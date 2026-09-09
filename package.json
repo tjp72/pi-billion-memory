@@ -1,0 +1,92 @@
+{
+  "name": "pi-billion-memory",
+  "version": "0.4.0",
+  "description": "Independent SQLite/FTS5 long-term memory index for the pi coding agent; reads allow-listed ACP compression sidecars (including billion-context-pi output) and exposes the memory_search tool.",
+  "type": "module",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "sideEffects": false,
+  "homepage": "https://github.com/tjp72/pi-billion-memory",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tjp72/pi-billion-memory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tjp72/pi-billion-memory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "tsup && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint src tests scripts",
+    "test": "node --import tsx --test tests/self-test.test.ts",
+    "e2e": "node --no-warnings scripts/e2e/run-e2e.mjs",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "npm run format:check && npm run typecheck && npm run lint && npm test && npm run build",
+    "verify:dist": "npm run build && git diff --exit-code -- dist",
+    "dev:install": "node scripts/install.mjs",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check && npm run e2e"
+  },
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "memory",
+    "sqlite",
+    "fts5",
+    "redaction",
+    "secrets",
+    "acp",
+    "context",
+    "compression",
+    "billion-context-pi",
+    "opencode",
+    "opencode-acp"
+  ],
+  "author": "tjp72",
+  "license": "MIT",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "billion-context-pi": ">=0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "billion-context-pi": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@types/node": "^26.5.0",
+    "oxlint": "^1.82.0",
+    "prettier": "^3.9.6",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}

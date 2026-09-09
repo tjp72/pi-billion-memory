@@ -1,0 +1,77 @@
+# Dependencies
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+.pnp.*
+.cache/
+
+# Local runtime data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.log
+*.log.*
+*.sources.jsonl
+pi-billion-memory.json
+*.bak
+
+# Build metadata (dist/ itself is committed for git installs)
+*.tsbuildinfo
+dist/*.tsbuildinfo
+dist/*.map
+
+# Secrets / local environment
+.env
+.env.*
+!.env.example
+id_rsa
+id_ed25519
+id_ecdsa
+id_dsa
+*.pem
+*.key
+*.p12
+*.pfx
+*.ppk
+*.jks
+*.keystore
+
+# Package artifacts
+*.tgz
+*.tar
+*.tar.gz
+*.zip
+
+# Planning / agent scratch files
+task_plan.md
+findings.md
+progress.md
+.pi/
+tmp/
+.tmp/
+temp/
+
+# Editor / OS noise
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+.history/
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+.eslintcache
+.oxlintcache
+coverage/
+.nyc_output/
+junit.xml
