@@ -82,10 +82,10 @@ pi install npm:pi-billion-memory
 
 ```bash
 # SSH（私有仓库推荐）
-pi install git:git@github.com:tjp72/pi-billion-memory.git@v0.4.0
+pi install git:git@github.com:tjp72/pi-billion-memory.git@v0.5.0
 
 # HTTPS（公开仓库；凭据由 git 处理）
-pi install git:https://github.com/tjp72/pi-billion-memory.git@v0.4.0
+pi install git:https://github.com/tjp72/pi-billion-memory.git@v0.5.0
 ```
 
 > `pi install git:...` 会 clone 仓库并执行 `npm install --omit=dev`，**不会执行

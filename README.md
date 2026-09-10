@@ -95,10 +95,10 @@ pi install npm:pi-billion-memory
 
 ```bash
 # SSH (recommended for a private repository)
-pi install git:git@github.com:tjp72/pi-billion-memory.git@v0.4.0
+pi install git:git@github.com:tjp72/pi-billion-memory.git@v0.5.0
 
 # HTTPS (public repository; credentials are handled by git)
-pi install git:https://github.com/tjp72/pi-billion-memory.git@v0.4.0
+pi install git:https://github.com:tjp72/pi-billion-memory.git@v0.5.0
 ```
 
 > `pi install git:...` clones the repository and runs `npm install --omit=dev`.
