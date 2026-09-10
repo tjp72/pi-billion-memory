@@ -230,7 +230,8 @@ opencode-acp ses_*.json ────────┘                             
 - `expandMaxMessages`: hard cap on messages rendered by one `memory_expand` call
   (default 200).
 - `expandMaxReadBytes`: hard cap on bytes read from a session file by one
-  `memory_expand` call (default 33554432, i.e. 32 MB).
+  `memory_expand` call (default 33554432, i.e. 32 MB). The file is opened and read
+  in bounded chunks, so a larger session file is never slurped whole first.
 
 ## Allow-list sources
 
@@ -306,12 +307,17 @@ memory_expand({ block: "b1", mode: "full", select: [1, 2] })
   file name or project) when the lookup is ambiguous.
 - `limit` and `chars` bound a single call; they are additionally clamped by
   `expandMaxMessages` and `expandMaxChars`.
+- `mode: "full"` requires a non-empty `select`: it refuses to render a whole block,
+  so recovering text always stays an explicit choice.
 - Only pi sources (`*.jsonl.acp.json`) are expandable; opencode-acp state files
   do not expose message references.
 - A `#call_...` suffix on a reference renders only that one tool call, not the
   surrounding assistant message.
 - A reference whose message is gone (deleted or truncated session file) is
   reported as missing rather than failing the call.
+- Extension-injected `custom_message` context is expandable as user text. Generated
+  ids (`acp_summary_*`) are labelled `synthetic`: they point at summaries, not at
+  session lines, so there is nothing to recover for them.
 - Expanded text passes through the same secret/URL filter as ingestion, and
   nothing is written back to the store.
 

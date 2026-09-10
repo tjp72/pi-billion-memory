@@ -21,6 +21,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must never be shared; ephemeral homes rebuild the index; redaction is best-effort over a
   plaintext, permission-unhardened store; sync sidecars, not the database, across machines.
 
+### Fixed
+
+- `memory_expand` hardening after an external review of 0.5.0:
+  - `mode: "full"` now **requires** a non-empty `select` instead of rendering the whole block,
+    which contradicted the documented two-step contract.
+  - `expandMaxReadBytes` is a real read cap again: the session file is opened and read in bounded
+    chunks instead of being slurped whole and sliced afterwards.
+  - A per-entry trim is reported as `truncated` again (a later assignment always cleared the
+    flag), and the rendered text is guaranteed to stay within `maxChars`.
+  - A missing/renamed session file degrades to `missing` references instead of throwing, matching
+    the documented behavior.
+  - `custom_message` entries (extension-injected context such as ACP compaction notices) are
+    expandable again; unknown content-item types render an explicit `[unsupported ...]`
+    placeholder instead of being dropped from the entry.
+  - Re-ingesting a sidecar clears stored pointers the sidecar no longer lists, so expansion can no
+    longer return messages that are no longer part of the block.
+  - The 0.5.0 pointer migration now clears a freshly seeded watermark row, so an orphaned source
+    row still gets its pointers backfilled.
+  - `~` in `dbPath`/`sourcesPath`/`logPath` expands to the home directory instead of creating a
+    literal `~` directory.
+  - The ambiguous-block message reports the real number of matches instead of the page size.
+  - Manifests no longer print an absolute session path, and generated `acp_summary_*` references
+    are labelled `synthetic` rather than counted as recoverable text.
+
 ## [0.5.0] - 2026-09-10
 
 ### Added

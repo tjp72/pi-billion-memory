@@ -7,12 +7,16 @@ import * as path from 'path';
 
 // src/expand.ts
 var CALL_SEPARATOR = "#";
+var SYNTHETIC_REF_PREFIX = "acp_summary_";
 function splitMessageId(raw) {
   const s = typeof raw === "string" ? raw : String(raw ?? "");
   const at = s.indexOf(CALL_SEPARATOR);
   if (at <= 0) return { base: s, callId: null };
   const callId = s.slice(at + CALL_SEPARATOR.length);
   return { base: s.slice(0, at), callId: callId || null };
+}
+function isSyntheticRef(id) {
+  return typeof id === "string" && id.startsWith(SYNTHETIC_REF_PREFIX);
 }
 function parseMsgIds(json) {
   if (typeof json !== "string" || !json.trim()) return [];
@@ -63,14 +67,18 @@ function renderContentItem(item, callId) {
     return { callId: id, kind: "toolCall", text: `${name}(${stringifyArgs(it.arguments)})` };
   }
   if (callId) return null;
-  return null;
+  const label = typeof type === "string" && type ? type : "unknown";
+  return { callId: null, kind: "other", text: `[unsupported content item: ${label}]` };
 }
 function renderMessage(line, callId) {
   if (!line || typeof line !== "object") return null;
-  const message = line.message;
-  if (!message || typeof message !== "object") return null;
-  const role = typeof message.role === "string" && message.role ? message.role : "unknown";
-  const content = message.content;
+  const entry = line;
+  const custom = entry.type === "custom_message";
+  const message = custom ? null : entry.message;
+  if (!custom && (!message || typeof message !== "object")) return null;
+  if (custom && callId) return null;
+  const role = custom ? "user" : typeof message.role === "string" && message.role ? message.role : "unknown";
+  const content = custom ? entry.content : message.content;
   const items = [];
   if (Array.isArray(content)) {
     for (const item of content) {
@@ -83,14 +91,39 @@ function renderMessage(line, callId) {
   if (items.length === 0) return null;
   return { role, items };
 }
-async function readSessionMessages(sessionFile, maxReadBytes, readFile = (file) => readWholeFile(file)) {
+async function readCapped(file, maxBytes) {
+  const { promises: fsp } = await import('fs');
+  const cap = Math.max(0, Math.floor(maxBytes));
+  const handle = await fsp.open(file, "r");
+  try {
+    const { size } = await handle.stat();
+    const want = Math.min(cap, size);
+    const buffer = Buffer.allocUnsafe(want);
+    let filled = 0;
+    while (filled < want) {
+      const { bytesRead } = await handle.read(buffer, filled, want - filled, filled);
+      if (bytesRead <= 0) break;
+      filled += bytesRead;
+    }
+    return { buffer: buffer.subarray(0, filled), totalBytes: size };
+  } finally {
+    await handle.close();
+  }
+}
+async function readSessionMessages(sessionFile, maxReadBytes, readFile = readCapped) {
   const messages = /* @__PURE__ */ new Map();
-  const buffer = await readFile(sessionFile);
-  const totalBytes = buffer.length;
   const cap = Math.max(0, Math.floor(maxReadBytes));
-  const truncated = totalBytes > cap;
-  const slice = truncated ? buffer.subarray(0, cap) : buffer;
-  const text = slice.toString("utf8");
+  let read;
+  try {
+    read = await readFile(sessionFile, cap);
+  } catch (e) {
+    if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) {
+      return { messages, bytesRead: 0, totalBytes: 0, truncated: false, missing: true };
+    }
+    throw e;
+  }
+  const truncated = read.totalBytes > cap;
+  const text = read.buffer.toString("utf8");
   const parts = text.split("\n");
   if (truncated) parts.pop();
   for (const part of parts) {
@@ -103,15 +136,11 @@ async function readSessionMessages(sessionFile, maxReadBytes, readFile = (file) 
       continue;
     }
     if (!line || typeof line !== "object") continue;
-    if (line.type !== "message") continue;
+    if (line.type !== "message" && line.type !== "custom_message") continue;
     if (typeof line.id !== "string" || !line.id) continue;
     messages.set(line.id, line);
   }
-  return { messages, bytesRead: slice.length, totalBytes, truncated };
-}
-async function readWholeFile(file) {
-  const { promises: fsp } = await import('fs');
-  return fsp.readFile(file);
+  return { messages, bytesRead: read.buffer.length, totalBytes: read.totalBytes, truncated, missing: false };
 }
 function renderEntry(rendered) {
   const parts = [];
@@ -123,7 +152,10 @@ ${item.text}`);
   return parts.join("\n");
 }
 async function expandBlock(opts) {
-  const select = Array.isArray(opts.select) ? opts.select.filter((n) => Number.isInteger(n) && n > 0) : null;
+  const select = Array.isArray(opts.select) ? opts.select.filter((n) => Number.isInteger(n) && n > 0) : [];
+  if (opts.mode === "full" && select.length === 0) {
+    throw new Error('mode "full" requires a non-empty select (run mode "list" first and pick indices)');
+  }
   const read = await readSessionMessages(opts.sessionFile, opts.maxReadBytes, opts.readFile);
   const entries = [];
   const renderedByIndex = /* @__PURE__ */ new Map();
@@ -158,14 +190,14 @@ async function expandBlock(opts) {
     skippedMessages: 0,
     readTruncated: read.truncated,
     bytesRead: read.bytesRead,
-    totalBytes: read.totalBytes
+    totalBytes: read.totalBytes,
+    sessionMissing: read.missing
   };
   if (opts.mode === "list") return { ...base, text: null };
-  const wanted = select && select.length > 0 ? new Set(select) : null;
+  const wanted = new Set(select);
   let requestedCount = 0;
   for (const entry of entries) {
-    if (wanted && !wanted.has(entry.index)) continue;
-    if (entry.found) requestedCount++;
+    if (wanted.has(entry.index) && entry.found) requestedCount++;
   }
   const maxChars = Math.max(0, Math.floor(opts.maxChars));
   const maxMessages = Math.max(1, Math.floor(opts.maxMessages));
@@ -173,8 +205,9 @@ async function expandBlock(opts) {
   let used = 0;
   let returned = 0;
   let skipped = 0;
+  let capTrimmed = false;
   for (const entry of entries) {
-    if (wanted && !wanted.has(entry.index)) continue;
+    if (!wanted.has(entry.index)) continue;
     if (!entry.found) continue;
     if (returned >= maxMessages) {
       skipped++;
@@ -186,35 +219,35 @@ async function expandBlock(opts) {
     if (opts.redact) body = opts.redact(body).text;
     const header = `### [${entry.index}] ${entry.role ?? "unknown"}${entry.callId ? ` \xB7 ${entry.callId}` : ""} \xB7 ${body.length} chars
 `;
-    const block = `${header}${body}`;
-    const cost = block.length + (chunks.length ? 2 : 0);
-    if (used + cost > maxChars && returned > 0) {
+    const sep2 = chunks.length ? 2 : 0;
+    const room = maxChars - used - sep2;
+    if (room <= 0) {
       skipped++;
       continue;
     }
-    if (used + cost > maxChars && returned === 0) {
-      const room = Math.max(0, maxChars - header.length);
-      chunks.push(`${header}${body.slice(0, room)}
-[entry truncated at ${maxChars} chars]`);
-      used += header.length + room;
+    if (header.length + body.length <= room) {
+      chunks.push(`${header}${body}`);
+      used += sep2 + header.length + body.length;
       returned++;
-      base.truncated = true;
       continue;
     }
-    chunks.push(block);
-    used += cost;
+    const marker = `
+[entry truncated at ${maxChars} chars]`;
+    const bodyRoom = room - header.length - marker.length;
+    if (bodyRoom > 0) {
+      chunks.push(`${header}${body.slice(0, bodyRoom)}${marker}`);
+      used += sep2 + header.length + bodyRoom + marker.length;
+    } else {
+      chunks.push(body.slice(0, room));
+      used += sep2 + room;
+    }
     returned++;
-  }
-  if (returned === 0) {
-    base.text = "";
-    base.truncated = skipped > 0;
-    base.skippedMessages = skipped;
-    return base;
+    capTrimmed = true;
   }
   base.text = chunks.join("\n\n");
-  base.returnedChars = used;
+  base.returnedChars = base.text.length;
   base.skippedMessages = skipped;
-  base.truncated = skipped > 0 || returned < requestedCount;
+  base.truncated = capTrimmed || skipped > 0 || returned < requestedCount;
   return base;
 }
 
@@ -263,15 +296,15 @@ var SESSION_HEADER_MAX_BYTES = 1e6;
 function sanitizeCfg(over) {
   const out = {};
   if (!over || typeof over !== "object") return out;
-  if (typeof over.dbPath === "string" && over.dbPath) out.dbPath = over.dbPath;
+  if (typeof over.dbPath === "string" && over.dbPath) out.dbPath = expandHome(over.dbPath);
   if (typeof over.maxSummaryChars === "number" && Number.isFinite(over.maxSummaryChars) && over.maxSummaryChars > 0) {
     out.maxSummaryChars = Math.floor(over.maxSummaryChars);
   }
   if (typeof over.debug === "boolean") out.debug = over.debug;
   if (Array.isArray(over.excludeDirs)) out.excludeDirs = over.excludeDirs.filter((x) => typeof x === "string");
   if (typeof over.scanOnStartup === "boolean") out.scanOnStartup = over.scanOnStartup;
-  if (typeof over.sourcesPath === "string" && over.sourcesPath) out.sourcesPath = over.sourcesPath;
-  if (typeof over.logPath === "string" && over.logPath) out.logPath = over.logPath;
+  if (typeof over.sourcesPath === "string" && over.sourcesPath) out.sourcesPath = expandHome(over.sourcesPath);
+  if (typeof over.logPath === "string" && over.logPath) out.logPath = expandHome(over.logPath);
   if (typeof over.expandEnabled === "boolean") out.expandEnabled = over.expandEnabled;
   if (Number.isInteger(over.expandMaxChars) && over.expandMaxChars > 0) out.expandMaxChars = over.expandMaxChars;
   if (Number.isInteger(over.expandMaxMessages) && over.expandMaxMessages > 0)
@@ -429,6 +462,16 @@ function defaultSources() {
     }
   ];
 }
+function blockFilter(blockId, source) {
+  const params = [String(blockId)];
+  let where = "b.block_id = ?";
+  if (source) {
+    where += " AND (b.source_file LIKE ? ESCAPE '\\' OR s.project LIKE ? ESCAPE '\\')";
+    const like = `%${String(source).replace(/[\\%_]/g, (m) => "\\" + m)}%`;
+    params.push(like, like);
+  }
+  return { where, params };
+}
 function sanitizeSource(raw) {
   if (!raw || typeof raw !== "object") return null;
   const id = typeof raw.id === "string" ? raw.id : null;
@@ -514,8 +557,8 @@ function cleanOpencodeSummary(summary) {
   return String(summary).replace(/\s*<dcp-message-id>.*?<\/dcp-message-id>\s*$/s, "").trim();
 }
 function collectMsgIds(block) {
-  const raw = block?.effectiveMessageIds ?? block?.messageIds;
-  if (!Array.isArray(raw)) return null;
+  const raw = [block?.effectiveMessageIds, block?.messageIds].find((v) => Array.isArray(v) && v.length > 0);
+  if (!raw) return null;
   const out = [];
   const seen = /* @__PURE__ */ new Set();
   for (const item of raw) {
@@ -648,17 +691,18 @@ var MemoryDb = class {
       );
     `);
     const blockCols = this.db.prepare("PRAGMA table_info(blocks)").all();
-    if (!blockCols.some((c) => c.name === "msg_ids")) {
-      this.db.exec("ALTER TABLE blocks ADD COLUMN msg_ids TEXT;");
-      this.db.exec("UPDATE source_watermarks SET last_mtime_ms = 0, last_size = 0;");
-      logLine("migrated blocks.msg_ids; watermark ledger reset once for pointer backfill");
-    }
+    const addedMsgIds = !blockCols.some((c) => c.name === "msg_ids");
+    if (addedMsgIds) this.db.exec("ALTER TABLE blocks ADD COLUMN msg_ids TEXT;");
     this.db.exec(`
       INSERT OR IGNORE INTO source_watermarks(source_file, last_mtime_ms, last_size, updated_at)
       SELECT source_file, last_mtime_ms, last_size, updated_at
       FROM sources
       WHERE last_mtime_ms IS NOT NULL AND last_size IS NOT NULL;
     `);
+    if (addedMsgIds) {
+      this.db.exec("UPDATE source_watermarks SET last_mtime_ms = 0, last_size = 0;");
+      logLine("migrated blocks.msg_ids; watermark ledger reset once for pointer backfill");
+    }
     const trig = this.db.prepare("SELECT count(*) AS c FROM sqlite_master WHERE type='trigger' AND name IN ('blocks_ai','blocks_ad')").get();
     if (!trig || trig.c < 2) {
       this.db.exec(`
@@ -809,7 +853,7 @@ var MemoryDb = class {
       );
       const updMsgIds = this.db.prepare(
         `UPDATE blocks SET msg_ids = ?
-          WHERE source_file = ? AND block_id = ? AND (msg_ids IS NULL OR msg_ids <> ?)`
+          WHERE source_file = ? AND block_id = ? AND (msg_ids IS NOT ?)`
       );
       for (const b of blocks) {
         if (!b || typeof b.summary !== "string") continue;
@@ -836,7 +880,7 @@ var MemoryDb = class {
           b.blockId
         );
         if (r.changes > 0) inserted++;
-        else if (msgIdsJson && updMsgIds.run(msgIdsJson, sourceFile, b.blockId, msgIdsJson).changes > 0) refreshed++;
+        else if (updMsgIds.run(msgIdsJson, sourceFile, b.blockId, msgIdsJson).changes > 0) refreshed++;
       }
       this.db.exec("COMMIT");
     } catch (e) {
@@ -861,13 +905,7 @@ var MemoryDb = class {
    */
   findBlocks(blockId, source = null, limit = 10) {
     this.open();
-    const params = [String(blockId)];
-    let where = "b.block_id = ?";
-    if (source) {
-      where += " AND (b.source_file LIKE ? ESCAPE '\\' OR s.project LIKE ? ESCAPE '\\')";
-      const like = `%${String(source).replace(/[\\%_]/g, (m) => "\\" + m)}%`;
-      params.push(like, like);
-    }
+    const { where, params } = blockFilter(blockId, source);
     params.push(Math.max(1, Math.min(50, limit)));
     return this.db.prepare(
       `SELECT b.id, b.source_file AS sourceFile, b.kind AS kind,
@@ -880,6 +918,22 @@ var MemoryDb = class {
           ORDER BY b.created_at DESC, b.id DESC
           LIMIT ?`
     ).all(...params);
+  }
+  /**
+   * Count stored rows for a block id with the same filter as {@link findBlocks} (ignoring `limit`),
+   * so a caller can report the real number of duplicates instead of the page size.
+   * @param {string} blockId block id as shown by memory_search (e.g. "b1")
+   * @param {string|null} source optional substring match on the source file name or project
+   * @returns {number} number of matching rows
+   */
+  countBlocks(blockId, source = null) {
+    this.open();
+    const { where, params } = blockFilter(blockId, source);
+    return this.db.prepare(
+      `SELECT count(*) AS c
+           FROM blocks b LEFT JOIN sources s ON s.source_file = b.source_file
+          WHERE ${where}`
+    ).get(...params).c;
   }
   /**
    * Build the search SQL shared by search()/explainSearch().
@@ -1240,19 +1294,25 @@ function formatExpansion(row, sessionFile, res, mode) {
   const lines = [
     `Block ${row.blockId}${row.tier != null ? ` (tier ${row.tier})` : ""} \xB7 project ${row.project || "unknown"}${row.createdAt ? ` \xB7 ${fmtTs(row.createdAt)}` : ""} \xB7 ${res.entries.length} message ref(s) \xB7 ${fmtTokens(row.tokens) || "?"} tok compressed`,
     `Source: ${sourceLabel(row)}`,
-    `Session: ${sessionFile}`
+    // Basename only: the absolute path carries the OS user name and the encoded project directory,
+    // and expansion never needs it (the `source` filter takes the session file name or project).
+    `Session: ${path.basename(sessionFile)}`
   ];
   const kb = (n) => `${Math.round(n / 1024)} KB`;
   lines.push(
-    res.readTruncated ? `Read: ${kb(res.bytesRead)} of ${kb(res.totalBytes)} (read cap hit; later messages may be missing)` : `Read: ${kb(res.totalBytes)} (complete)`
+    res.sessionMissing ? "Read: session file is gone (deleted, rotated, or renamed since ingestion)" : res.readTruncated ? `Read: ${kb(res.bytesRead)} of ${kb(res.totalBytes)} (read cap hit; later messages may be missing)` : `Read: ${kb(res.totalBytes)} (complete)`
   );
-  const missing = res.entries.filter((e) => !e.found).length;
+  const synthetic = res.entries.filter((e) => !e.found && isSyntheticRef(e.messageId)).length;
+  const missing = res.entries.filter((e) => !e.found).length - synthetic;
   if (missing > 0) lines.push(`Missing: ${missing} referenced message(s) not present in the session file`);
+  if (synthetic > 0) {
+    lines.push(`Synthetic: ${synthetic} reference(s) point at generated ids the session file never holds`);
+  }
   lines.push("");
   if (mode === "list") {
     const shown = res.entries.slice(0, EXPAND_MANIFEST_MAX);
     for (const e of shown) {
-      const role = (e.found ? e.role || "?" : "missing").padEnd(11);
+      const role = (e.found ? e.role || "?" : isSyntheticRef(e.messageId) ? "synthetic" : "missing").padEnd(11);
       const size = e.found ? `${String(e.chars).padStart(6)} chars` : "          ";
       lines.push(`${String(e.index).padStart(4)}  ${role} ${size}  ${e.ref}`);
     }
@@ -1304,12 +1364,12 @@ var MEMORY_EXPAND_PARAMETERS = {
     mode: {
       type: "string",
       enum: ["list", "full"],
-      description: "'list' (default) returns a manifest of the absorbed messages with no conversation text; 'full' renders the selected text"
+      description: "'list' (default) returns a manifest of the absorbed messages with no conversation text; 'full' renders exactly the indices given in 'select'"
     },
     select: {
       type: "array",
       items: { type: "number" },
-      description: "1-based message indices from a 'list' result to render; omit to render all (still bounded)"
+      description: "1-based message indices taken from a 'list' result; required (and non-empty) for mode 'full', which never renders a whole block at once"
     },
     limit: { type: "number", description: "Max messages to render, default from expandMaxMessages" },
     chars: { type: "number", description: "Max characters to return, default from expandMaxChars" }
@@ -1446,7 +1506,9 @@ async function factory(pi) {
               details: { mode: "error", hits: 0 }
             };
           }
-          const rows = getDb().findBlocks(p.block, p.source);
+          const db2 = getDb();
+          const rows = db2.findBlocks(p.block, p.source);
+          const total = rows.length ? db2.countBlocks(p.block, p.source) : 0;
           if (rows.length === 0) {
             return {
               content: [
@@ -1466,11 +1528,11 @@ async function factory(pi) {
               content: [
                 {
                   type: "text",
-                  text: `memory_expand: ${rows.length} blocks share the id '${p.block}'. Add 'source' to pick one:
+                  text: `memory_expand: ${total} block(s) share the id '${p.block}' (showing the newest ${rows.length}). Add 'source' to pick one:
 ${list}`
                 }
               ],
-              details: { mode: "ambiguous", hits: rows.length }
+              details: { mode: "ambiguous", hits: total }
             };
           }
           const row = rows[0];

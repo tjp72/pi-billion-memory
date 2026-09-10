@@ -845,6 +845,19 @@ check(
   exDb.findBlocks("b1", "no-such-source").length === 0 && exDb.findBlocks("b1", "ExpandProj").length === 1,
 );
 check("ingest falls back to the messageIds key", internals.parseMsgIds(exDb.findBlocks("b2")[0].msgIds).length === 1);
+check(
+  "countBlocks counts every duplicate row, not just the page findBlocks returns",
+  exDb.countBlocks("b1") === 1 &&
+    exDb.countBlocks("b1", "ExpandProj") === 1 &&
+    exDb.countBlocks("b1", "no-such-source") === 0 &&
+    exDb.countBlocks("b404") === 0,
+);
+check(
+  "an explicitly empty effectiveMessageIds does not hide the messageIds fallback",
+  JSON.stringify(internals.collectMsgIds({ effectiveMessageIds: [], messageIds: ["aaa11111"] })) === '["aaa11111"]' &&
+    internals.collectMsgIds({ effectiveMessageIds: [], messageIds: [] }) === null &&
+    internals.collectMsgIds({}) === null,
+);
 
 const exIds = internals.parseMsgIds(exRow[0].msgIds);
 const exBudget = { maxChars: 40000, maxMessages: 200, maxReadBytes: 32 * 1024 * 1024 };
@@ -913,18 +926,54 @@ const exString = await internals.expandBlock({
   redact: null,
 });
 check("plain string content is rendered", exString.text.includes("expandStringMarker"));
+const exTrim = await internals.expandBlock({
+  sessionFile: exSession,
+  msgIds: exIds,
+  mode: "full",
+  select: [4],
+  ...exBudget,
+  maxChars: 60,
+  redact: null,
+});
+check(
+  "a trimmed entry is flagged as truncation and stays inside the char cap",
+  exTrim.truncated &&
+    exTrim.text.length <= 60 &&
+    exTrim.returnedChars === exTrim.text.length &&
+    exTrim.text.includes("[entry truncated at 60 chars]"),
+);
 const exTrunc = await internals.expandBlock({
   sessionFile: exSession,
   msgIds: exIds,
   mode: "full",
-  select: null,
+  select: [1],
   ...exBudget,
   maxChars: 1,
   redact: null,
 });
 check(
-  "a tiny char budget still returns one entry and flags truncation",
-  exTrunc.truncated && exTrunc.text.length > 0 && exTrunc.skippedMessages === 3 && exTrunc.returnedChars <= 1 + 200,
+  "a tiny char budget never exceeds the cap and still flags truncation",
+  exTrunc.truncated &&
+    exTrunc.text.length <= 1 &&
+    exTrunc.returnedChars === exTrunc.text.length &&
+    exTrunc.skippedMessages === 0,
+);
+let exNoSelect = "";
+try {
+  await internals.expandBlock({
+    sessionFile: exSession,
+    msgIds: exIds,
+    mode: "full",
+    select: null,
+    ...exBudget,
+    redact: null,
+  });
+} catch (e) {
+  exNoSelect = e.message;
+}
+check(
+  "full mode refuses to render a whole block without an explicit selection",
+  exNoSelect.includes("non-empty select"),
 );
 const exFew = await internals.expandBlock({
   sessionFile: exSession,
@@ -962,20 +1011,92 @@ check(
 );
 const exFullRead = await internals.readSessionMessages(exSession, 10 * 1024 * 1024);
 check(
-  "an uncapped read indexes only type:message lines",
+  "an uncapped read indexes message entries and skips other line types",
   !exFullRead.truncated && exFullRead.messages.size === 3 && !exFullRead.messages.has("not-a-message"),
 );
 check(
   "renderMessage returns null for a line without a message body",
   internals.renderMessage({ type: "message", id: "x" }, null) === null && internals.renderMessage(null, null) === null,
 );
-let exMissing = "";
-try {
-  await internals.readSessionMessages(path.join(exRoot, "nope.jsonl"), 1000);
-} catch (e) {
-  exMissing = e.message;
-}
-check("a missing session file surfaces a read error", exMissing.includes("ENOENT"));
+const exCapped = await internals.readCapped(exSession, 40);
+check(
+  "the physical read stops at the cap and still reports the real file size",
+  exCapped.buffer.length === 40 && exCapped.totalBytes > 40,
+);
+let exSeamCap = -1;
+const exSeamRead = await internals.readSessionMessages(exSession, 40, async (_file, maxBytes) => {
+  exSeamCap = maxBytes;
+  return internals.readCapped(exSession, maxBytes);
+});
+check(
+  "the read seam is handed the byte cap, so no caller can slurp a whole session file",
+  exSeamCap === 40 && exSeamRead.truncated && exSeamRead.bytesRead === 40 && exSeamRead.totalBytes > 40,
+);
+const exMissingRead = await internals.readSessionMessages(path.join(exRoot, "nope.jsonl"), 1000);
+check(
+  "a deleted session file degrades to missing refs instead of throwing",
+  exMissingRead.missing === true && exMissingRead.messages.size === 0 && exMissingRead.totalBytes === 0,
+);
+const exMissingExpand = await internals.expandBlock({
+  sessionFile: path.join(exRoot, "nope.jsonl"),
+  msgIds: exIds,
+  mode: "list",
+  select: null,
+  ...exBudget,
+  redact: null,
+});
+check(
+  "expansion over a deleted session reports every reference as missing",
+  exMissingExpand.sessionMissing === true &&
+    exMissingExpand.entries.every((e) => !e.found) &&
+    exMissingExpand.text === null,
+);
+const exUnknown = await internals.renderMessage(
+  { type: "message", id: "unknown1", message: { role: "assistant", content: [{ type: "brandNewThing", payload: 7 }] } },
+  null,
+);
+check(
+  "an unknown content type renders as an `other` placeholder, not as a missing reference",
+  Boolean(exUnknown) &&
+    exUnknown.items.length === 1 &&
+    exUnknown.items[0].kind === "other" &&
+    exUnknown.items[0].text.includes("brandNewThing"),
+);
+const exCustomLine = { type: "custom_message", id: "cm1", customType: "test-extension", content: "expandCustomMarker" };
+const exCustomRendered = internals.renderMessage(exCustomLine, null);
+check(
+  "custom_message entries (extension-injected context) are expandable as user text",
+  Boolean(exCustomRendered) &&
+    exCustomRendered.role === "user" &&
+    exCustomRendered.items.length === 1 &&
+    exCustomRendered.items[0].text === "expandCustomMarker",
+);
+check(
+  "a #call_ selector can never match a custom_message",
+  internals.renderMessage(exCustomLine, "call_00_one") === null,
+);
+const exCustomFile = path.join(exRoot, "custom.jsonl");
+fs.writeFileSync(exCustomFile, `${JSON.stringify(exCustomLine)}\n`);
+const exCustomRead = await internals.readSessionMessages(exCustomFile, 1_000_000);
+check(
+  "readSessionMessages indexes custom_message lines alongside messages",
+  exCustomRead.messages.size === 1 && exCustomRead.messages.has("cm1") && !exCustomRead.truncated,
+);
+const exCustomExpand = await internals.expandBlock({
+  sessionFile: exCustomFile,
+  msgIds: ["cm1", "acp_summary_7"],
+  mode: "full",
+  select: [1],
+  ...exBudget,
+  redact: null,
+});
+check(
+  "a custom_message reference expands to its injected text, and synthetic refs are recognizable",
+  exCustomExpand.text.includes("expandCustomMarker") &&
+    !exCustomExpand.truncated &&
+    internals.isSyntheticRef("acp_summary_7") &&
+    !internals.isSyntheticRef("aaa11111"),
+);
 
 // Pointers must backfill onto rows that predate the column, and must not churn afterwards.
 exDb.db.exec("UPDATE blocks SET msg_ids = NULL");
@@ -991,6 +1112,23 @@ check(
   "re-ingest leaves intact pointers untouched",
   exNoop.ok && exNoop.parsed && exNoop.inserted === 0 && exNoop.refreshed === 0,
 );
+// A sidecar that re-emits a block id without references must clear the stored pointers, otherwise
+// expansion keeps returning messages the block no longer covers.
+const exSidecarRaw = fs.readFileSync(exSidecar, "utf8");
+const exSidecarData = JSON.parse(exSidecarRaw);
+exSidecarData.blocks = exSidecarData.blocks.map((b) => (b.blockId === "b1" ? { ...b, effectiveMessageIds: [] } : b));
+fs.writeFileSync(exSidecar, JSON.stringify(exSidecarData));
+fs.utimesSync(exSidecar, new Date(T2 + 2), new Date(T2 + 2));
+const exDrop = await exDb.ingestSidecarFile(exSession, "/home/dev/ExpandProj");
+check(
+  "a sidecar that drops references clears the stored pointers",
+  exDrop.ok &&
+    exDrop.parsed &&
+    exDrop.refreshed === 1 &&
+    internals.parseMsgIds(exDb.findBlocks("b1")[0].msgIds).length === 0,
+);
+fs.writeFileSync(exSidecar, exSidecarRaw);
+fs.utimesSync(exSidecar, new Date(T2 + 1), new Date(T2 + 1));
 check("pointers stay searchable but are not FTS-indexed", exDb.search("expandDeltaMarker").rows.length === 1);
 exDb.close();
 
@@ -1046,6 +1184,56 @@ check(
 const ptrAgain = await ptrDb.ingestSidecarFile(exSession, "/home/dev/ExpandProj");
 check("the pointer migration runs at most once", ptrAgain.ok && !ptrAgain.parsed);
 ptrDb.close();
+
+// A legacy store whose `sources` row has no watermark row yet: seeding the ledger before the
+// pointer reset must not re-stamp the watermarks that reset is about to clear.
+const orphanPath = path.join(tmp, "pointers-orphan.db");
+const orphanRaw = new DatabaseSync(orphanPath);
+orphanRaw.exec(`
+  CREATE TABLE sources(
+    source_file TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'pi', project TEXT NOT NULL, cwd TEXT,
+    last_mtime_ms INTEGER DEFAULT 0, last_size INTEGER DEFAULT 0, first_seen_at INTEGER, updated_at INTEGER
+  );
+  CREATE TABLE blocks(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, source_file TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'pi',
+    block_id TEXT NOT NULL, run_id TEXT, tier INTEGER, topic TEXT, summary TEXT NOT NULL,
+    ref_start TEXT, ref_end TEXT, compressed_tokens INTEGER, created_at INTEGER,
+    UNIQUE(source_file, block_id)
+  );
+  CREATE TABLE source_watermarks(
+    source_file TEXT PRIMARY KEY, last_mtime_ms INTEGER NOT NULL DEFAULT 0,
+    last_size INTEGER NOT NULL DEFAULT 0, updated_at INTEGER
+  );
+  INSERT INTO sources(source_file, kind, project, cwd, last_mtime_ms, last_size, first_seen_at, updated_at)
+  VALUES ('${exSidecar}', 'pi', 'ExpandProj', '/home/dev/ExpandProj', 777, 888, 1, 1);
+`);
+orphanRaw.close();
+const orphanDb = new internals.MemoryDb(orphanPath);
+orphanDb.open();
+const orphanWm = orphanDb.db.prepare("SELECT last_mtime_ms, last_size FROM source_watermarks").all();
+check(
+  "the pointer migration clears a freshly seeded watermark row",
+  orphanWm.length === 1 && orphanWm[0].last_mtime_ms === 0 && orphanWm[0].last_size === 0,
+);
+const orphanIngest = await orphanDb.ingestSidecarFile(exSession, "/home/dev/ExpandProj");
+check(
+  "an orphaned source re-reads and backfills its pointers after migration",
+  orphanIngest.ok &&
+    orphanIngest.parsed &&
+    internals.parseMsgIds(orphanDb.findBlocks("b1", "ExpandProj")[0].msgIds).length === 5,
+);
+orphanDb.close();
+
+// Config paths accept `~`: a config copied from the README must not create a literal "~" directory.
+const exHome = process.env.HOME || "";
+const exCfgPaths = internals.sanitizeCfg({ dbPath: "~/a.db", sourcesPath: "~", logPath: "~/c.log" });
+check(
+  "~ in configured paths expands to the home directory instead of a literal '~' directory",
+  exCfgPaths.dbPath === path.join(exHome, "a.db") &&
+    exCfgPaths.sourcesPath === exHome &&
+    exCfgPaths.logPath === path.join(exHome, "c.log") &&
+    internals.sanitizeCfg({ dbPath: "relative/x.db" }).dbPath === "relative/x.db",
+);
 
 // --- cleanup --------------------------------------------------------------------
 db.close();

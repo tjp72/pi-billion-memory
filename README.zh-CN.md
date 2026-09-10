@@ -200,7 +200,8 @@ opencode-acp ses_*.json ────────┘                             
 - `expandMaxChars`：单次 `memory_expand` 返回字符数硬上限（默认 40000）；
 - `expandMaxMessages`：单次 `memory_expand` 渲染消息数硬上限（默认 200）；
 - `expandMaxReadBytes`：单次 `memory_expand` 读取 session 文件的字节数硬上限
-  （默认 33554432，即 32 MB）。
+  （默认 33554432，即 32 MB）。文件以有界分块方式打开读取，不会先把整个大文件
+  读进内存再切片；
 
 ## 白名单源
 
@@ -266,9 +267,12 @@ memory_expand({ block: "b1", mode: "full", select: [1, 2] })
   结果不唯一时用 `source`（`Source:` 标签的子串，如 session 文件名或项目名）消歧；
 - `limit` 和 `chars` 限制单次调用；它们还会被 `expandMaxMessages` /
   `expandMaxChars` 二次压制；
+- `mode: "full"` 必须提供非空 `select`：它拒绝渲染整个块，还原正文始终是一次显式选择；
 - 只有 pi 源（`*.jsonl.acp.json`）可展开；opencode-acp state 文件不暴露消息引用；
 - 引用带 `#call_...` 后缀时，只渲染那一次工具调用，不含它所在的 assistant 消息；
 - 引用的消息已不存在（session 文件被删除或截断）时，报告为缺失，而不是让调用失败；
+- 扩展注入的 `custom_message` 上下文可按用户文本展开；生成类 id（`acp_summary_*`）
+  标记为 `synthetic`：它们指向的是摘要而非 session 行，没有可还原的正文。
 - 展开出的文本会走与入库相同的敏感信息/网址过滤，且不会写回本地库。
 
 0.5.0 之前入库的块没有记录指针。升级后会重置一次水位线账本，使下一次扫描重新

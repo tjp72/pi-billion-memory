@@ -7,10 +7,14 @@
  *
  * Scope and guarantees:
  * - Read-only. Nothing is written back to the store; expanded text is returned to the caller only.
- * - Bounded. Every read and every response is capped by the caller's budgets (`maxReadBytes`,
- *   `maxChars`, `maxMessages`).
- * - On demand. Only messages already referenced by a stored block can be resolved; the reader is
- *   never used to walk a session file for discovery.
+ * - Bounded. Every read and every response is capped by the caller's budgets: the session file is
+ *   opened and read in `maxReadBytes` steps (never slurped whole), and the rendered text — entry
+ *   headers and truncation markers included — never exceeds `maxChars`.
+ * - Two-step. `full` mode renders only an explicit, non-empty `select`, so a whole block cannot be
+ *   dumped by omitting it; `list` mode returns a manifest with no conversation text at all.
+ * - On demand. The reader resolves only ids already referenced by a stored block and is never used
+ *   to discover blocks; it does parse the session file up to the byte cap, because a JSONL file
+ *   cannot be read randomly.
  * - Redaction is injected by the caller so this module stays dependency-free (and so the same
  *   filter that guards storage also guards output).
  */
@@ -22,7 +26,7 @@ export interface SplitMessageId {
     callId: string | null;
 }
 /** Kind of a rendered content item. */
-export type RenderedKind = "text" | "thinking" | "toolCall" | "toolResult" | "other";
+export type RenderedKind = "text" | "thinking" | "toolCall" | "other";
 /** One rendered piece of a message. */
 export interface RenderedItem {
     /** Tool-call id when the item is a tool call. */
@@ -35,9 +39,14 @@ export interface RenderedMessage {
     role: string;
     items: RenderedItem[];
 }
+/** Bytes read from a file plus its size on disk. */
+export interface ReadResult {
+    buffer: Buffer;
+    totalBytes: number;
+}
 /** Result of reading a session file. */
 export interface SessionRead {
-    /** Raw message id -> parsed `type:"message"` line. */
+    /** Raw message id -> parsed entry (`type:"message"` or `type:"custom_message"`). */
     messages: Map<string, any>;
     /** Bytes actually read. */
     bytesRead: number;
@@ -45,6 +54,8 @@ export interface SessionRead {
     totalBytes: number;
     /** True when the file was longer than the read cap (the trailing partial line is dropped). */
     truncated: boolean;
+    /** True when the session file no longer exists (deleted, rotated, or renamed since ingestion). */
+    missing: boolean;
 }
 /** One entry in the expansion manifest. */
 export interface ExpandEntry {
@@ -82,12 +93,17 @@ export interface ExpandResult {
     bytesRead: number;
     /** Total size of the session file. */
     totalBytes: number;
+    /** True when the session file was gone, so every reference resolves to missing. */
+    sessionMissing: boolean;
 }
 export interface ExpandOptions {
     sessionFile: string;
     msgIds: string[];
     mode: "list" | "full";
-    /** 1-based entry indices to render; null/empty means "all" in `full` mode. */
+    /**
+     * 1-based entry indices to render. Required and non-empty in `full` mode: there is no "render
+     * everything" path, so a caller has to pick a selection from a `list` result first.
+     */
     select?: number[] | null;
     maxChars: number;
     maxMessages: number;
@@ -98,5 +114,5 @@ export interface ExpandOptions {
         hits: number;
     };
     /** Test seam for the file read. */
-    readFile?: (file: string) => Promise<Buffer>;
+    readFile?: (file: string, maxBytes: number) => Promise<ReadResult>;
 }

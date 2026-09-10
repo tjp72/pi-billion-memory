@@ -87,11 +87,15 @@ Coverage that must be preserved and extended, never removed:
 - **block expansion (opt-in)**: `msg_ids` pointers stored at ingestion from pi
   `effectiveMessageIds` / opencode `messageIds` (including `#call_...` selectors, duplicates,
   dangling refs, and malformed pointer payloads); `list` mode returns a manifest with no
-  conversation text; `full` mode renders only an explicit `select`, and a narrow selection is
-  **not** reported as truncation; `maxChars`/`maxMessages` caps and the injected redactor are
-  honored; missing session files and byte-capped reads degrade instead of throwing; pointer
-  backfill refreshes existing rows without re-inserting them; the 0.4.x -> 0.5.0 migration adds
-  `msg_ids` and resets the watermark ledger exactly once;
+  conversation text; `full` mode renders only an explicit `select` and **throws** when that
+  selection is empty, a narrow selection is **not** reported as truncation while a per-entry trim
+  is, and the rendered text never exceeds `maxChars`; `maxChars`/`maxMessages` caps and the
+  injected redactor are honored; `readCapped` stops the physical read at `expandMaxReadBytes`,
+  and missing session files degrade to `missing` refs instead of throwing; `custom_message`
+  (extension-injected) lines expand as user text and generated `acp_summary_*` refs are labelled
+  `synthetic`; pointer backfill refreshes existing rows without re-inserting them and clears
+  pointers the sidecar no longer lists; the 0.4.x -> 0.5.0 migration adds `msg_ids` and resets the
+  watermark ledger exactly once, including for a source row that had no ledger row yet;
 
 Fixture conventions: sessions live under encoded-dir names like `--home-dev-ProjA--` with a
 matching neutral cwd (`/home/dev/ProjA` -> project `ProjA`). Keep it that way — no real paths.
@@ -153,8 +157,9 @@ The design is deliberately minimal; preserve these properties:
   ingestion skips tombstoned `(source_file, block_id)` pairs.
 - **Expansion is opt-in, two-step, and read-only**: `memory_expand` is registered only when
   `expandEnabled` is true (default false). `list` mode returns a manifest with no conversation
-  text; `full` mode renders only an explicit selection, bounded by `expandMaxChars`,
-  `expandMaxMessages`, and `expandMaxReadBytes`. Expanded text passes through `redactSecrets()`,
+  text; `full` mode requires a non-empty `select` and never renders a whole block implicitly,
+  bounded by `expandMaxChars`, `expandMaxMessages`, and `expandMaxReadBytes` (a physical
+  `fsp.open` + capped `read`, never a post-hoc slice of a whole file). Expanded text passes through `redactSecrets()`,
   and nothing is written to the store. `blocks.msg_ids` is populated from the sidecar at
   ingestion — ingestion itself must never read message lines. The 0.5.0 migration adds the column
   and resets the watermark ledger **once** to backfill pointers; `INSERT OR IGNORE` must keep
@@ -178,7 +183,8 @@ The design is deliberately minimal; preserve these properties:
   `~/.pi/pi-billion-memory.sources.jsonl`; log `~/.pi/pi-billion-memory.log` (1 MB cap). All under
   `os.homedir()/.pi` unless overridden by user config — never hardcode paths. `expandEnabled`
   (default `false`), `expandMaxChars`, `expandMaxMessages`, and `expandMaxReadBytes` bound the
-  optional expansion tool.
+  optional expansion tool. `~` in a configured path expands to the home directory — config paths
+  must never create a literal `~` directory.
 
 ## 5. Scope and known boundaries
 

@@ -47,7 +47,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { expandBlock, parseMsgIds } from "./expand.js";
+import { expandBlock, isSyntheticRef, parseMsgIds } from "./expand.js";
 
 // ---------------------------------------------------------------------------
 // Constants / config / logging
@@ -101,18 +101,22 @@ const PI_MAP_TTL_MS = 10 * 60 * 1000;
 /** Hard cap for the session header read; the first line is normally a few KB */
 const SESSION_HEADER_MAX_BYTES = 1_000_000;
 
-function sanitizeCfg(over) {
+/** @internal Test seam: the same sanitizer the config loader uses. */
+export function sanitizeCfg(over) {
   const out: Record<string, any> = {};
   if (!over || typeof over !== "object") return out;
-  if (typeof over.dbPath === "string" && over.dbPath) out.dbPath = over.dbPath;
+  // Config paths accept `~`/`~/`: a config copied from the README must never create a literal "~"
+  // directory next to the working directory (expandHome is applied to source roots for the same
+  // reason below).
+  if (typeof over.dbPath === "string" && over.dbPath) out.dbPath = expandHome(over.dbPath);
   if (typeof over.maxSummaryChars === "number" && Number.isFinite(over.maxSummaryChars) && over.maxSummaryChars > 0) {
     out.maxSummaryChars = Math.floor(over.maxSummaryChars);
   }
   if (typeof over.debug === "boolean") out.debug = over.debug;
   if (Array.isArray(over.excludeDirs)) out.excludeDirs = over.excludeDirs.filter((x) => typeof x === "string");
   if (typeof over.scanOnStartup === "boolean") out.scanOnStartup = over.scanOnStartup;
-  if (typeof over.sourcesPath === "string" && over.sourcesPath) out.sourcesPath = over.sourcesPath;
-  if (typeof over.logPath === "string" && over.logPath) out.logPath = over.logPath;
+  if (typeof over.sourcesPath === "string" && over.sourcesPath) out.sourcesPath = expandHome(over.sourcesPath);
+  if (typeof over.logPath === "string" && over.logPath) out.logPath = expandHome(over.logPath);
   if (typeof over.expandEnabled === "boolean") out.expandEnabled = over.expandEnabled;
   if (Number.isInteger(over.expandMaxChars) && over.expandMaxChars > 0) out.expandMaxChars = over.expandMaxChars;
   if (Number.isInteger(over.expandMaxMessages) && over.expandMaxMessages > 0)
@@ -321,6 +325,22 @@ function defaultSources() {
   ];
 }
 
+/**
+ * Shared WHERE clause for block lookups: exact block id plus an optional substring match on the
+ * source file name or the project. Returns the clause and its positional parameters so count and
+ * page queries can never drift apart.
+ */
+function blockFilter(blockId, source) {
+  const params: any[] = [String(blockId)];
+  let where = "b.block_id = ?";
+  if (source) {
+    where += " AND (b.source_file LIKE ? ESCAPE '\\' OR s.project LIKE ? ESCAPE '\\')";
+    const like = `%${String(source).replace(/[\\%_]/g, (m) => "\\" + m)}%`;
+    params.push(like, like);
+  }
+  return { where, params };
+}
+
 function sanitizeSource(raw) {
   if (!raw || typeof raw !== "object") return null;
   const id = typeof raw.id === "string" ? raw.id : null;
@@ -430,9 +450,12 @@ function cleanOpencodeSummary(summary) {
  * `messageIds`. An unrecognized shape yields null, so the block is stored as "not expandable"
  * instead of failing ingestion.
  */
-function collectMsgIds(block: any): string[] | null {
-  const raw = block?.effectiveMessageIds ?? block?.messageIds;
-  if (!Array.isArray(raw)) return null;
+/** @internal Test seam: exposed so the first-non-empty-list rule stays covered. */
+export function collectMsgIds(block: any): string[] | null {
+  // `??` alone would let an explicitly empty first field hide a populated second one, so take the
+  // first list that actually has entries.
+  const raw = [block?.effectiveMessageIds, block?.messageIds].find((v) => Array.isArray(v) && v.length > 0);
+  if (!raw) return null;
   const out: string[] = [];
   const seen = new Set<string>();
   for (const item of raw) {
@@ -586,11 +609,8 @@ export class MemoryDb {
     // Rows created before the column existed keep NULL, so reset the watermark ledger once to force
     // a re-parse of every source and backfill the pointers. Tombstones still block resurrection.
     const blockCols = this.db.prepare("PRAGMA table_info(blocks)").all();
-    if (!blockCols.some((c) => c.name === "msg_ids")) {
-      this.db.exec("ALTER TABLE blocks ADD COLUMN msg_ids TEXT;");
-      this.db.exec("UPDATE source_watermarks SET last_mtime_ms = 0, last_size = 0;");
-      logLine("migrated blocks.msg_ids; watermark ledger reset once for pointer backfill");
-    }
+    const addedMsgIds = !blockCols.some((c) => c.name === "msg_ids");
+    if (addedMsgIds) this.db.exec("ALTER TABLE blocks ADD COLUMN msg_ids TEXT;");
     // Idempotent migration: seed the watermark ledger from existing sources rows.
     this.db.exec(`
       INSERT OR IGNORE INTO source_watermarks(source_file, last_mtime_ms, last_size, updated_at)
@@ -598,6 +618,12 @@ export class MemoryDb {
       FROM sources
       WHERE last_mtime_ms IS NOT NULL AND last_size IS NOT NULL;
     `);
+    // Reset the ledger once, after the seed: seeding first would re-stamp the watermarks that the
+    // reset is about to clear, and the pointer backfill re-read would never happen.
+    if (addedMsgIds) {
+      this.db.exec("UPDATE source_watermarks SET last_mtime_ms = 0, last_size = 0;");
+      logLine("migrated blocks.msg_ids; watermark ledger reset once for pointer backfill");
+    }
     const trig = this.db
       .prepare("SELECT count(*) AS c FROM sqlite_master WHERE type='trigger' AND name IN ('blocks_ai','blocks_ad')")
       .get();
@@ -762,11 +788,14 @@ export class MemoryDb {
          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE NOT EXISTS (SELECT 1 FROM block_tombstones WHERE source_file = ? AND block_id = ?)`,
       );
-      // INSERT OR IGNORE leaves existing rows alone, so refresh the pointer column separately.
-      // Only msg_ids changes, which keeps the FTS external-content table valid.
+      // INSERT OR IGNORE leaves existing rows alone, so refresh the pointer column separately —
+      // including back to NULL, because a sidecar that re-emits a block_id without references must
+      // not leave stale pointers behind (they would expand to messages the block no longer covers).
+      // Only msg_ids changes, which keeps the FTS external-content table valid. `IS NOT` is
+      // SQLite's null-safe comparison, so an unchanged value still reports 0 change.
       const updMsgIds = this.db.prepare(
         `UPDATE blocks SET msg_ids = ?
-          WHERE source_file = ? AND block_id = ? AND (msg_ids IS NULL OR msg_ids <> ?)`,
+          WHERE source_file = ? AND block_id = ? AND (msg_ids IS NOT ?)`,
       );
       for (const b of blocks) {
         if (!b || typeof b.summary !== "string") continue;
@@ -796,7 +825,7 @@ export class MemoryDb {
           b.blockId,
         );
         if (r.changes > 0) inserted++;
-        else if (msgIdsJson && updMsgIds.run(msgIdsJson, sourceFile, b.blockId, msgIdsJson).changes > 0) refreshed++;
+        else if (updMsgIds.run(msgIdsJson, sourceFile, b.blockId, msgIdsJson).changes > 0) refreshed++;
       }
       this.db.exec("COMMIT");
     } catch (e) {
@@ -823,13 +852,7 @@ export class MemoryDb {
    */
   findBlocks(blockId, source = null, limit = 10) {
     this.open();
-    const params: any[] = [String(blockId)];
-    let where = "b.block_id = ?";
-    if (source) {
-      where += " AND (b.source_file LIKE ? ESCAPE '\\' OR s.project LIKE ? ESCAPE '\\')";
-      const like = `%${String(source).replace(/[\\%_]/g, (m) => "\\" + m)}%`;
-      params.push(like, like);
-    }
+    const { where, params } = blockFilter(blockId, source);
     params.push(Math.max(1, Math.min(50, limit)));
     return this.db
       .prepare(
@@ -844,6 +867,25 @@ export class MemoryDb {
           LIMIT ?`,
       )
       .all(...params);
+  }
+
+  /**
+   * Count stored rows for a block id with the same filter as {@link findBlocks} (ignoring `limit`),
+   * so a caller can report the real number of duplicates instead of the page size.
+   * @param {string} blockId block id as shown by memory_search (e.g. "b1")
+   * @param {string|null} source optional substring match on the source file name or project
+   * @returns {number} number of matching rows
+   */
+  countBlocks(blockId, source = null) {
+    this.open();
+    const { where, params } = blockFilter(blockId, source);
+    return this.db
+      .prepare(
+        `SELECT count(*) AS c
+           FROM blocks b LEFT JOIN sources s ON s.source_file = b.source_file
+          WHERE ${where}`,
+      )
+      .get(...params).c;
   }
 
   /**
@@ -1316,21 +1358,31 @@ function formatExpansion(row, sessionFile, res, mode) {
       `${row.createdAt ? ` · ${fmtTs(row.createdAt)}` : ""} · ${res.entries.length} message ref(s)` +
       ` · ${fmtTokens(row.tokens) || "?"} tok compressed`,
     `Source: ${sourceLabel(row)}`,
-    `Session: ${sessionFile}`,
+    // Basename only: the absolute path carries the OS user name and the encoded project directory,
+    // and expansion never needs it (the `source` filter takes the session file name or project).
+    `Session: ${path.basename(sessionFile)}`,
   ];
   const kb = (n) => `${Math.round(n / 1024)} KB`;
   lines.push(
-    res.readTruncated
-      ? `Read: ${kb(res.bytesRead)} of ${kb(res.totalBytes)} (read cap hit; later messages may be missing)`
-      : `Read: ${kb(res.totalBytes)} (complete)`,
+    res.sessionMissing
+      ? "Read: session file is gone (deleted, rotated, or renamed since ingestion)"
+      : res.readTruncated
+        ? `Read: ${kb(res.bytesRead)} of ${kb(res.totalBytes)} (read cap hit; later messages may be missing)`
+        : `Read: ${kb(res.totalBytes)} (complete)`,
   );
-  const missing = res.entries.filter((e) => !e.found).length;
+  // Upstream versions can synthesize their own ids for summary entries ("acp_summary_*"); no such
+  // line exists in a session file, so label those instead of calling them missing.
+  const synthetic = res.entries.filter((e) => !e.found && isSyntheticRef(e.messageId)).length;
+  const missing = res.entries.filter((e) => !e.found).length - synthetic;
   if (missing > 0) lines.push(`Missing: ${missing} referenced message(s) not present in the session file`);
+  if (synthetic > 0) {
+    lines.push(`Synthetic: ${synthetic} reference(s) point at generated ids the session file never holds`);
+  }
   lines.push("");
   if (mode === "list") {
     const shown = res.entries.slice(0, EXPAND_MANIFEST_MAX);
     for (const e of shown) {
-      const role = (e.found ? e.role || "?" : "missing").padEnd(11);
+      const role = (e.found ? e.role || "?" : isSyntheticRef(e.messageId) ? "synthetic" : "missing").padEnd(11);
       const size = e.found ? `${String(e.chars).padStart(6)} chars` : "          ";
       lines.push(`${String(e.index).padStart(4)}  ${role} ${size}  ${e.ref}`);
     }
@@ -1400,12 +1452,13 @@ const MEMORY_EXPAND_PARAMETERS = {
       type: "string",
       enum: ["list", "full"],
       description:
-        "'list' (default) returns a manifest of the absorbed messages with no conversation text; 'full' renders the selected text",
+        "'list' (default) returns a manifest of the absorbed messages with no conversation text; 'full' renders exactly the indices given in 'select'",
     },
     select: {
       type: "array",
       items: { type: "number" },
-      description: "1-based message indices from a 'list' result to render; omit to render all (still bounded)",
+      description:
+        "1-based message indices taken from a 'list' result; required (and non-empty) for mode 'full', which never renders a whole block at once",
     },
     limit: { type: "number", description: "Max messages to render, default from expandMaxMessages" },
     chars: { type: "number", description: "Max characters to return, default from expandMaxChars" },
@@ -1589,7 +1642,10 @@ export default async function factory(pi: ExtensionAPI) {
               details: { mode: "error", hits: 0 },
             };
           }
-          const rows = getDb().findBlocks(p.block, p.source);
+          const db = getDb();
+          const rows = db.findBlocks(p.block, p.source);
+          // Rows are paged (findBlocks defaults to 10); count separately so the report is honest.
+          const total = rows.length ? db.countBlocks(p.block, p.source) : 0;
           if (rows.length === 0) {
             return {
               content: [
@@ -1616,10 +1672,10 @@ export default async function factory(pi: ExtensionAPI) {
               content: [
                 {
                   type: "text",
-                  text: `memory_expand: ${rows.length} blocks share the id '${p.block}'. Add 'source' to pick one:\n${list}`,
+                  text: `memory_expand: ${total} block(s) share the id '${p.block}' (showing the newest ${rows.length}). Add 'source' to pick one:\n${list}`,
                 },
               ],
-              details: { mode: "ambiguous", hits: rows.length },
+              details: { mode: "ambiguous", hits: total },
             };
           }
           const row = rows[0];
