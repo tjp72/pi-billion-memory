@@ -1,6 +1,7 @@
 # pi-billion-memory
 
 [![CI](https://github.com/tjp72/pi-billion-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/tjp72/pi-billion-memory/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/tjp72/pi-billion-memory?sort=semver)](https://github.com/tjp72/pi-billion-memory/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Long-term memory extension for the [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent):
@@ -87,14 +88,14 @@ affiliated with, endorsed by, or a fork of**
 The extension is distributed **through git only** — there is no npm package, so
 every install path is `pi install git:...`.
 
-### GitHub (private repository)
+### GitHub
 
 ```bash
 # Latest main — simplest, but not reproducible
-pi install git:git@github.com:tjp72/pi-billion-memory.git
-
-# HTTPS instead of SSH — git credentials are required
 pi install git:https://github.com/tjp72/pi-billion-memory.git
+
+# SSH instead of HTTPS — handy if you already have a key registered with GitHub
+pi install git:git@github.com:tjp72/pi-billion-memory.git
 ```
 
 Append `@<tag>` to pin a release (reproducible; tags are listed on the
@@ -107,6 +108,15 @@ pi install git:git@github.com:tjp72/pi-billion-memory.git@<tag>
 > `pi install git:...` clones the repository and runs `npm install --omit=dev`.
 > It does not build the project, so the built `dist/` directory is committed to
 > the repository. Do not delete `dist/` before tagging a release.
+
+### Update
+
+```bash
+pi update --extensions   # re-reconciles git packages; pinned tags stay where they are
+```
+
+To move a tag-pinned install to a newer release, re-run the install line with the
+new tag (`pi install git:https://github.com/tjp72/pi-billion-memory@v0.5.1`).
 
 ### Local development
 
@@ -394,8 +404,10 @@ machine. That is also the only configuration it is safe in.
   the allow-list) at persistent storage if that matters.
 - **Redaction is best-effort, storage is plaintext.** The secret/URL filter is
   regex-based, applies to newly ingested blocks only, and existing rows are
-  never rewritten. The database is not encrypted and file permissions are not
-  hardened, so any process that can read the home directory can read it. There
+  never rewritten. The database is not encrypted; the store file is created
+  owner-only where the OS supports it (`0600` on POSIX, ignored on Windows),
+  but that is best-effort hardening rather than protection — the log file and
+  the SQLite `-wal`/`-shm` files are not covered. There
   is no quota, retention policy, or audit log beyond `/memory prune`.
 - **Cross-machine use**: sync the sidecar files, not the database. Each machine
   should build its own index from its own source files.

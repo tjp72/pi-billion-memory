@@ -1,0 +1,69 @@
+name: Bug report
+description: Something is broken or behaves differently than documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Do not paste real session content, memory summaries, or
+        absolute personal paths.** Reproduce with neutral data (`/home/dev/ProjX`) or a
+        redacted snippet. For security or privacy problems, use the private advisory
+        form instead — see the issue chooser.
+  - type: input
+    id: version
+    attributes:
+      label: pi-billion-memory version
+      description: The tag you installed, or the commit SHA when you track `main`.
+      placeholder: v0.5.1
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      description: Output of `node --version`. Node >= 22.19 is required.
+      placeholder: v22.23.1
+    validations:
+      required: true
+  - type: input
+    id: pi
+    attributes:
+      label: pi version
+      description: Output of `pi --version`.
+      placeholder: 0.85.1
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - WSL
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you run, what did you expect, and what happened instead? Include `/memory` output when it is relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Steps with neutral paths and fixture data only.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt (optional)
+      description: |
+        `~/.pi/pi-billion-memory.log`. With `debug` enabled it can contain absolute paths —
+        redact user names, project names, and anything else private before pasting.
+    validations:
+      required: false

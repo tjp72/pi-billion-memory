@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.1] - 2026-09-10
 
 ### Changed
 
@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tag matches `package.json`, re-checks the committed `dist/`, and creates the GitHub release from
   the matching `CHANGELOG.md` section. `pi install git:...` is the only documented install path,
   and the npm badge and npm install/uninstall sections were removed from both READMEs.
+- The store file is created `0600` where the OS supports it (ignored on Windows).
+- Errors returned to the model by `memory_search`/`memory_expand` no longer contain absolute local
+  paths; the full trace stays in the extension log.
+- CI limits the workflow token to `contents: read`, the release workflow extracts release notes
+  with a literal version match instead of a regular expression, and the declared
+  `billion-context-pi` peer range is `>=0.1.65` to match the documented tested version.
+- The install docs are written for the public repository: HTTPS first (no credentials required),
+  SSH as the alternative, plus an "Update" section and a release badge.
+- Both workflows pin `actions/checkout` and `actions/setup-node` to commit SHAs. The repository
+  also gained issue forms (bug report with version/Node/pi fields), a pull-request template,
+  Dependabot configuration, and a Code of Conduct.
 
 ### Added
 
@@ -44,6 +55,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The ambiguous-block message reports the real number of matches instead of the page size.
   - Manifests no longer print an absolute session path, and generated `acp_summary_*` references
     are labelled `synthetic` rather than counted as recoverable text.
+- Scan and store lifecycle hardening after a follow-up review:
+  - A background scan can no longer reopen the closed store after `session_shutdown`: the scan
+    aborts per file when the session generation moved on, and `getDb()` refuses to open a latched
+    store instead of recreating it.
+  - One failing allow-list source (unreadable root, corrupt opencode DB, adapter bug) no longer
+    aborts every remaining source; failures are counted and logged per source.
+  - An allow-list entry with an unknown `adapter` is rejected and logged when the list is read,
+    instead of falling through to the permissive scan-time path.
+  - `/memory prune` writes its tombstones and deletes in one transaction, so a crash cannot leave
+    the two halves inconsistent, and a failing `VACUUM` is logged instead of failing the prune.
+  - An ingest that finishes reading a file after `session_shutdown` returns `store closed` instead
+    of touching a null handle and then failing again in `ROLLBACK`.
+  - A scan whose allow-list root holds more than 20,000 entries stops at the cap and logs it,
+    instead of walking an accidentally over-broad tree to the end.
+  - Log lines no longer contain absolute session or working-directory paths unless `debug` is on
+    (the store path is logged as a file name) — logs are what users paste into public issues.
+  - `SECURITY.md` no longer points "above" at a section that sits below it.
 
 ## [0.5.0] - 2026-09-10
 

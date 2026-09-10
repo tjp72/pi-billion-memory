@@ -1,6 +1,7 @@
 # pi-billion-memory
 
 [![CI](https://github.com/tjp72/pi-billion-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/tjp72/pi-billion-memory/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/tjp72/pi-billion-memory?sort=semver)](https://github.com/tjp72/pi-billion-memory/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
@@ -73,14 +74,14 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
 
 本扩展**只通过 git 分发**——没有 npm 包，所以所有安装方式都是 `pi install git:...`。
 
-### GitHub（私有仓库）
+### GitHub
 
 ```bash
 # 最新 main——最省事，但不可复现
-pi install git:git@github.com:tjp72/pi-billion-memory.git
-
-# 用 HTTPS 代替 SSH——需要 git 凭据
 pi install git:https://github.com/tjp72/pi-billion-memory.git
+
+# 用 SSH 代替 HTTPS——适合已把密钥注册到 GitHub 的情况
+pi install git:git@github.com:tjp72/pi-billion-memory.git
 ```
 
 在末尾追加 `@<tag>` 可钉住某个发布版本（可复现；tag 见
@@ -92,6 +93,15 @@ pi install git:git@github.com:tjp72/pi-billion-memory.git@<tag>
 
 > `pi install git:...` 会 clone 仓库并执行 `npm install --omit=dev`，**不会执行
 > build**，所以构建产物 `dist/` 必须提交到仓库。打 tag 前不要删除 `dist/`。
+
+### 更新
+
+```bash
+pi update --extensions   # 重新对齐 git 包；钉住的 tag 不会移动
+```
+
+要把钉住 tag 的安装升到新版本，用新 tag 重新执行一次安装命令
+（`pi install git:https://github.com/tjp72/pi-billion-memory@v0.5.1`）。
 
 ### 本地开发安装
 
@@ -335,7 +345,8 @@ npm run verify:dist  # 构建并检查已提交的 dist/ 是否过期
 - **home 不持久 = 每次重建索引**：CI 或无状态容器里每次启动都会重建索引；介意的话把 `dbPath`
   和白名单指到持久化位置。
 - **脱敏是尽力而为，存储是明文**：密钥/URL 过滤基于正则，只作用于新入库的块，已有行永不重写。
-  数据库不加密，也**没有做文件权限收紧**，因此任何能读该 home 目录的进程都能读它。
+  数据库不加密；库文件在支持的系统上会尽力收紧为仅属主可读（POSIX 下 `0600`，Windows 上无效果），
+  但这只是尽力加固而非保护—日志文件和 SQLite 的 `-wal`/`-shm` 文件不在范围内。
   除 `/memory prune` 外没有配额、保留策略或审计日志。
 - **跨机器**：同步 sidecar 文件，不要同步数据库；每台机器用自己的源文件各建一份索引。
 

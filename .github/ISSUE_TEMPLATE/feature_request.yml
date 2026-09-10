@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a capability or an improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep the project's constraints in mind: local-only (no network calls), no third-party
+        runtime dependencies beyond the pi host API, allow-listed sources only, and no parsing
+        of raw conversation messages.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation where the extension gets in your way or misses something.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should happen instead? If it adds a config option or a tool parameter, sketch the shape.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, or why the obvious approach does not fit the constraints above.
+    validations:
+      required: false

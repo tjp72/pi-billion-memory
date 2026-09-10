@@ -203,6 +203,16 @@ The design is deliberately minimal; preserve these properties:
 - Upstream compression formats are internal implementations that can change. Adapters must be
   defensive: detect/ignore malformed or mid-write files (parse failure leaves the watermark
   untouched), never crash the scan, and remain easy to update when a source format changes.
+  A source that throws must degrade to a `failed` count, never abort the rest of the scan, and an
+  allow-list entry with an unknown `adapter` must be rejected where the list is read.
+- Scan lifecycle: `session_shutdown` closes the store and latches it closed. A scan in flight must
+  stop at the next boundary (session-generation check) and must never reopen the file-backed store;
+  `getDb()` throws once the store is latched instead of recreating it.
+- `MemoryDb.prune` writes tombstones and deletes inside one transaction; `VACUUM` runs after the
+  commit and is best-effort (logged, never fatal). The store file is chmod `0600` where the OS
+  supports it.
+- Text returned to the model (tool results) must not contain absolute local paths (log, database,
+  session); the full trace belongs in the extension log. Use `withoutPaths` in `src/extension.ts`.
 - `memory_search` must stay a cheap, reliable lookup — no network calls, no external services.
 
 ## 6. Git hygiene

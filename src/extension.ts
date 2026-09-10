@@ -36,7 +36,7 @@
  * credential values are replaced with [REDACTED] and URLs with [REDACTED_URL]; the hit count is
  * logged without the value.
  *
- * Install: `pi install git:git@github.com:tjp72/pi-billion-memory.git@<tag>`
+ * Install: `pi install git:https://github.com/tjp72/pi-billion-memory.git@<tag>`
  *   (git distribution only; there is no npm package).
  * Build: `npm run build` (tsup + tsc) emits `dist/index.js`.
  * Config: ~/.pi/pi-billion-memory.json (optional; see loadConfig defaults below).
@@ -341,13 +341,30 @@ function blockFilter(blockId, source) {
   return { where, params };
 }
 
-function sanitizeSource(raw) {
+/**
+ * Strip local absolute paths from text that goes back to the model. A tool error must not hand over
+ * the layout of the machine (log, database, and session paths). Full details stay in the log.
+ */
+function withoutPaths(text: string): string {
+  return String(text)
+    .replace(/[A-Za-z]:\\[^\s'"]+/g, "<path>")
+    .replace(/(?<![\w.:/])~?\/[^\s'":,)]+/g, "<path>");
+}
+
+/** Adapter ids the scanner understands; anything else is rejected where the allow-list is read. */
+const SOURCE_ADAPTERS = new Set(["pi-sidecar", "opencode-acp"]);
+
+/** @internal Test seam: the same validation the allow-list loader applies. */
+export function sanitizeSource(raw) {
   if (!raw || typeof raw !== "object") return null;
   const id = typeof raw.id === "string" ? raw.id : null;
   const adapter = typeof raw.adapter === "string" ? raw.adapter : null;
   const root = typeof raw.root === "string" ? expandHome(raw.root) : null;
   const pattern = typeof raw.pattern === "string" ? raw.pattern : null;
   if (!id || !adapter || !root || !pattern) return null;
+  // An unknown adapter used to fall through to the permissive branch at scan time; reject it here
+  // so a typo in the allow-list is visible instead of a silently dead source.
+  if (!SOURCE_ADAPTERS.has(adapter)) return null;
   const out: any = {
     id,
     adapter,
@@ -377,8 +394,10 @@ export async function loadSources() {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
     try {
-      const s = sanitizeSource(JSON.parse(line));
+      const parsed = JSON.parse(line);
+      const s = sanitizeSource(parsed);
       if (s) list.push(s);
+      else logLine(`sources line ignored: bad id/adapter/root/pattern or unknown adapter '${parsed?.adapter}'`);
     } catch (e) {
       logLine(`sources line ignored: ${e.message}`);
     }
@@ -395,7 +414,11 @@ function fileMatches(pattern, name) {
   return re.test(name);
 }
 
-async function walkFiles(dir, filePattern) {
+// An allow-list root that accidentally points at ~ (or /) must not stall the scan: stop after this
+// many visited entries and log it, instead of walking the whole filesystem.
+const MAX_SCAN_FILES = 20000;
+
+async function walkFiles(dir, filePattern, budget = { left: MAX_SCAN_FILES, hitCap: false }) {
   let entries;
   try {
     entries = await fs.promises.readdir(dir, { withFileTypes: true });
@@ -404,9 +427,14 @@ async function walkFiles(dir, filePattern) {
   }
   const out = [];
   for (const ent of entries) {
+    if (budget.left <= 0) {
+      budget.hitCap = true;
+      return out;
+    }
+    budget.left--;
     const full = path.join(dir, ent.name);
     if (ent.isDirectory()) {
-      out.push(...(await walkFiles(full, filePattern)));
+      out.push(...(await walkFiles(full, filePattern, budget)));
     } else if (ent.isFile() && fileMatches(filePattern, ent.name)) {
       out.push(full);
     }
@@ -427,9 +455,24 @@ export async function listSourceFiles(source) {
   const recursive = parts.length > 1 || parts[0] === "**";
   if (!recursive) {
     const names = await fs.promises.readdir(root);
-    return names.filter((n) => fileMatches(filePattern, n)).map((n) => path.join(root, n));
+    const matched = names.filter((n) => fileMatches(filePattern, n));
+    if (matched.length > MAX_SCAN_FILES) {
+      logLine(
+        `scan: source '${source.id}' has ${matched.length} matching files; only the first ${MAX_SCAN_FILES} are considered`,
+      );
+      matched.length = MAX_SCAN_FILES;
+    }
+    return matched.map((n) => path.join(root, n));
   }
-  return walkFiles(root, filePattern);
+  const budget = { left: MAX_SCAN_FILES, hitCap: false };
+  const files = await walkFiles(root, filePattern, budget);
+  if (budget.hitCap) {
+    logLine(
+      `scan: source '${source.id}' hit the ${MAX_SCAN_FILES}-entry cap; the rest was skipped ` +
+        "(check that the allow-list root points at a session directory, not at a whole home directory)",
+    );
+  }
+  return files;
 }
 
 // ---------------------------------------------------------------------------
@@ -528,6 +571,8 @@ function normalizeOpencodeBlocks(data: any) {
 export class MemoryDb {
   dbPath: string;
   db: any = null;
+  /** True between close() and the next open(): an in-flight ingest must fail, not touch a null handle. */
+  closed = false;
 
   /**
    * @param {string} dbPath
@@ -542,6 +587,14 @@ export class MemoryDb {
     if (!DatabaseSyncCtor) throw new Error("node:sqlite unavailable");
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
     this.db = new DatabaseSyncCtor(this.dbPath);
+    this.closed = false;
+    // The store holds conversation summaries: keep it readable by the user only. Best effort, so a
+    // filesystem that cannot express modes (Windows) simply keeps its defaults.
+    try {
+      if (process.platform !== "win32") fs.chmodSync(this.dbPath, 0o600);
+    } catch {
+      // Ignore: permissions are hardening, not a functional requirement.
+    }
     this.db.exec("PRAGMA journal_mode=WAL;");
     this.db.exec("PRAGMA busy_timeout=5000;");
     this.db.exec("PRAGMA synchronous=NORMAL;");
@@ -643,6 +696,7 @@ export class MemoryDb {
   }
 
   close() {
+    this.closed = true;
     if (this.db) {
       try {
         this.db.close();
@@ -752,6 +806,12 @@ export class MemoryDb {
         size,
         error: "unrecognized source format",
       };
+    }
+    if (this.closed) {
+      // The session ended while this file was being read: the connection is gone, and a closed
+      // store must not be reopened behind the user's back. Report a plain failure instead of a
+      // TypeError from a null handle (plus a second one from the ROLLBACK).
+      return { ok: false, parsed: true, total: 0, inserted: 0, mtimeMs, size, error: "store closed" };
     }
     const now = Date.now();
     let inserted = 0;
@@ -1018,26 +1078,47 @@ export class MemoryDb {
     const cutoff = Date.now() - keepDays * 86400000;
     const now = Date.now();
     const before = this.db.prepare("SELECT count(*) AS c FROM blocks").get().c;
-    // Record durable tombstones first: a later source-file change must not resurrect pruned blocks.
-    this.db
-      .prepare(
-        `INSERT OR IGNORE INTO block_tombstones(source_file, block_id, pruned_at)
-         SELECT source_file, block_id, ? FROM blocks
-         WHERE created_at IS NOT NULL AND created_at < ?`,
-      )
-      .run(now, cutoff);
-    this.db.prepare("DELETE FROM blocks WHERE created_at IS NOT NULL AND created_at < ?").run(cutoff);
-    const rs = this.db
-      .prepare(
-        "DELETE FROM sources WHERE NOT EXISTS (SELECT 1 FROM blocks b WHERE b.source_file = sources.source_file)",
-      )
-      .run();
-    this.db.exec("VACUUM");
+    // Tombstones and deletes are one unit: a crash between them would make the delete look like it
+    // never happened, so a later source-file change could resurrect pruned blocks.
+    this.db.exec("BEGIN IMMEDIATE");
+    let removedSources = 0;
+    try {
+      // Record durable tombstones first: a later source-file change must not resurrect pruned blocks.
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO block_tombstones(source_file, block_id, pruned_at)
+           SELECT source_file, block_id, ? FROM blocks
+           WHERE created_at IS NOT NULL AND created_at < ?`,
+        )
+        .run(now, cutoff);
+      this.db.prepare("DELETE FROM blocks WHERE created_at IS NOT NULL AND created_at < ?").run(cutoff);
+      const rs = this.db
+        .prepare(
+          "DELETE FROM sources WHERE NOT EXISTS (SELECT 1 FROM blocks b WHERE b.source_file = sources.source_file)",
+        )
+        .run();
+      removedSources = rs.changes;
+      this.db.exec("COMMIT");
+    } catch (e) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // The failing statement is the one worth reporting.
+      }
+      throw e;
+    }
+    // VACUUM cannot run inside a transaction, and a busy database is no reason to fail the prune:
+    // the rows are already gone, only the file size stays behind.
+    try {
+      this.db.exec("VACUUM");
+    } catch (e) {
+      logLine(`prune: VACUUM skipped (${e.message}); rows pruned, file size unchanged`);
+    }
     const remain = this.db.prepare("SELECT count(*) AS c FROM blocks").get().c;
     return {
       removedBlocks: before - remain,
-      removedSources: rs.changes,
-      removedSessions: rs.changes,
+      removedSources,
+      removedSessions: removedSources,
       remainingBlocks: remain,
     };
   }
@@ -1051,6 +1132,8 @@ export class MemoryDb {
 let db = null;
 /** Session generation guard: a stale background scan must not touch the DB after shutdown. */
 let sessionGeneration = 0;
+/** Set once the store is closed at session end: no continuation may reopen the file-backed DB. */
+let dbClosed = false;
 let backgroundScan = null;
 /** Cached official SessionManager map (fallback only; the header read is the primary path). */
 let piMapCache = null;
@@ -1061,6 +1144,7 @@ let piHeaderReadCount = 0;
 /** @internal */
 export function getDb() {
   if (!db) db = new MemoryDb(cfg.dbPath);
+  if (dbClosed) throw new Error("memory store is closed for this session");
   db.open();
   return db;
 }
@@ -1212,6 +1296,9 @@ export async function scanSources(force = false) {
   await loadSqlite();
   const d = getDb();
   const sources = await loadSources();
+  // A shutdown or session switch bumps this while a scan is in flight. The scan then stops instead
+  // of reopening (and writing into) a database the user's session already closed.
+  const generation = sessionGeneration;
   const needPiCwd = sources.some((s) => s.enabled && s.adapter === "pi-sidecar");
   // Lazy cwd resolution: called by ingestSourceFile only after the watermark check says the
   // source must be (re)parsed. Header read first; official SessionManager map is the fallback.
@@ -1232,45 +1319,76 @@ export async function scanSources(force = false) {
   let enabledSources = 0;
   for (const source of sources) {
     if (!source.enabled) continue;
+    if (generation !== sessionGeneration) {
+      logLine("scan: stopped early, the session was closed while scanning");
+      break;
+    }
     enabledSources++;
-    let files = await listSourceFiles(source);
-    if (source.adapter === "pi-sidecar" && cfg.excludeDirs.length) {
-      // Keep the legacy per-directory exclusion working when a pi root contains many session dirs.
-      files = files.filter((f) => {
-        const rel = path.relative(source.root, f);
-        return !rel.split(path.sep).some((seg) => cfg.excludeDirs.includes(seg));
-      });
+    // Partial counts survive a throwing source: the tally is filled in as the scan progresses.
+    const tally = { files: 0, scanned: 0, inserted: 0, redacted: 0, total: 0, failed: 0 };
+    try {
+      await scanOneSource(source, d, force, resolvePiCwd, generation, tally);
+    } catch (e) {
+      // One broken source (unreadable root, corrupt opencode DB, adapter bug) must not hide every
+      // source behind it.
+      tally.failed++;
+      logLine(`source '${source.id}' (${source.adapter}) failed: ${e.stack || e.message}`);
     }
-    fileCount += files.length;
-    let opencodeMap = null;
-    if (source.adapter === "opencode-acp" && files.length) {
-      opencodeMap = await loadOpencodeSessionMap(source, files);
-    }
-    for (const file of files) {
-      let meta;
-      if (source.adapter === "pi-sidecar") {
-        // cwd is resolved lazily inside ingestSourceFile (explicit → stored → header → API map).
-        meta = { kind: "pi", cwd: null, project: null };
-      } else if (source.adapter === "opencode-acp") {
-        const info = opencodeMap?.get(file);
-        meta = { kind: "opencode", cwd: info?.cwd ?? null, project: info?.project ?? null };
-      } else {
-        logLine(`unknown source adapter '${source.adapter}' for ${source.id}; skipped`);
-        failed++;
-        continue;
-      }
-      const r = await d.ingestSourceFile(file, meta, force, source.adapter === "pi-sidecar" ? resolvePiCwd : null);
-      if (r.parsed) scanned++;
-      if (!r.ok && r.error && r.error !== "no source file") {
-        failed++;
-        if (cfg.debug) log(`scan failed ${file}: ${r.error}`);
-      }
-      inserted += r.inserted;
-      redacted += r.redacted || 0;
-      total += r.total;
-    }
+    fileCount += tally.files;
+    scanned += tally.scanned;
+    inserted += tally.inserted;
+    redacted += tally.redacted;
+    total += tally.total;
+    failed += tally.failed;
   }
   return { scanned, inserted, redacted, total, failed, files: fileCount, sources: enabledSources };
+}
+
+/**
+ * Scan one allow-list source, accumulating into `tally`.
+ *
+ * Split out of {@link scanSources} so a single failure degrades to a `failed` count. The generation
+ * guard stops the walk when the session ends mid-scan: the store is closed at shutdown, so any
+ * further ingest would reopen it and keep writing after the user left.
+ */
+async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) {
+  let files = await listSourceFiles(source);
+  if (source.adapter === "pi-sidecar" && cfg.excludeDirs.length) {
+    // Keep the legacy per-directory exclusion working when a pi root contains many session dirs.
+    files = files.filter((f) => {
+      const rel = path.relative(source.root, f);
+      return !rel.split(path.sep).some((seg) => cfg.excludeDirs.includes(seg));
+    });
+  }
+  tally.files += files.length;
+  let opencodeMap = null;
+  if (source.adapter === "opencode-acp" && files.length) {
+    opencodeMap = await loadOpencodeSessionMap(source, files);
+  }
+  for (const file of files) {
+    if (generation !== sessionGeneration) return; // session ended: stop before the next DB touch
+    let meta;
+    if (source.adapter === "pi-sidecar") {
+      // cwd is resolved lazily inside ingestSourceFile (explicit → stored → header → API map).
+      meta = { kind: "pi", cwd: null, project: null };
+    } else if (source.adapter === "opencode-acp") {
+      const info = opencodeMap?.get(file);
+      meta = { kind: "opencode", cwd: info?.cwd ?? null, project: info?.project ?? null };
+    } else {
+      logLine(`unknown source adapter '${source.adapter}' for ${source.id}; skipped`);
+      tally.failed++;
+      continue;
+    }
+    const r = await d.ingestSourceFile(file, meta, force, source.adapter === "pi-sidecar" ? resolvePiCwd : null);
+    if (r.parsed) tally.scanned++;
+    if (!r.ok && r.error && r.error !== "no source file") {
+      tally.failed++;
+      if (cfg.debug) log(`scan failed ${file}: ${r.error}`);
+    }
+    tally.inserted += r.inserted;
+    tally.redacted += r.redacted || 0;
+    tally.total += r.total;
+  }
 }
 
 /** Kept as an alias for callers/tests that used the pre-allow-list name. */
@@ -1508,8 +1626,15 @@ export default async function factory(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? null;
+    dbClosed = false; // a new session may reuse this extension instance after a shutdown
     const generation = ++sessionGeneration;
-    logLine(`session_start file=${sessionFile || "(ephemeral)"} cwd=${ctx.cwd ?? ""}`);
+    logLine(
+      cfg.debug
+        ? `session_start file=${sessionFile || "(ephemeral)"} cwd=${ctx.cwd ?? ""}`
+        : // Logs are what users paste into issues: without debug, keep names, not full paths.
+          `session_start file=${sessionFile ? path.basename(sessionFile) : "(ephemeral)"} ` +
+            `cwd=${ctx.cwd ? path.basename(ctx.cwd) : ""}`,
+    );
     if (!cfg.scanOnStartup) {
       // Startup full scan disabled: force-scan only the current session so it is visible immediately;
       // agent_settled and the pre-search scan keep everything else fresh.
@@ -1529,7 +1654,7 @@ export default async function factory(pi: ExtensionAPI) {
         await scanCurrentSession(sessionFile, true, ctx.cwd); // force-scan the current session so it is visible right away
         if (generation !== sessionGeneration) return;
         const st = getDb().stats();
-        logLine(`db ready: ${st.dbPath} sources=${st.sources} blocks=${st.blocks}`);
+        logLine(`db ready: ${path.basename(st.dbPath)} sources=${st.sources} blocks=${st.blocks}`);
       })
       .catch((e) => logLine(`session_start scan error: ${e.stack || e.message}`));
     backgroundScan = run;
@@ -1571,6 +1696,8 @@ export default async function factory(pi: ExtensionAPI) {
       db.close();
       db = null;
     }
+    // Latched after the close: a background continuation must not open the store again.
+    dbClosed = true;
   });
 
   pi.registerTool({
@@ -1606,7 +1733,7 @@ export default async function factory(pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `memory_search failed: ${e.message} (see ${cfg.logPath || DEFAULT_CFG.logPath})`,
+              text: `memory_search failed: ${withoutPaths(e.message) || "unknown error"} (the extension log has the full trace)`,
             },
           ],
           details: { mode: "error", hits: 0, dbPath: cfg.dbPath },
@@ -1737,7 +1864,7 @@ export default async function factory(pi: ExtensionAPI) {
             content: [
               {
                 type: "text",
-                text: `memory_expand failed: ${e.message} (see ${cfg.logPath || DEFAULT_CFG.logPath})`,
+                text: `memory_expand failed: ${withoutPaths(e.message) || "unknown error"} (the extension log has the full trace)`,
               },
             ],
             details: { mode: "error", hits: 0 },

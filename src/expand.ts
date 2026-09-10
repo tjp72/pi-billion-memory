@@ -215,7 +215,11 @@ export async function readCapped(file: string, maxBytes: number): Promise<ReadRe
     }
     return { buffer: buffer.subarray(0, filled), totalBytes: size };
   } finally {
-    await handle.close();
+    try {
+      await handle.close();
+    } catch {
+      // Never let a close failure mask the real read error.
+    }
   }
 }
 

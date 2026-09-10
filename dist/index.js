@@ -107,7 +107,10 @@ async function readCapped(file, maxBytes) {
     }
     return { buffer: buffer.subarray(0, filled), totalBytes: size };
   } finally {
-    await handle.close();
+    try {
+      await handle.close();
+    } catch {
+    }
   }
 }
 async function readSessionMessages(sessionFile, maxReadBytes, readFile = readCapped) {
@@ -472,6 +475,10 @@ function blockFilter(blockId, source) {
   }
   return { where, params };
 }
+function withoutPaths(text) {
+  return String(text).replace(/[A-Za-z]:\\[^\s'"]+/g, "<path>").replace(/(?<![\w.:/])~?\/[^\s'":,)]+/g, "<path>");
+}
+var SOURCE_ADAPTERS = /* @__PURE__ */ new Set(["pi-sidecar", "opencode-acp"]);
 function sanitizeSource(raw) {
   if (!raw || typeof raw !== "object") return null;
   const id = typeof raw.id === "string" ? raw.id : null;
@@ -479,6 +486,7 @@ function sanitizeSource(raw) {
   const root = typeof raw.root === "string" ? expandHome(raw.root) : null;
   const pattern = typeof raw.pattern === "string" ? raw.pattern : null;
   if (!id || !adapter || !root || !pattern) return null;
+  if (!SOURCE_ADAPTERS.has(adapter)) return null;
   const out = {
     id,
     adapter,
@@ -504,8 +512,10 @@ async function loadSources() {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
     try {
-      const s = sanitizeSource(JSON.parse(line));
+      const parsed = JSON.parse(line);
+      const s = sanitizeSource(parsed);
       if (s) list.push(s);
+      else logLine(`sources line ignored: bad id/adapter/root/pattern or unknown adapter '${parsed?.adapter}'`);
     } catch (e) {
       logLine(`sources line ignored: ${e.message}`);
     }
@@ -519,7 +529,8 @@ function fileMatches(pattern, name) {
   const re = new RegExp("^" + pattern.split("*").map(escapeRegExp).join(".*") + "$");
   return re.test(name);
 }
-async function walkFiles(dir, filePattern) {
+var MAX_SCAN_FILES = 2e4;
+async function walkFiles(dir, filePattern, budget = { left: MAX_SCAN_FILES, hitCap: false }) {
   let entries;
   try {
     entries = await fs.promises.readdir(dir, { withFileTypes: true });
@@ -528,9 +539,14 @@ async function walkFiles(dir, filePattern) {
   }
   const out = [];
   for (const ent of entries) {
+    if (budget.left <= 0) {
+      budget.hitCap = true;
+      return out;
+    }
+    budget.left--;
     const full = path.join(dir, ent.name);
     if (ent.isDirectory()) {
-      out.push(...await walkFiles(full, filePattern));
+      out.push(...await walkFiles(full, filePattern, budget));
     } else if (ent.isFile() && fileMatches(filePattern, ent.name)) {
       out.push(full);
     }
@@ -549,9 +565,23 @@ async function listSourceFiles(source) {
   const recursive = parts.length > 1 || parts[0] === "**";
   if (!recursive) {
     const names = await fs.promises.readdir(root);
-    return names.filter((n) => fileMatches(filePattern, n)).map((n) => path.join(root, n));
+    const matched = names.filter((n) => fileMatches(filePattern, n));
+    if (matched.length > MAX_SCAN_FILES) {
+      logLine(
+        `scan: source '${source.id}' has ${matched.length} matching files; only the first ${MAX_SCAN_FILES} are considered`
+      );
+      matched.length = MAX_SCAN_FILES;
+    }
+    return matched.map((n) => path.join(root, n));
   }
-  return walkFiles(root, filePattern);
+  const budget = { left: MAX_SCAN_FILES, hitCap: false };
+  const files = await walkFiles(root, filePattern, budget);
+  if (budget.hitCap) {
+    logLine(
+      `scan: source '${source.id}' hit the ${MAX_SCAN_FILES}-entry cap; the rest was skipped (check that the allow-list root points at a session directory, not at a whole home directory)`
+    );
+  }
+  return files;
 }
 function cleanOpencodeSummary(summary) {
   return String(summary).replace(/\s*<dcp-message-id>.*?<\/dcp-message-id>\s*$/s, "").trim();
@@ -620,6 +650,8 @@ function normalizeOpencodeBlocks(data) {
 var MemoryDb = class {
   dbPath;
   db = null;
+  /** True between close() and the next open(): an in-flight ingest must fail, not touch a null handle. */
+  closed = false;
   /**
    * @param {string} dbPath
    */
@@ -632,6 +664,11 @@ var MemoryDb = class {
     if (!DatabaseSyncCtor) throw new Error("node:sqlite unavailable");
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
     this.db = new DatabaseSyncCtor(this.dbPath);
+    this.closed = false;
+    try {
+      if (process.platform !== "win32") fs.chmodSync(this.dbPath, 384);
+    } catch {
+    }
     this.db.exec("PRAGMA journal_mode=WAL;");
     this.db.exec("PRAGMA busy_timeout=5000;");
     this.db.exec("PRAGMA synchronous=NORMAL;");
@@ -719,6 +756,7 @@ var MemoryDb = class {
     }
   }
   close() {
+    this.closed = true;
     if (this.db) {
       try {
         this.db.close();
@@ -819,6 +857,9 @@ var MemoryDb = class {
         size,
         error: "unrecognized source format"
       };
+    }
+    if (this.closed) {
+      return { ok: false, parsed: true, total: 0, inserted: 0, mtimeMs, size, error: "store closed" };
     }
     const now = Date.now();
     let inserted = 0;
@@ -1049,32 +1090,50 @@ var MemoryDb = class {
     const cutoff = Date.now() - keepDays * 864e5;
     const now = Date.now();
     const before = this.db.prepare("SELECT count(*) AS c FROM blocks").get().c;
-    this.db.prepare(
-      `INSERT OR IGNORE INTO block_tombstones(source_file, block_id, pruned_at)
-         SELECT source_file, block_id, ? FROM blocks
-         WHERE created_at IS NOT NULL AND created_at < ?`
-    ).run(now, cutoff);
-    this.db.prepare("DELETE FROM blocks WHERE created_at IS NOT NULL AND created_at < ?").run(cutoff);
-    const rs = this.db.prepare(
-      "DELETE FROM sources WHERE NOT EXISTS (SELECT 1 FROM blocks b WHERE b.source_file = sources.source_file)"
-    ).run();
-    this.db.exec("VACUUM");
+    this.db.exec("BEGIN IMMEDIATE");
+    let removedSources = 0;
+    try {
+      this.db.prepare(
+        `INSERT OR IGNORE INTO block_tombstones(source_file, block_id, pruned_at)
+           SELECT source_file, block_id, ? FROM blocks
+           WHERE created_at IS NOT NULL AND created_at < ?`
+      ).run(now, cutoff);
+      this.db.prepare("DELETE FROM blocks WHERE created_at IS NOT NULL AND created_at < ?").run(cutoff);
+      const rs = this.db.prepare(
+        "DELETE FROM sources WHERE NOT EXISTS (SELECT 1 FROM blocks b WHERE b.source_file = sources.source_file)"
+      ).run();
+      removedSources = rs.changes;
+      this.db.exec("COMMIT");
+    } catch (e) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+      }
+      throw e;
+    }
+    try {
+      this.db.exec("VACUUM");
+    } catch (e) {
+      logLine(`prune: VACUUM skipped (${e.message}); rows pruned, file size unchanged`);
+    }
     const remain = this.db.prepare("SELECT count(*) AS c FROM blocks").get().c;
     return {
       removedBlocks: before - remain,
-      removedSources: rs.changes,
-      removedSessions: rs.changes,
+      removedSources,
+      removedSessions: removedSources,
       remainingBlocks: remain
     };
   }
 };
 var db = null;
 var sessionGeneration = 0;
+var dbClosed = false;
 var backgroundScan = null;
 var piMapCache = null;
 var piMapInFlight = null;
 function getDb() {
   if (!db) db = new MemoryDb(cfg.dbPath);
+  if (dbClosed) throw new Error("memory store is closed for this session");
   db.open();
   return db;
 }
@@ -1190,6 +1249,7 @@ async function scanSources(force = false) {
   await loadSqlite();
   const d = getDb();
   const sources = await loadSources();
+  const generation = sessionGeneration;
   const needPiCwd = sources.some((s) => s.enabled && s.adapter === "pi-sidecar");
   const resolvePiCwd = needPiCwd ? async (sessionFile) => {
     const headerCwd = await piSessionHeaderCwd(sessionFile);
@@ -1206,43 +1266,63 @@ async function scanSources(force = false) {
   let enabledSources = 0;
   for (const source of sources) {
     if (!source.enabled) continue;
+    if (generation !== sessionGeneration) {
+      logLine("scan: stopped early, the session was closed while scanning");
+      break;
+    }
     enabledSources++;
-    let files = await listSourceFiles(source);
-    if (source.adapter === "pi-sidecar" && cfg.excludeDirs.length) {
-      files = files.filter((f) => {
-        const rel = path.relative(source.root, f);
-        return !rel.split(path.sep).some((seg) => cfg.excludeDirs.includes(seg));
-      });
+    const tally = { files: 0, scanned: 0, inserted: 0, redacted: 0, total: 0, failed: 0 };
+    try {
+      await scanOneSource(source, d, force, resolvePiCwd, generation, tally);
+    } catch (e) {
+      tally.failed++;
+      logLine(`source '${source.id}' (${source.adapter}) failed: ${e.stack || e.message}`);
     }
-    fileCount += files.length;
-    let opencodeMap = null;
-    if (source.adapter === "opencode-acp" && files.length) {
-      opencodeMap = await loadOpencodeSessionMap(source, files);
-    }
-    for (const file of files) {
-      let meta;
-      if (source.adapter === "pi-sidecar") {
-        meta = { kind: "pi", cwd: null, project: null };
-      } else if (source.adapter === "opencode-acp") {
-        const info = opencodeMap?.get(file);
-        meta = { kind: "opencode", cwd: info?.cwd ?? null, project: info?.project ?? null };
-      } else {
-        logLine(`unknown source adapter '${source.adapter}' for ${source.id}; skipped`);
-        failed++;
-        continue;
-      }
-      const r = await d.ingestSourceFile(file, meta, force, source.adapter === "pi-sidecar" ? resolvePiCwd : null);
-      if (r.parsed) scanned++;
-      if (!r.ok && r.error && r.error !== "no source file") {
-        failed++;
-        if (cfg.debug) log(`scan failed ${file}: ${r.error}`);
-      }
-      inserted += r.inserted;
-      redacted += r.redacted || 0;
-      total += r.total;
-    }
+    fileCount += tally.files;
+    scanned += tally.scanned;
+    inserted += tally.inserted;
+    redacted += tally.redacted;
+    total += tally.total;
+    failed += tally.failed;
   }
   return { scanned, inserted, redacted, total, failed, files: fileCount, sources: enabledSources };
+}
+async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) {
+  let files = await listSourceFiles(source);
+  if (source.adapter === "pi-sidecar" && cfg.excludeDirs.length) {
+    files = files.filter((f) => {
+      const rel = path.relative(source.root, f);
+      return !rel.split(path.sep).some((seg) => cfg.excludeDirs.includes(seg));
+    });
+  }
+  tally.files += files.length;
+  let opencodeMap = null;
+  if (source.adapter === "opencode-acp" && files.length) {
+    opencodeMap = await loadOpencodeSessionMap(source, files);
+  }
+  for (const file of files) {
+    if (generation !== sessionGeneration) return;
+    let meta;
+    if (source.adapter === "pi-sidecar") {
+      meta = { kind: "pi", cwd: null, project: null };
+    } else if (source.adapter === "opencode-acp") {
+      const info = opencodeMap?.get(file);
+      meta = { kind: "opencode", cwd: info?.cwd ?? null, project: info?.project ?? null };
+    } else {
+      logLine(`unknown source adapter '${source.adapter}' for ${source.id}; skipped`);
+      tally.failed++;
+      continue;
+    }
+    const r = await d.ingestSourceFile(file, meta, force, source.adapter === "pi-sidecar" ? resolvePiCwd : null);
+    if (r.parsed) tally.scanned++;
+    if (!r.ok && r.error && r.error !== "no source file") {
+      tally.failed++;
+      if (cfg.debug) log(`scan failed ${file}: ${r.error}`);
+    }
+    tally.inserted += r.inserted;
+    tally.redacted += r.redacted || 0;
+    tally.total += r.total;
+  }
 }
 async function scanCurrentSession(sessionFile, force = false, cwd = null) {
   if (!sessionFile) return null;
@@ -1398,8 +1478,14 @@ async function factory(pi) {
   const paramsSchema = MEMORY_SEARCH_PARAMETERS;
   pi.on("session_start", async (_event, ctx) => {
     const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? null;
+    dbClosed = false;
     const generation = ++sessionGeneration;
-    logLine(`session_start file=${sessionFile || "(ephemeral)"} cwd=${ctx.cwd ?? ""}`);
+    logLine(
+      cfg.debug ? `session_start file=${sessionFile || "(ephemeral)"} cwd=${ctx.cwd ?? ""}` : (
+        // Logs are what users paste into issues: without debug, keep names, not full paths.
+        `session_start file=${sessionFile ? path.basename(sessionFile) : "(ephemeral)"} cwd=${ctx.cwd ? path.basename(ctx.cwd) : ""}`
+      )
+    );
     if (!cfg.scanOnStartup) {
       scanCurrentSession(sessionFile, true, ctx.cwd).catch((e) => logLine(`session_start scan error: ${e.message}`));
       return;
@@ -1412,7 +1498,7 @@ async function factory(pi) {
       await scanCurrentSession(sessionFile, true, ctx.cwd);
       if (generation !== sessionGeneration) return;
       const st = getDb().stats();
-      logLine(`db ready: ${st.dbPath} sources=${st.sources} blocks=${st.blocks}`);
+      logLine(`db ready: ${path.basename(st.dbPath)} sources=${st.sources} blocks=${st.blocks}`);
     }).catch((e) => logLine(`session_start scan error: ${e.stack || e.message}`));
     backgroundScan = run;
     void run.finally(() => {
@@ -1450,6 +1536,7 @@ async function factory(pi) {
       db.close();
       db = null;
     }
+    dbClosed = true;
   });
   pi.registerTool({
     name: "memory_search",
@@ -1477,7 +1564,7 @@ async function factory(pi) {
           content: [
             {
               type: "text",
-              text: `memory_search failed: ${e.message} (see ${cfg.logPath || DEFAULT_CFG.logPath})`
+              text: `memory_search failed: ${withoutPaths(e.message) || "unknown error"} (the extension log has the full trace)`
             }
           ],
           details: { mode: "error", hits: 0, dbPath: cfg.dbPath }
@@ -1590,7 +1677,7 @@ ${list}`
             content: [
               {
                 type: "text",
-                text: `memory_expand failed: ${e.message} (see ${cfg.logPath || DEFAULT_CFG.logPath})`
+                text: `memory_expand failed: ${withoutPaths(e.message) || "unknown error"} (the extension log has the full trace)`
               }
             ],
             details: { mode: "error", hits: 0 }

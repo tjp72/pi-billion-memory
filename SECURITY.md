@@ -31,7 +31,7 @@ the value.
 
 This is a best-effort safety net, not a guarantee. Compression summaries should
 not contain secrets in the first place; if you find a bypass, report it privately
-as described above. The filter applies to newly ingested/updated blocks; existing
+as described below. The filter applies to newly ingested/updated blocks; existing
 rows are not rewritten (delete `~/.pi/pi-billion-memory.db*` and rescan to rebuild).
 
 ## Reporting a vulnerability

@@ -1234,6 +1234,12 @@ check(
     exCfgPaths.logPath === path.join(exHome, "c.log") &&
     internals.sanitizeCfg({ dbPath: "relative/x.db" }).dbPath === "relative/x.db",
 );
+check(
+  "an allow-list entry with an unknown adapter is rejected instead of silently scanned",
+  internals.sanitizeSource({ id: "s1", adapter: "sessions", root: "/tmp", pattern: "*.jsonl" }) === null &&
+    internals.sanitizeSource({ id: "s1", adapter: "pi-sidecar", root: "/tmp", pattern: "*.jsonl" })?.adapter ===
+      "pi-sidecar",
+);
 
 // --- cleanup --------------------------------------------------------------------
 db.close();
