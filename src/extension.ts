@@ -132,7 +132,7 @@ try {
     cfg = { ...DEFAULT_CFG, ...sanitizeCfg(JSON.parse(fs.readFileSync(CFG_PATH, "utf8"))) };
   }
 } catch (e) {
-  logLine(`config load failed: ${e.message}`);
+  logLine(`config load failed: ${withoutPaths(e.message)}`);
 }
 
 function syncLogPath() {
@@ -285,7 +285,7 @@ export async function loadSqlite() {
     const m = await import(sqliteModule);
     DatabaseSyncCtor = m.DatabaseSync;
   } catch (e) {
-    logLine(`node:sqlite unavailable (need node>=22.19): ${e.message}`);
+    logLine(`node:sqlite unavailable (need node>=22.19): ${withoutPaths(e.message)}`);
   }
   return DatabaseSyncCtor;
 }
@@ -345,10 +345,18 @@ function blockFilter(blockId, source) {
  * Strip local absolute paths from text that goes back to the model. A tool error must not hand over
  * the layout of the machine (log, database, and session paths). Full details stay in the log.
  */
-function withoutPaths(text: string): string {
-  return String(text)
-    .replace(/[A-Za-z]:\\[^\s'"]+/g, "<path>")
-    .replace(/(?<![\w.:/])~?\/[^\s'":,)]+/g, "<path>");
+export function withoutPaths(text: string): string {
+  return (
+    String(text)
+      // Stack traces: `file:///home/...` would survive the POSIX lookbehind below.
+      .replace(/file:\/\/\/[^\s'"]+/g, "file://<path>")
+      // Drive or UNC roots, either separator. A space only continues the path when the next chunk
+      // still contains a separator, so "C:\Program Files\app\a.log" is covered without letting a
+      // message like "C:\x failed: ..." swallow the rest of the sentence.
+      .replace(/(?<![\w:/\\])(?:[A-Za-z]:[\\/]|\\\\|\/\/)[^\s'"]+(?: [^\s'"]*[\\/][^\s'"]*)*/g, "<path>")
+      // POSIX paths, same space rule ("/home/alice/My Docs/notes.txt").
+      .replace(/(?<![\w.:/\\])~?\/(?:[^\s'":,)]*\/)*[^\s'":,)]+(?: [^\s'":,)]*\/[^\s'":,)]*)*/g, "<path>")
+  );
 }
 
 /** Adapter ids the scanner understands; anything else is rejected where the allow-list is read. */
@@ -386,7 +394,7 @@ export async function loadSources() {
     // Missing allow-list → built-in defaults. Any other read error (permissions, a directory,
     // I/O error) is fail-closed: scan nothing rather than silently re-enabling default roots.
     if (e && e.code === "ENOENT") return defaultSources();
-    logLine(`sources read failed (fail-closed, no sources): ${e.message}`);
+    logLine(`sources read failed (fail-closed, no sources): ${withoutPaths(e.message)}`);
     return [];
   }
   const list = [];
@@ -399,7 +407,7 @@ export async function loadSources() {
       if (s) list.push(s);
       else logLine(`sources line ignored: bad id/adapter/root/pattern or unknown adapter '${parsed?.adapter}'`);
     } catch (e) {
-      logLine(`sources line ignored: ${e.message}`);
+      logLine(`sources line ignored: ${withoutPaths(e.message)}`);
     }
   }
   return list;
@@ -409,70 +417,114 @@ function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function fileMatches(pattern, name) {
-  const re = new RegExp("^" + pattern.split("*").map(escapeRegExp).join(".*") + "$");
-  return re.test(name);
+/**
+ * Path-aware glob for allow-list patterns: `*` stays inside one path segment, `**` spans zero or
+ * more segments. Patterns are matched against the path relative to the allow-list root, so a
+ * directory prefix ("sub/*.json") can only narrow the scan, never widen it.
+ */
+function globToRegExp(pattern) {
+  const segs = String(pattern).split(/[\\/]/).filter(Boolean);
+  let re = "^";
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
+    const last = i === segs.length - 1;
+    if (seg === "**") {
+      // `**` also swallows the separators around it: "**/x" matches "x" and "a/b/x".
+      re += last ? ".*" : "(?:[^/]+/)*";
+      continue;
+    }
+    re += seg.split("*").map(escapeRegExp).join("[^/]*");
+    if (!last) re += "/";
+  }
+  return new RegExp(`${re}$`);
 }
 
-// An allow-list root that accidentally points at ~ (or /) must not stall the scan: stop after this
-// many visited entries and log it, instead of walking the whole filesystem.
+// An allow-list root that accidentally points at ~ (or /) must not stall the scan: bound both the
+// entries visited and the matches kept, then log the cap. Visited entries get the larger budget so
+// a directory full of non-matching session files cannot starve the real sidecars.
+const MAX_SCAN_ENTRIES = 200000;
 const MAX_SCAN_FILES = 20000;
 
-async function walkFiles(dir, filePattern, budget = { left: MAX_SCAN_FILES, hitCap: false }) {
+async function walkGlob(dir, re, budget, errors, prefix = "") {
   let entries;
   try {
     entries = await fs.promises.readdir(dir, { withFileTypes: true });
-  } catch {
+  } catch (e) {
+    errors.push(e);
     return [];
   }
   const out = [];
   for (const ent of entries) {
-    if (budget.left <= 0) {
-      budget.hitCap = true;
-      return out;
+    if (budget.visitedLeft <= 0) {
+      budget.hitVisited = true;
+      break;
     }
-    budget.left--;
-    const full = path.join(dir, ent.name);
+    budget.visitedLeft--;
     if (ent.isDirectory()) {
-      out.push(...(await walkFiles(full, filePattern, budget)));
-    } else if (ent.isFile() && fileMatches(filePattern, ent.name)) {
-      out.push(full);
+      out.push(...(await walkGlob(path.join(dir, ent.name), re, budget, errors, `${prefix}${ent.name}/`)));
+    } else if (ent.isFile()) {
+      // Dirent types exclude symlinks on purpose: the allow-list must only read real files.
+      if (!re.test(`${prefix}${ent.name}`)) continue;
+      if (budget.matchedLeft <= 0) {
+        budget.hitMatched = true;
+        break;
+      }
+      budget.matchedLeft--;
+      out.push(path.join(dir, ent.name));
     }
   }
   return out;
 }
 
-/** @internal */
+/**
+ * List the files an allow-list entry selects.
+ *
+ * The pattern is matched against paths relative to `source.root`, so `sub/*.json` stays inside
+ * `sub/` instead of widening into a recursive root scan. Symlinks are never followed (the
+ * allow-list describes real files), and directories that cannot be read are reported instead of
+ * silently looking like an empty source.
+ * @internal
+ */
 export async function listSourceFiles(source) {
-  const root = source.root;
-  try {
-    await fs.promises.access(root);
-  } catch {
-    return [];
+  const errors = [];
+  const segs = String(source.pattern).split(/[\\/]/).filter(Boolean);
+  const filePattern = segs.pop() || source.pattern;
+  // A literal directory prefix is a starting point, not a file name: "sub/*.json" must scan
+  // `<root>/sub`, not `<root>` recursively.
+  let start = source.root;
+  while (segs.length && !segs[0].includes("*")) {
+    start = path.join(start, segs.shift());
   }
-  const parts = source.pattern.split(/[\\/]/).filter(Boolean);
-  const filePattern = parts[parts.length - 1] || source.pattern;
-  const recursive = parts.length > 1 || parts[0] === "**";
-  if (!recursive) {
-    const names = await fs.promises.readdir(root);
-    const matched = names.filter((n) => fileMatches(filePattern, n));
-    if (matched.length > MAX_SCAN_FILES) {
-      logLine(
-        `scan: source '${source.id}' has ${matched.length} matching files; only the first ${MAX_SCAN_FILES} are considered`,
-      );
-      matched.length = MAX_SCAN_FILES;
+  if (segs.length === 0) {
+    const re = globToRegExp(filePattern);
+    try {
+      const entries = await fs.promises.readdir(start, { withFileTypes: true });
+      const matched = entries
+        .filter((ent) => ent.isFile() && re.test(ent.name))
+        .map((ent) => path.join(start, ent.name));
+      if (matched.length > MAX_SCAN_FILES) {
+        logLine(
+          `scan: source '${source.id}' has ${matched.length} matching files; only the first ${MAX_SCAN_FILES} are considered`,
+        );
+        matched.length = MAX_SCAN_FILES;
+      }
+      return { files: matched, errors };
+    } catch (e) {
+      errors.push(e);
+      return { files: [], errors };
     }
-    return matched.map((n) => path.join(root, n));
   }
-  const budget = { left: MAX_SCAN_FILES, hitCap: false };
-  const files = await walkFiles(root, filePattern, budget);
-  if (budget.hitCap) {
+  const re = globToRegExp([...segs, filePattern].join("/"));
+  const budget = { visitedLeft: MAX_SCAN_ENTRIES, matchedLeft: MAX_SCAN_FILES, hitVisited: false, hitMatched: false };
+  const files = await walkGlob(start, re, budget, errors);
+  if (budget.hitVisited || budget.hitMatched) {
     logLine(
-      `scan: source '${source.id}' hit the ${MAX_SCAN_FILES}-entry cap; the rest was skipped ` +
-        "(check that the allow-list root points at a session directory, not at a whole home directory)",
+      `scan: source '${source.id}' hit the ${
+        budget.hitMatched ? `${MAX_SCAN_FILES}-match` : `${MAX_SCAN_ENTRIES}-entry`
+      } cap; the rest was skipped (check that the allow-list root points at a session directory, not at a whole home directory)`,
     );
   }
-  return files;
+  return { files, errors };
 }
 
 // ---------------------------------------------------------------------------
@@ -497,7 +549,9 @@ function cleanOpencodeSummary(summary) {
 export function collectMsgIds(block: any): string[] | null {
   // `??` alone would let an explicitly empty first field hide a populated second one, so take the
   // first list that actually has entries.
-  const raw = [block?.effectiveMessageIds, block?.messageIds].find((v) => Array.isArray(v) && v.length > 0);
+  const raw = [block?.effectiveMessageIds, block?.messageIds].find(
+    (v) => Array.isArray(v) && v.some((item) => typeof item === "string" && item.trim() !== ""),
+  );
   if (!raw) return null;
   const out: string[] = [];
   const seen = new Set<string>();
@@ -584,6 +638,9 @@ export class MemoryDb {
 
   open() {
     if (this.db) return;
+    // Refuse to reopen a store the session already closed: `ingestSourceFile` calls `open()` on
+    // entry, so without this latch an in-flight scan could resurrect the DB after shutdown.
+    if (dbClosed) throw new Error("memory store is closed for this session");
     if (!DatabaseSyncCtor) throw new Error("node:sqlite unavailable");
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
     this.db = new DatabaseSyncCtor(this.dbPath);
@@ -1027,7 +1084,7 @@ export class MemoryDb {
     try {
       rows = this.db.prepare(built.sql).all(...built.params);
     } catch (e) {
-      logLine(`search error: ${e.message} | sql=${built.sql}`);
+      logLine(`search error: ${withoutPaths(e.message)} | sql=${built.sql}`);
       rows = [];
     }
     return { mode: built.mode, rows };
@@ -1112,7 +1169,7 @@ export class MemoryDb {
     try {
       this.db.exec("VACUUM");
     } catch (e) {
-      logLine(`prune: VACUUM skipped (${e.message}); rows pruned, file size unchanged`);
+      logLine(`prune: VACUUM skipped (${withoutPaths(e.message)}); rows pruned, file size unchanged`);
     }
     const remain = this.db.prepare("SELECT count(*) AS c FROM blocks").get().c;
     return {
@@ -1274,7 +1331,7 @@ export async function loadOpencodeSessionMap(source, files) {
       if (cwd || project) map.set(file, { cwd: cwd || null, project: project || null });
     }
   } catch (e) {
-    logLine(`opencode session map failed: ${e.message}`);
+    logLine(`opencode session map failed: ${withoutPaths(e.message)}`);
   } finally {
     if (odb) {
       try {
@@ -1293,12 +1350,13 @@ export async function loadOpencodeSessionMap(source, files) {
  */
 /** @internal */
 export async function scanSources(force = false) {
+  // Captured before the first await: a shutdown that lands while the allow-list is being read must
+  // invalidate this scan, not hand it the post-shutdown generation (which would let the scan write
+  // into a store the session already closed).
+  const generation = sessionGeneration;
   await loadSqlite();
   const d = getDb();
   const sources = await loadSources();
-  // A shutdown or session switch bumps this while a scan is in flight. The scan then stops instead
-  // of reopening (and writing into) a database the user's session already closed.
-  const generation = sessionGeneration;
   const needPiCwd = sources.some((s) => s.enabled && s.adapter === "pi-sidecar");
   // Lazy cwd resolution: called by ingestSourceFile only after the watermark check says the
   // source must be (re)parsed. Header read first; official SessionManager map is the fallback.
@@ -1332,7 +1390,7 @@ export async function scanSources(force = false) {
       // One broken source (unreadable root, corrupt opencode DB, adapter bug) must not hide every
       // source behind it.
       tally.failed++;
-      logLine(`source '${source.id}' (${source.adapter}) failed: ${e.stack || e.message}`);
+      logLine(`source '${source.id}' (${source.adapter}) failed: ${withoutPaths(e.stack || e.message)}`);
     }
     fileCount += tally.files;
     scanned += tally.scanned;
@@ -1352,7 +1410,19 @@ export async function scanSources(force = false) {
  * further ingest would reopen it and keep writing after the user left.
  */
 async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) {
-  let files = await listSourceFiles(source);
+  const listing = await listSourceFiles(source);
+  let files = listing.files;
+  if (listing.errors.length) {
+    // An unreadable or missing root must be visible: treating it as "0 files" hid permission
+    // errors and stale allow-list paths from both the log and the failure tally.
+    tally.failed += listing.errors.length;
+    const first = listing.errors[0];
+    logLine(
+      `scan: source '${source.id}' could not read ${listing.errors.length} director${
+        listing.errors.length === 1 ? "y" : "ies"
+      }: ${withoutPaths(first?.message || String(first))}`,
+    );
+  }
   if (source.adapter === "pi-sidecar" && cfg.excludeDirs.length) {
     // Keep the legacy per-directory exclusion working when a pi root contains many session dirs.
     files = files.filter((f) => {
@@ -1638,7 +1708,9 @@ export default async function factory(pi: ExtensionAPI) {
     if (!cfg.scanOnStartup) {
       // Startup full scan disabled: force-scan only the current session so it is visible immediately;
       // agent_settled and the pre-search scan keep everything else fresh.
-      scanCurrentSession(sessionFile, true, ctx.cwd).catch((e) => logLine(`session_start scan error: ${e.message}`));
+      scanCurrentSession(sessionFile, true, ctx.cwd).catch((e) =>
+        logLine(`session_start scan error: ${withoutPaths(e.message)}`),
+      );
       return;
     }
     // Background allow-list scan: async fs I/O never blocks the event loop, session_start returns
@@ -1656,7 +1728,7 @@ export default async function factory(pi: ExtensionAPI) {
         const st = getDb().stats();
         logLine(`db ready: ${path.basename(st.dbPath)} sources=${st.sources} blocks=${st.blocks}`);
       })
-      .catch((e) => logLine(`session_start scan error: ${e.stack || e.message}`));
+      .catch((e) => logLine(`session_start scan error: ${withoutPaths(e.stack || e.message)}`));
     backgroundScan = run;
     void run.finally(() => {
       if (backgroundScan === run) backgroundScan = null;
@@ -1673,7 +1745,10 @@ export default async function factory(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    sessionGeneration++; // invalidate the continuation of any in-flight background scan
+    // Remember which session this shutdown belongs to: if a new session_start lands while the grace
+    // period (or the final scan) is still running, closing the store here would close and latch the
+    // *new* session's store. The check below is synchronous with the latch, so no window remains.
+    const shutdownGeneration = ++sessionGeneration; // invalidate in-flight background scan continuations
     const inflight = backgroundScan;
     if (inflight) {
       // Short grace period so we do not close the DB in the middle of a background transaction.
@@ -1692,12 +1767,18 @@ export default async function factory(pi: ExtensionAPI) {
     } catch (e) {
       log(`session_shutdown: ${e.message}`);
     }
+    if (shutdownGeneration !== sessionGeneration) {
+      // A new session started while this shutdown was finishing: it owns the store now, leave it open.
+      log(`session_shutdown: superseded by a new session; store left open`);
+      return;
+    }
+    // Latch before closing: a continuation that resumes between the close and the latch could
+    // otherwise reopen the store through MemoryDb.open().
+    dbClosed = true;
     if (db) {
       db.close();
       db = null;
     }
-    // Latched after the close: a background continuation must not open the store again.
-    dbClosed = true;
   });
 
   pi.registerTool({
@@ -1725,10 +1806,10 @@ export default async function factory(pi: ExtensionAPI) {
         const text = formatResults(res);
         return {
           content: [{ type: "text", text }],
-          details: { mode: res.mode, hits: res.rows.length, dbPath: cfg.dbPath },
+          details: { mode: res.mode, hits: res.rows.length, dbPath: path.basename(cfg.dbPath) },
         };
       } catch (e) {
-        logLine(`memory_search error: ${e.stack || e.message}`);
+        logLine(`memory_search error: ${withoutPaths(e.stack || e.message)}`);
         return {
           content: [
             {
@@ -1736,7 +1817,7 @@ export default async function factory(pi: ExtensionAPI) {
               text: `memory_search failed: ${withoutPaths(e.message) || "unknown error"} (the extension log has the full trace)`,
             },
           ],
-          details: { mode: "error", hits: 0, dbPath: cfg.dbPath },
+          details: { mode: "error", hits: 0, dbPath: path.basename(cfg.dbPath) },
         };
       }
     },
@@ -1859,7 +1940,7 @@ export default async function factory(pi: ExtensionAPI) {
             },
           };
         } catch (e) {
-          logLine(`memory_expand error: ${e.stack || e.message}`);
+          logLine(`memory_expand error: ${withoutPaths(e.stack || e.message)}`);
           return {
             content: [
               {
@@ -1916,7 +1997,7 @@ export default async function factory(pi: ExtensionAPI) {
           `Log: ${cfg.logPath || DEFAULT_CFG.logPath}`;
         ctx.ui?.notify?.(msg, "info");
       } catch (e) {
-        logLine(`/memory error: ${e.stack || e.message}`);
+        logLine(`/memory error: ${withoutPaths(e.stack || e.message)}`);
       }
     },
   });
@@ -1934,6 +2015,19 @@ export function configureForTests(over: Record<string, unknown>): void {
   syncLogPath();
   piMapCache = null;
   piMapInFlight = null;
+  // Reset the connection state too, so one test cannot inherit the previous test's store (until
+  // now that isolation came from every test file owning its own process).
+  if (db) {
+    try {
+      db.close();
+    } catch {
+      /* already closed */
+    }
+    db = null;
+  }
+  backgroundScan = null;
+  dbClosed = false;
+  sessionGeneration++;
 }
 
 /** @internal */

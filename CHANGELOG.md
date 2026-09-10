@@ -5,6 +5,44 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-09-10
+
+### Fixed
+
+- A background scan can no longer reopen the store after `session_shutdown`, including a shutdown
+  that lands while the allow-list is being read: the scan captures the session generation before
+  its first `await`, and `MemoryDb.open()` refuses a latched store (`getDb()` already did).
+- Allow-list patterns are matched against paths relative to the source root, so a directory prefix
+  (`sub/*.json`, `2026/**/*.jsonl.acp.json`) narrows the scan instead of silently widening it into
+  a recursive scan of the whole root.
+- Symlinks are ignored consistently. The non-recursive listing now uses `withFileTypes` like the
+  recursive walk, so a link inside the root can no longer pull in a file from outside the
+  allow-list.
+- An unreadable or missing allow-list directory is counted as a failed source and logged (with the
+  path redacted) instead of silently looking like an empty source. The 0.5.1 note promised this;
+  it now holds. The scan budget now bounds visited entries (`200,000`) and matches (`20,000`)
+  separately, so non-matching session files cannot starve the real sidecars.
+- `readCapped` re-stats the handle after reading, so `truncated` means "bytes exist past the
+  buffer": a session file that shrank while it was read no longer reports a stale truncation and
+  loses its last complete line. A file that exists but cannot be opened (EACCES/EPERM/EISDIR)
+  degrades to missing instead of failing the tool.
+- `mode: "full"` counts indices the manifest never offered (or that hold no text) as skipped, so a
+  selection that resolves to nothing reports `truncated` instead of a clean empty result.
+- `withoutPaths` covers `C:/`, UNC roots, `file:///` and paths containing spaces
+  ("C:\Program Files\...", "/home/alice/My Docs/..."). The tool details no longer carry the full
+  database path, and log lines that quote raw errors/stacks pass through it as well, so the 0.5.1
+  "logs have no absolute paths" note now holds for them too.
+- `collectMsgIds` skips a first field whose entries are all unusable instead of letting it shadow a
+  valid second field.
+- A `session_shutdown` that is still finishing (grace period or final scan) when a new
+  `session_start` lands no longer closes and latches the new session's store; it detects that it was
+  superseded and leaves the store open.
+- `configureForTests` resets the cached connection, session generation, background scan and latch,
+  so tests no longer depend on every test file owning its own process.
+- `package.json` drops the leftover `publishConfig` and `prepublishOnly` (the package is `private`
+  and distributed through git tags), and the README update examples use the same `.git` URL as the
+  install section.
+
 ## [0.5.1] - 2026-09-10
 
 ### Changed

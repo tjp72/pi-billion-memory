@@ -39,7 +39,7 @@ export interface RenderedMessage {
     role: string;
     items: RenderedItem[];
 }
-/** Bytes read from a file plus its size on disk. */
+/** Bytes read from a file plus its size after the read. */
 export interface ReadResult {
     buffer: Buffer;
     totalBytes: number;
@@ -50,11 +50,11 @@ export interface SessionRead {
     messages: Map<string, any>;
     /** Bytes actually read. */
     bytesRead: number;
-    /** Total size of the file on disk. */
+    /** File size after the read; larger than `bytesRead` means bytes were left behind. */
     totalBytes: number;
-    /** True when the file was longer than the read cap (the trailing partial line is dropped). */
+    /** True when bytes existed past the returned buffer (the trailing partial line is dropped). */
     truncated: boolean;
-    /** True when the session file no longer exists (deleted, rotated, or renamed since ingestion). */
+    /** True when the session file is gone or unreadable (deleted, rotated, renamed, or not permitted). */
     missing: boolean;
 }
 /** One entry in the expansion manifest. */

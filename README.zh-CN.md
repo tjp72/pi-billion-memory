@@ -101,7 +101,7 @@ pi update --extensions   # 重新对齐 git 包；钉住的 tag 不会移动
 ```
 
 要把钉住 tag 的安装升到新版本，用新 tag 重新执行一次安装命令
-（`pi install git:https://github.com/tjp72/pi-billion-memory@v0.5.1`）。
+（`pi install git:https://github.com/tjp72/pi-billion-memory.git@v0.5.2`）。
 
 ### 本地开发安装
 

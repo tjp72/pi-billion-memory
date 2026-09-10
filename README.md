@@ -116,7 +116,7 @@ pi update --extensions   # re-reconciles git packages; pinned tags stay where th
 ```
 
 To move a tag-pinned install to a newer release, re-run the install line with the
-new tag (`pi install git:https://github.com/tjp72/pi-billion-memory@v0.5.1`).
+new tag (`pi install git:https://github.com/tjp72/pi-billion-memory.git@v0.5.2`).
 
 ### Local development
 

@@ -205,14 +205,26 @@ The design is deliberately minimal; preserve these properties:
   untouched), never crash the scan, and remain easy to update when a source format changes.
   A source that throws must degrade to a `failed` count, never abort the rest of the scan, and an
   allow-list entry with an unknown `adapter` must be rejected where the list is read.
+- Allow-list patterns are matched against paths **relative to the source root**: `*` never crosses a
+  `/`, `**` is the only segment that does, and symlinks are never followed (the list describes real
+  files). A directory that cannot be read counts as a failed source and is logged; it must not look
+  like an empty source. Any budget cap that skips files must be logged with its limit.
 - Scan lifecycle: `session_shutdown` closes the store and latches it closed. A scan in flight must
-  stop at the next boundary (session-generation check) and must never reopen the file-backed store;
-  `getDb()` throws once the store is latched instead of recreating it.
+  stop at the next boundary (session-generation check, captured before the first `await`) and must
+  never reopen the file-backed store; `getDb()` and `MemoryDb.open()` throw once the store is
+  latched (the latch is set before `close()` so a continuation cannot slip in between), and a
+  superseded shutdown (a new session started while its grace period or final scan was running)
+  must leave the store open.
 - `MemoryDb.prune` writes tombstones and deletes inside one transaction; `VACUUM` runs after the
   commit and is best-effort (logged, never fatal). The store file is chmod `0600` where the OS
   supports it.
-- Text returned to the model (tool results) must not contain absolute local paths (log, database,
-  session); the full trace belongs in the extension log. Use `withoutPaths` in `src/extension.ts`.
+- Text returned to the model (tool results, tool `details`) and log lines that quote raw errors or
+  stacks must not contain absolute local paths (log, database, session); "the log has the full
+  trace" is not a reason to leak a path. Use `withoutPaths` in `src/extension.ts`.
+- `memory_expand` degrade rules: `mode:"full"` requires a non-empty `select`; a session file that
+  is gone or unreadable (ENOENT/ENOTDIR/EACCES/EPERM/EISDIR) yields `sessionMissing` instead of
+  throwing; `truncated` means bytes exist past the returned buffer (the cap, or a file that grew
+  while it was read), and indices the manifest never offered count as skipped.
 - `memory_search` must stay a cheap, reliable lookup — no network calls, no external services.
 
 ## 6. Git hygiene

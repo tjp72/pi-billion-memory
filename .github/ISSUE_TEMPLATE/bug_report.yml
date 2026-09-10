@@ -14,7 +14,7 @@ body:
     attributes:
       label: pi-billion-memory version
       description: The tag you installed, or the commit SHA when you track `main`.
-      placeholder: v0.5.1
+      placeholder: v0.5.2
     validations:
       required: true
   - type: input

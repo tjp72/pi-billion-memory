@@ -105,7 +105,8 @@ async function readCapped(file, maxBytes) {
       if (bytesRead <= 0) break;
       filled += bytesRead;
     }
-    return { buffer: buffer.subarray(0, filled), totalBytes: size };
+    const { size: after } = await handle.stat();
+    return { buffer: buffer.subarray(0, filled), totalBytes: after };
   } finally {
     try {
       await handle.close();
@@ -120,15 +121,15 @@ async function readSessionMessages(sessionFile, maxReadBytes, readFile = readCap
   try {
     read = await readFile(sessionFile, cap);
   } catch (e) {
-    if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) {
+    if (e && ["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EISDIR"].includes(e.code)) {
       return { messages, bytesRead: 0, totalBytes: 0, truncated: false, missing: true };
     }
     throw e;
   }
-  const truncated = read.totalBytes > cap;
+  const truncated = read.buffer.length < read.totalBytes;
   const text = read.buffer.toString("utf8");
   const parts = text.split("\n");
-  if (truncated) parts.pop();
+  if (truncated && !text.endsWith("\n")) parts.pop();
   for (const part of parts) {
     const raw = part.trim();
     if (!raw) continue;
@@ -207,7 +208,7 @@ async function expandBlock(opts) {
   const chunks = [];
   let used = 0;
   let returned = 0;
-  let skipped = 0;
+  let skipped = Math.max(0, wanted.size - requestedCount);
   let capTrimmed = false;
   for (const entry of entries) {
     if (!wanted.has(entry.index)) continue;
@@ -322,7 +323,7 @@ try {
     cfg = { ...DEFAULT_CFG, ...sanitizeCfg(JSON.parse(fs.readFileSync(CFG_PATH, "utf8"))) };
   }
 } catch (e) {
-  logLine(`config load failed: ${e.message}`);
+  logLine(`config load failed: ${withoutPaths(e.message)}`);
 }
 function syncLogPath() {
   if (typeof cfg.logPath !== "string" || !cfg.logPath) cfg.logPath = DEFAULT_CFG.logPath;
@@ -432,7 +433,7 @@ async function loadSqlite() {
     const m = await import(sqliteModule);
     DatabaseSyncCtor = m.DatabaseSync;
   } catch (e) {
-    logLine(`node:sqlite unavailable (need node>=22.19): ${e.message}`);
+    logLine(`node:sqlite unavailable (need node>=22.19): ${withoutPaths(e.message)}`);
   }
   return DatabaseSyncCtor;
 }
@@ -476,7 +477,7 @@ function blockFilter(blockId, source) {
   return { where, params };
 }
 function withoutPaths(text) {
-  return String(text).replace(/[A-Za-z]:\\[^\s'"]+/g, "<path>").replace(/(?<![\w.:/])~?\/[^\s'":,)]+/g, "<path>");
+  return String(text).replace(/file:\/\/\/[^\s'"]+/g, "file://<path>").replace(/(?<![\w:/\\])(?:[A-Za-z]:[\\/]|\\\\|\/\/)[^\s'"]+(?: [^\s'"]*[\\/][^\s'"]*)*/g, "<path>").replace(/(?<![\w.:/\\])~?\/(?:[^\s'":,)]*\/)*[^\s'":,)]+(?: [^\s'":,)]*\/[^\s'":,)]*)*/g, "<path>");
 }
 var SOURCE_ADAPTERS = /* @__PURE__ */ new Set(["pi-sidecar", "opencode-acp"]);
 function sanitizeSource(raw) {
@@ -504,7 +505,7 @@ async function loadSources() {
     text = await fs.promises.readFile(sourcesPath, "utf8");
   } catch (e) {
     if (e && e.code === "ENOENT") return defaultSources();
-    logLine(`sources read failed (fail-closed, no sources): ${e.message}`);
+    logLine(`sources read failed (fail-closed, no sources): ${withoutPaths(e.message)}`);
     return [];
   }
   const list = [];
@@ -517,7 +518,7 @@ async function loadSources() {
       if (s) list.push(s);
       else logLine(`sources line ignored: bad id/adapter/root/pattern or unknown adapter '${parsed?.adapter}'`);
     } catch (e) {
-      logLine(`sources line ignored: ${e.message}`);
+      logLine(`sources line ignored: ${withoutPaths(e.message)}`);
     }
   }
   return list;
@@ -525,69 +526,94 @@ async function loadSources() {
 function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-function fileMatches(pattern, name) {
-  const re = new RegExp("^" + pattern.split("*").map(escapeRegExp).join(".*") + "$");
-  return re.test(name);
+function globToRegExp(pattern) {
+  const segs = String(pattern).split(/[\\/]/).filter(Boolean);
+  let re = "^";
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
+    const last = i === segs.length - 1;
+    if (seg === "**") {
+      re += last ? ".*" : "(?:[^/]+/)*";
+      continue;
+    }
+    re += seg.split("*").map(escapeRegExp).join("[^/]*");
+    if (!last) re += "/";
+  }
+  return new RegExp(`${re}$`);
 }
+var MAX_SCAN_ENTRIES = 2e5;
 var MAX_SCAN_FILES = 2e4;
-async function walkFiles(dir, filePattern, budget = { left: MAX_SCAN_FILES, hitCap: false }) {
+async function walkGlob(dir, re, budget, errors, prefix = "") {
   let entries;
   try {
     entries = await fs.promises.readdir(dir, { withFileTypes: true });
-  } catch {
+  } catch (e) {
+    errors.push(e);
     return [];
   }
   const out = [];
   for (const ent of entries) {
-    if (budget.left <= 0) {
-      budget.hitCap = true;
-      return out;
+    if (budget.visitedLeft <= 0) {
+      budget.hitVisited = true;
+      break;
     }
-    budget.left--;
-    const full = path.join(dir, ent.name);
+    budget.visitedLeft--;
     if (ent.isDirectory()) {
-      out.push(...await walkFiles(full, filePattern, budget));
-    } else if (ent.isFile() && fileMatches(filePattern, ent.name)) {
-      out.push(full);
+      out.push(...await walkGlob(path.join(dir, ent.name), re, budget, errors, `${prefix}${ent.name}/`));
+    } else if (ent.isFile()) {
+      if (!re.test(`${prefix}${ent.name}`)) continue;
+      if (budget.matchedLeft <= 0) {
+        budget.hitMatched = true;
+        break;
+      }
+      budget.matchedLeft--;
+      out.push(path.join(dir, ent.name));
     }
   }
   return out;
 }
 async function listSourceFiles(source) {
-  const root = source.root;
-  try {
-    await fs.promises.access(root);
-  } catch {
-    return [];
+  const errors = [];
+  const segs = String(source.pattern).split(/[\\/]/).filter(Boolean);
+  const filePattern = segs.pop() || source.pattern;
+  let start = source.root;
+  while (segs.length && !segs[0].includes("*")) {
+    start = path.join(start, segs.shift());
   }
-  const parts = source.pattern.split(/[\\/]/).filter(Boolean);
-  const filePattern = parts[parts.length - 1] || source.pattern;
-  const recursive = parts.length > 1 || parts[0] === "**";
-  if (!recursive) {
-    const names = await fs.promises.readdir(root);
-    const matched = names.filter((n) => fileMatches(filePattern, n));
-    if (matched.length > MAX_SCAN_FILES) {
-      logLine(
-        `scan: source '${source.id}' has ${matched.length} matching files; only the first ${MAX_SCAN_FILES} are considered`
-      );
-      matched.length = MAX_SCAN_FILES;
+  if (segs.length === 0) {
+    const re2 = globToRegExp(filePattern);
+    try {
+      const entries = await fs.promises.readdir(start, { withFileTypes: true });
+      const matched = entries.filter((ent) => ent.isFile() && re2.test(ent.name)).map((ent) => path.join(start, ent.name));
+      if (matched.length > MAX_SCAN_FILES) {
+        logLine(
+          `scan: source '${source.id}' has ${matched.length} matching files; only the first ${MAX_SCAN_FILES} are considered`
+        );
+        matched.length = MAX_SCAN_FILES;
+      }
+      return { files: matched, errors };
+    } catch (e) {
+      errors.push(e);
+      return { files: [], errors };
     }
-    return matched.map((n) => path.join(root, n));
   }
-  const budget = { left: MAX_SCAN_FILES, hitCap: false };
-  const files = await walkFiles(root, filePattern, budget);
-  if (budget.hitCap) {
+  const re = globToRegExp([...segs, filePattern].join("/"));
+  const budget = { visitedLeft: MAX_SCAN_ENTRIES, matchedLeft: MAX_SCAN_FILES, hitVisited: false, hitMatched: false };
+  const files = await walkGlob(start, re, budget, errors);
+  if (budget.hitVisited || budget.hitMatched) {
     logLine(
-      `scan: source '${source.id}' hit the ${MAX_SCAN_FILES}-entry cap; the rest was skipped (check that the allow-list root points at a session directory, not at a whole home directory)`
+      `scan: source '${source.id}' hit the ${budget.hitMatched ? `${MAX_SCAN_FILES}-match` : `${MAX_SCAN_ENTRIES}-entry`} cap; the rest was skipped (check that the allow-list root points at a session directory, not at a whole home directory)`
     );
   }
-  return files;
+  return { files, errors };
 }
 function cleanOpencodeSummary(summary) {
   return String(summary).replace(/\s*<dcp-message-id>.*?<\/dcp-message-id>\s*$/s, "").trim();
 }
 function collectMsgIds(block) {
-  const raw = [block?.effectiveMessageIds, block?.messageIds].find((v) => Array.isArray(v) && v.length > 0);
+  const raw = [block?.effectiveMessageIds, block?.messageIds].find(
+    (v) => Array.isArray(v) && v.some((item) => typeof item === "string" && item.trim() !== "")
+  );
   if (!raw) return null;
   const out = [];
   const seen = /* @__PURE__ */ new Set();
@@ -661,6 +687,7 @@ var MemoryDb = class {
   }
   open() {
     if (this.db) return;
+    if (dbClosed) throw new Error("memory store is closed for this session");
     if (!DatabaseSyncCtor) throw new Error("node:sqlite unavailable");
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
     this.db = new DatabaseSyncCtor(this.dbPath);
@@ -1044,7 +1071,7 @@ var MemoryDb = class {
     try {
       rows = this.db.prepare(built.sql).all(...built.params);
     } catch (e) {
-      logLine(`search error: ${e.message} | sql=${built.sql}`);
+      logLine(`search error: ${withoutPaths(e.message)} | sql=${built.sql}`);
       rows = [];
     }
     return { mode: built.mode, rows };
@@ -1114,7 +1141,7 @@ var MemoryDb = class {
     try {
       this.db.exec("VACUUM");
     } catch (e) {
-      logLine(`prune: VACUUM skipped (${e.message}); rows pruned, file size unchanged`);
+      logLine(`prune: VACUUM skipped (${withoutPaths(e.message)}); rows pruned, file size unchanged`);
     }
     const remain = this.db.prepare("SELECT count(*) AS c FROM blocks").get().c;
     return {
@@ -1234,7 +1261,7 @@ async function loadOpencodeSessionMap(source, files) {
       if (cwd || project) map.set(file, { cwd: cwd || null, project: project || null });
     }
   } catch (e) {
-    logLine(`opencode session map failed: ${e.message}`);
+    logLine(`opencode session map failed: ${withoutPaths(e.message)}`);
   } finally {
     if (odb) {
       try {
@@ -1246,10 +1273,10 @@ async function loadOpencodeSessionMap(source, files) {
   return map;
 }
 async function scanSources(force = false) {
+  const generation = sessionGeneration;
   await loadSqlite();
   const d = getDb();
   const sources = await loadSources();
-  const generation = sessionGeneration;
   const needPiCwd = sources.some((s) => s.enabled && s.adapter === "pi-sidecar");
   const resolvePiCwd = needPiCwd ? async (sessionFile) => {
     const headerCwd = await piSessionHeaderCwd(sessionFile);
@@ -1276,7 +1303,7 @@ async function scanSources(force = false) {
       await scanOneSource(source, d, force, resolvePiCwd, generation, tally);
     } catch (e) {
       tally.failed++;
-      logLine(`source '${source.id}' (${source.adapter}) failed: ${e.stack || e.message}`);
+      logLine(`source '${source.id}' (${source.adapter}) failed: ${withoutPaths(e.stack || e.message)}`);
     }
     fileCount += tally.files;
     scanned += tally.scanned;
@@ -1288,7 +1315,15 @@ async function scanSources(force = false) {
   return { scanned, inserted, redacted, total, failed, files: fileCount, sources: enabledSources };
 }
 async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) {
-  let files = await listSourceFiles(source);
+  const listing = await listSourceFiles(source);
+  let files = listing.files;
+  if (listing.errors.length) {
+    tally.failed += listing.errors.length;
+    const first = listing.errors[0];
+    logLine(
+      `scan: source '${source.id}' could not read ${listing.errors.length} director${listing.errors.length === 1 ? "y" : "ies"}: ${withoutPaths(first?.message || String(first))}`
+    );
+  }
   if (source.adapter === "pi-sidecar" && cfg.excludeDirs.length) {
     files = files.filter((f) => {
       const rel = path.relative(source.root, f);
@@ -1487,7 +1522,9 @@ async function factory(pi) {
       )
     );
     if (!cfg.scanOnStartup) {
-      scanCurrentSession(sessionFile, true, ctx.cwd).catch((e) => logLine(`session_start scan error: ${e.message}`));
+      scanCurrentSession(sessionFile, true, ctx.cwd).catch(
+        (e) => logLine(`session_start scan error: ${withoutPaths(e.message)}`)
+      );
       return;
     }
     const run = scanSources().then(async (r) => {
@@ -1499,7 +1536,7 @@ async function factory(pi) {
       if (generation !== sessionGeneration) return;
       const st = getDb().stats();
       logLine(`db ready: ${path.basename(st.dbPath)} sources=${st.sources} blocks=${st.blocks}`);
-    }).catch((e) => logLine(`session_start scan error: ${e.stack || e.message}`));
+    }).catch((e) => logLine(`session_start scan error: ${withoutPaths(e.stack || e.message)}`));
     backgroundScan = run;
     void run.finally(() => {
       if (backgroundScan === run) backgroundScan = null;
@@ -1514,7 +1551,7 @@ async function factory(pi) {
     }
   });
   pi.on("session_shutdown", async (_event, ctx) => {
-    sessionGeneration++;
+    const shutdownGeneration = ++sessionGeneration;
     const inflight = backgroundScan;
     if (inflight) {
       let timer = null;
@@ -1532,11 +1569,15 @@ async function factory(pi) {
     } catch (e) {
       log(`session_shutdown: ${e.message}`);
     }
+    if (shutdownGeneration !== sessionGeneration) {
+      log(`session_shutdown: superseded by a new session; store left open`);
+      return;
+    }
+    dbClosed = true;
     if (db) {
       db.close();
       db = null;
     }
-    dbClosed = true;
   });
   pi.registerTool({
     name: "memory_search",
@@ -1556,10 +1597,10 @@ async function factory(pi) {
         const text = formatResults(res);
         return {
           content: [{ type: "text", text }],
-          details: { mode: res.mode, hits: res.rows.length, dbPath: cfg.dbPath }
+          details: { mode: res.mode, hits: res.rows.length, dbPath: path.basename(cfg.dbPath) }
         };
       } catch (e) {
-        logLine(`memory_search error: ${e.stack || e.message}`);
+        logLine(`memory_search error: ${withoutPaths(e.stack || e.message)}`);
         return {
           content: [
             {
@@ -1567,7 +1608,7 @@ async function factory(pi) {
               text: `memory_search failed: ${withoutPaths(e.message) || "unknown error"} (the extension log has the full trace)`
             }
           ],
-          details: { mode: "error", hits: 0, dbPath: cfg.dbPath }
+          details: { mode: "error", hits: 0, dbPath: path.basename(cfg.dbPath) }
         };
       }
     }
@@ -1672,7 +1713,7 @@ ${list}`
             }
           };
         } catch (e) {
-          logLine(`memory_expand error: ${e.stack || e.message}`);
+          logLine(`memory_expand error: ${withoutPaths(e.stack || e.message)}`);
           return {
             content: [
               {
@@ -1725,7 +1766,7 @@ DB: ${st.dbPath}
 Log: ${cfg.logPath || DEFAULT_CFG.logPath}`;
         ctx.ui?.notify?.(msg, "info");
       } catch (e) {
-        logLine(`/memory error: ${e.stack || e.message}`);
+        logLine(`/memory error: ${withoutPaths(e.stack || e.message)}`);
       }
     }
   });

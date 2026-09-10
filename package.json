@@ -1,6 +1,6 @@
 {
   "name": "pi-billion-memory",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Independent SQLite/FTS5 long-term memory index for the pi coding agent; reads allow-listed ACP compression sidecars (including billion-context-pi output) and exposes the memory_search tool.",
   "type": "module",
   "private": true,
@@ -33,9 +33,6 @@
   "bugs": {
     "url": "https://github.com/tjp72/pi-billion-memory/issues"
   },
-  "publishConfig": {
-    "access": "public"
-  },
   "engines": {
     "node": ">=22.19.0"
   },
@@ -50,8 +47,7 @@
     "check": "npm run format:check && npm run typecheck && npm run lint && npm test && npm run build",
     "verify:dist": "npm run build && git diff --exit-code -- dist",
     "dev:install": "node scripts/install.mjs",
-    "prepack": "npm run build",
-    "prepublishOnly": "npm run check && npm run e2e"
+    "prepack": "npm run build"
   },
   "keywords": [
     "pi",

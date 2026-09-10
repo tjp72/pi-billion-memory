@@ -1241,6 +1241,122 @@ check(
       "pi-sidecar",
 );
 
+// --- allow-list pattern scope, symlinks, listing errors ----------------------------------------
+const globRoot = path.join(tmp, "glob-root");
+fs.mkdirSync(path.join(globRoot, "sub"), { recursive: true });
+fs.mkdirSync(path.join(globRoot, "other"), { recursive: true });
+fs.writeFileSync(path.join(globRoot, "top.json"), "{}");
+fs.writeFileSync(path.join(globRoot, "sub", "inside.json"), "{}");
+fs.writeFileSync(path.join(globRoot, "other", "outside.json"), "{}");
+const globSub = await internals.listSourceFiles({
+  id: "g1",
+  adapter: "pi-sidecar",
+  root: globRoot,
+  pattern: "sub/*.json",
+});
+check(
+  "a directory prefix in an allow-list pattern narrows the scan instead of widening it",
+  globSub.files.length === 1 &&
+    globSub.files[0] === path.join(globRoot, "sub", "inside.json") &&
+    globSub.errors.length === 0,
+);
+const globDeep = await internals.listSourceFiles({
+  id: "g2",
+  adapter: "pi-sidecar",
+  root: globRoot,
+  pattern: "**/*.json",
+});
+check(
+  "** spans directories while * stays inside one segment",
+  globDeep.files.length === 3 && globDeep.files.includes(path.join(globRoot, "sub", "inside.json")),
+);
+const globMissing = await internals.listSourceFiles({
+  id: "g3",
+  adapter: "pi-sidecar",
+  root: path.join(tmp, "no-such-root"),
+  pattern: "*.json",
+});
+check(
+  "an unreadable or missing allow-list root is reported instead of looking like an empty source",
+  globMissing.files.length === 0 && globMissing.errors.length === 1,
+);
+let symlinkCreated = false;
+try {
+  fs.symlinkSync(path.join(globRoot, "other", "outside.json"), path.join(globRoot, "sub", "linked.json"));
+  symlinkCreated = true;
+} catch {
+  // Windows without developer mode cannot create symlinks; the check is skipped there.
+}
+if (symlinkCreated) {
+  const globLink = await internals.listSourceFiles({
+    id: "g4",
+    adapter: "pi-sidecar",
+    root: globRoot,
+    pattern: "sub/*.json",
+  });
+  check(
+    "a symlink inside the root does not pull in a file from outside the allow-list",
+    globLink.files.length === 1 && globLink.files[0] === path.join(globRoot, "sub", "inside.json"),
+  );
+}
+check(
+  "withoutPaths covers drive, UNC, spaced and POSIX absolute paths",
+  internals.withoutPaths("C:\\Users\\alice\\secret\\a.jsonl") === "<path>" &&
+    internals.withoutPaths("C:/Users/alice/secret/a.jsonl") === "<path>" &&
+    internals.withoutPaths("\\\\server\\share\\private\\a.jsonl") === "<path>" &&
+    internals.withoutPaths("C:\\Program Files\\app\\a.log") === "<path>" &&
+    internals.withoutPaths("/home/alice/My Docs/notes.txt") === "<path>",
+);
+check(
+  "withoutPaths leaves URLs and plain messages alone",
+  internals.withoutPaths("see https://example.com/a/b for details") === "see https://example.com/a/b for details" &&
+    internals.withoutPaths("permission denied") === "permission denied",
+);
+check(
+  "a first list of unusable entries does not shadow a valid second field",
+  JSON.stringify(internals.collectMsgIds({ effectiveMessageIds: [null, "  "], messageIds: ["aaa11111"] })) ===
+    '["aaa11111"]',
+);
+const exBadSelect = await internals.expandBlock({
+  sessionFile: exSession,
+  msgIds: exIds,
+  mode: "full",
+  select: [999],
+  ...exBudget,
+  redact: null,
+});
+check(
+  "a selection that resolves to nothing reports truncation instead of a clean empty result",
+  exBadSelect.text === "" && exBadSelect.truncated === true && exBadSelect.skippedMessages === 1,
+);
+const exGrowBuf = Buffer.from('{"type":"message","id":"m9"}\n');
+const exGrow = await internals.readSessionMessages(exSession, 10 * 1024 * 1024, async () => ({
+  buffer: exGrowBuf,
+  totalBytes: exGrowBuf.length + 100,
+}));
+check(
+  "a file that grows during the read is truncated without dropping the complete line",
+  exGrow.truncated === true && exGrow.messages.has("m9"),
+);
+const exShrinkBuf = Buffer.from('{"type":"message","id":"m9"}');
+const exShrink = await internals.readSessionMessages(exSession, 10, async () => ({
+  buffer: exShrinkBuf,
+  totalBytes: exShrinkBuf.length,
+}));
+check(
+  "a file that shrank during the read is no longer reported as truncated",
+  exShrink.truncated === false && exShrink.messages.has("m9"),
+);
+const exDenied = await internals.readSessionMessages(exSession, 100, async () => {
+  const err = new Error("denied");
+  (err as any).code = "EACCES";
+  throw err;
+});
+check(
+  "an unreadable session file degrades to missing instead of failing the tool call",
+  exDenied.missing === true && exDenied.messages.size === 0,
+);
+
 // --- cleanup --------------------------------------------------------------------
 db.close();
 fs.rmSync(tmp, { recursive: true, force: true });

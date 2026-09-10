@@ -171,7 +171,7 @@ export function renderMessage(line: unknown, callId: string | null): RenderedMes
   return { role, items };
 }
 
-/** Bytes read from a file plus its size on disk. */
+/** Bytes read from a file plus its size after the read. */
 export interface ReadResult {
   buffer: Buffer;
   totalBytes: number;
@@ -183,11 +183,11 @@ export interface SessionRead {
   messages: Map<string, any>;
   /** Bytes actually read. */
   bytesRead: number;
-  /** Total size of the file on disk. */
+  /** File size after the read; larger than `bytesRead` means bytes were left behind. */
   totalBytes: number;
-  /** True when the file was longer than the read cap (the trailing partial line is dropped). */
+  /** True when bytes existed past the returned buffer (the trailing partial line is dropped). */
   truncated: boolean;
-  /** True when the session file no longer exists (deleted, rotated, or renamed since ingestion). */
+  /** True when the session file is gone or unreadable (deleted, rotated, renamed, or not permitted). */
   missing: boolean;
 }
 
@@ -196,7 +196,8 @@ export interface SessionRead {
  *
  * The cap is physical: bytes are pulled from an open handle in bounded steps, so a multi-megabyte
  * session file never has to fit in memory just to resolve a few references. The size comes from the
- * same handle, which tells the caller whether the cap cut the file short.
+ * same handle is re-statted after the transfer, which tells the caller whether anything was left
+ * past the returned buffer.
  * @internal
  */
 export async function readCapped(file: string, maxBytes: number): Promise<ReadResult> {
@@ -213,7 +214,11 @@ export async function readCapped(file: string, maxBytes: number): Promise<ReadRe
       if (bytesRead <= 0) break;
       filled += bytesRead;
     }
-    return { buffer: buffer.subarray(0, filled), totalBytes: size };
+    // Re-stat instead of reporting the size from before the transfer: a session file can grow or
+    // shrink while it is read, and the caller's "is there data past this buffer?" must not use a
+    // stale value (a shrink used to look truncated and cost a complete line).
+    const { size: after } = await handle.stat();
+    return { buffer: buffer.subarray(0, filled), totalBytes: after };
   } finally {
     try {
       await handle.close();
@@ -229,8 +234,8 @@ export async function readCapped(file: string, maxBytes: number): Promise<ReadRe
  * The read is physically byte-capped (see {@link readCapped}): expansion must not become a way to
  * stream a whole session file into memory. When the cap cuts the file mid-line the trailing
  * fragment is dropped, so a truncated read can only lose messages, never corrupt them. A session
- * file that has been deleted, rotated, or renamed is not an error: every reference in it is
- * reported as missing instead of failing the call.
+ * file that has been deleted, rotated, renamed, or cannot be opened is not an error: every
+ * reference in it is reported as missing instead of failing the call.
  * @internal
  */
 export async function readSessionMessages(
@@ -244,15 +249,18 @@ export async function readSessionMessages(
   try {
     read = await readFile(sessionFile, cap);
   } catch (e) {
-    if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) {
+    // Gone or not readable: both degrade to "nothing recoverable here", never to a failed call.
+    if (e && ["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EISDIR"].includes(e.code)) {
       return { messages, bytesRead: 0, totalBytes: 0, truncated: false, missing: true };
     }
     throw e;
   }
-  const truncated = read.totalBytes > cap;
+  // "Truncated" means bytes exist past the buffer, whatever the reason: the cap, or a file that grew
+  // while it was read. Comparing against the stale cap alone reported a shrink as truncation.
+  const truncated = read.buffer.length < read.totalBytes;
   const text = read.buffer.toString("utf8");
   const parts = text.split("\n");
-  if (truncated) parts.pop(); // drop the fragment the cap cut in half
+  if (truncated && !text.endsWith("\n")) parts.pop(); // drop the fragment the cut left mid-line
   for (const part of parts) {
     const raw = part.trim();
     if (!raw) continue;
@@ -413,7 +421,9 @@ export async function expandBlock(opts: ExpandOptions): Promise<ExpandResult> {
   const chunks: string[] = [];
   let used = 0;
   let returned = 0;
-  let skipped = 0;
+  // Indices the caller asked for that the block cannot render (out of range, no text, synthetic)
+  // are skipped too: a selection that resolves to nothing must not look like a clean empty result.
+  let skipped = Math.max(0, wanted.size - requestedCount);
   let capTrimmed = false;
 
   for (const entry of entries) {
