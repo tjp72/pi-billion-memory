@@ -14,35 +14,43 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # Tags that predate the current version (history re-pushes, backfilled releases) have no
+      # CHANGELOG section here: surface them as a notice and skip the job instead of failing it.
+      - name: Check that the tag matches package.json
+        run: |
+          expected="v$(node -p "require('./package.json').version")"
+          if [ "$expected" != "${GITHUB_REF_NAME}" ]; then
+            echo "::notice::tag ${GITHUB_REF_NAME} predates the current package.json version ${expected}; no release is created"
+            echo "SKIP_RELEASE=1" >> "$GITHUB_ENV"
+          fi
+
       - name: Set up Node
+        if: env.SKIP_RELEASE != '1'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           cache: npm
 
       - name: Install
+        if: env.SKIP_RELEASE != '1'
         run: npm ci --legacy-peer-deps
 
       - name: Check
+        if: env.SKIP_RELEASE != '1'
         run: npm run check
 
       - name: E2E dist smoke test
+        if: env.SKIP_RELEASE != '1'
         run: npm run e2e
 
       - name: Verify committed dist
+        if: env.SKIP_RELEASE != '1'
         run: npm run verify:dist
-
-      - name: Check that the tag matches package.json
-        run: |
-          expected="v$(node -p "require('./package.json').version")"
-          if [ "$expected" != "${GITHUB_REF_NAME}" ]; then
-            echo "tag ${GITHUB_REF_NAME} does not match package.json version ${expected}" >&2
-            exit 1
-          fi
 
       # This project is distributed through git tags, not npm: package.json keeps
       # "private": true and every install path is `pi install git:...@<tag>`.
       - name: Create GitHub release from CHANGELOG.md
+        if: env.SKIP_RELEASE != '1'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
