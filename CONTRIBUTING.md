@@ -47,6 +47,58 @@ API** (`@earendil-works/pi-coding-agent`). Development-only tools belong in
 5. Keep commit messages English, imperative, and factual.
 6. Do not force-push a shared branch; open a pull request instead.
 
+## Maintainer notes
+
+Branch protection on `main` is: the four CI jobs are required status checks, force pushes
+and branch deletions are disabled, and admins are **not** enforced. The owner can therefore
+still push directly (that is how releases and fixes land), while a contributor without
+admin rights can only land a change through a pull request where CI has run — a direct push
+of a fresh commit fails because the required checks cannot be satisfied yet.
+
+Two couplings to remember:
+
+- The required checks are the CI job names (`Node <version> / <os>`). Renaming a matrix job
+  in `.github/workflows/ci.yml` leaves the rule waiting for a check that never reports, and
+  pull requests hang on `Expected — Waiting for status to be reported`. Update the rule in
+  the same change.
+- A tag creates a GitHub Release only when its name matches `package.json` (`vX.Y.Z`);
+  older tags are skipped on purpose. Bump the version first, then tag.
+
+Force pushes are blocked for everyone, including the owner. When history on `main`
+genuinely has to be rewritten (an accidental commit that is already pushed), lift the rule
+for the duration, rewrite, and put it back:
+
+```bash
+REPO=tjp72/pi-billion-memory
+
+# 1. Lift force-push protection (everything else stays as configured).
+gh api -X PUT "repos/$REPO/branches/main/protection" --input - <<'JSON'
+{
+  "required_status_checks": {
+    "strict": false,
+    "contexts": [
+      "Node 22.19 / ubuntu-latest",
+      "Node 22.19 / windows-latest",
+      "Node 24 / ubuntu-latest",
+      "Node 24 / windows-latest"
+    ]
+  },
+  "enforce_admins": false,
+  "required_pull_request_reviews": null,
+  "restrictions": null,
+  "allow_deletions": false,
+  "allow_force_pushes": true
+}
+JSON
+
+# 2. Rewrite the branch.
+git push --force-with-lease origin main
+
+# 3. Put the rule back: same payload with "allow_force_pushes": false.
+gh api "repos/$REPO/branches/main/protection" \
+  --jq '{force_push: .allow_force_pushes.enabled, checks: .required_status_checks.contexts}'
+```
+
 ## Reporting bugs
 
 Use the issue templates and include the version, Node version, pi version, and
