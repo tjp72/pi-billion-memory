@@ -210,9 +210,10 @@ The design is deliberately minimal; preserve these properties:
 - If history ever needs scrubbing: orphan-branch rebuild is the approved procedure, **then**
   `git reflog expire --expire=now --all && git gc --prune=now`, and verify with
   `git fsck --no-reflogs` (no dangling output) and `git log --all` (only intended commits).
-- Publishing stays private until the maintainer removes `"private": true`. Tags use `vX.Y.Z`.
-  The release workflow publishes to npm with `--access public`; provenance is enabled only after
-  the GitHub repository is public.
+- Distribution is git-only: `package.json` keeps `"private": true` and there is no npm package.
+  Tags use `vX.Y.Z`; the release workflow checks that the tag matches `package.json`, re-checks the
+  committed `dist/`, and creates the GitHub release from the matching `CHANGELOG.md` section.
+  Every documented install path is `pi install git:...@<tag>`.
 
 ## 7. Finish checklist (every task)
 

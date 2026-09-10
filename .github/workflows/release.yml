@@ -5,11 +5,10 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: read
-  id-token: write
+  contents: write
 
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -19,7 +18,6 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
           cache: npm
 
       - name: Install
@@ -31,15 +29,32 @@ jobs:
       - name: E2E dist smoke test
         run: npm run e2e
 
-      - name: Ensure package is publishable
-        run: |
-          node -e "const p=require('./package.json'); if (p.private) { console.error('package.json has private: true; remove it before publishing'); process.exit(1); }"
+      - name: Verify committed dist
+        run: npm run verify:dist
 
-      # `--provenance` requires a public repository. After the repository is
-      # made public, change the publish command to:
-      #   npm publish --access public --provenance
-      # `NPM_TOKEN` must be configured as a repository secret.
-      - name: Publish to npm
-        run: npm publish --access public
+      - name: Check that the tag matches package.json
+        run: |
+          expected="v$(node -p "require('./package.json').version")"
+          if [ "$expected" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match package.json version ${expected}" >&2
+            exit 1
+          fi
+
+      # This project is distributed through git tags, not npm: package.json keeps
+      # "private": true and every install path is `pi install git:...@<tag>`.
+      - name: Create GitHub release from CHANGELOG.md
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          notes="$RUNNER_TEMP/notes.md"
+          awk -v v="${tag#v}" '
+            $0 ~ "^## \\[" v "\\]" { inside = 1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > "$notes"
+          if [ -s "$notes" ]; then
+            gh release create "$tag" --title "$tag" --notes-file "$notes"
+          else
+            gh release create "$tag" --title "$tag" --generate-notes
+          fi

@@ -1,6 +1,5 @@
 # pi-billion-memory
 
-[![npm version](https://img.shields.io/npm/v/pi-billion-memory.svg)](https://www.npmjs.com/package/pi-billion-memory)
 [![CI](https://github.com/tjp72/pi-billion-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/tjp72/pi-billion-memory/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -32,7 +31,7 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
   `/memory` 命令，因此可以和 billion-context-pi 同时运行，不会参与上下文压缩的
   顺序竞争，也不会覆盖压缩结果。
 - sidecar 格式是 billion-context-pi 的内部实现，可能变化。本扩展针对
-  billion-context-pi `0.1.52` 的 sidecar 格式做过测试；如果上游格式变化，
+  billion-context-pi `0.1.65` 的 sidecar 格式做过测试；如果上游格式变化，
   可能需要更新适配器。
 - billion-context-pi 使用 MIT 许可证；它的名称和 logo 归其作者所有。
   本项目的 MIT 许可证只覆盖本项目代码。
@@ -72,20 +71,23 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
 
 ## 安装
 
-### npm（发布后推荐）
+本扩展**只通过 git 分发**——没有 npm 包，所以所有安装方式都是 `pi install git:...`。
+
+### GitHub（私有仓库）
 
 ```bash
-pi install npm:pi-billion-memory
+# 最新 main——最省事，但不可复现
+pi install git:git@github.com:tjp72/pi-billion-memory.git
+
+# 用 HTTPS 代替 SSH——需要 git 凭据
+pi install git:https://github.com/tjp72/pi-billion-memory.git
 ```
 
-### GitHub（私有或公开仓库）
+在末尾追加 `@<tag>` 可钉住某个发布版本（可复现；tag 见
+[Releases](https://github.com/tjp72/pi-billion-memory/releases) 页面）：
 
 ```bash
-# SSH（私有仓库推荐）
-pi install git:git@github.com:tjp72/pi-billion-memory.git@v0.5.0
-
-# HTTPS（私有仓库；需要 git 凭据）
-pi install git:https://github.com/tjp72/pi-billion-memory.git@v0.5.0
+pi install git:git@github.com:tjp72/pi-billion-memory.git@<tag>
 ```
 
 > `pi install git:...` 会 clone 仓库并执行 `npm install --omit=dev`，**不会执行
@@ -116,8 +118,6 @@ pi list
 ### 卸载
 
 ```bash
-pi remove npm:pi-billion-memory
-# 或
 pi remove git:git@github.com:tjp72/pi-billion-memory.git
 ```
 

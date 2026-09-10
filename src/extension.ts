@@ -36,8 +36,8 @@
  * credential values are replaced with [REDACTED] and URLs with [REDACTED_URL]; the hit count is
  * logged without the value.
  *
- * Install: `pi install npm:pi-billion-memory` or
- *   `pi install git:git@github.com:tjp72/pi-billion-memory.git@<tag>`.
+ * Install: `pi install git:git@github.com:tjp72/pi-billion-memory.git@<tag>`
+ *   (git distribution only; there is no npm package).
  * Build: `npm run build` (tsup + tsc) emits `dist/index.js`.
  * Config: ~/.pi/pi-billion-memory.json (optional; see loadConfig defaults below).
  * Allow-list: ~/.pi/pi-billion-memory.sources.jsonl (optional; defaults to pi + opencode).

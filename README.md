@@ -1,6 +1,5 @@
 # pi-billion-memory
 
-[![npm version](https://img.shields.io/npm/v/pi-billion-memory.svg)](https://www.npmjs.com/package/pi-billion-memory)
 [![CI](https://github.com/tjp72/pi-billion-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/tjp72/pi-billion-memory/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -38,7 +37,7 @@ affiliated with, endorsed by, or a fork of**
   ordering or clobber compressed output.
 - The sidecar format is an implementation detail of billion-context-pi and may
   change. This extension is tested against the sidecar format produced by
-  billion-context-pi `0.1.52`; a format change may require an adapter update.
+  billion-context-pi `0.1.65`; a format change may require an adapter update.
 - billion-context-pi is MIT-licensed. Its name and logo belong to its authors.
   This project's MIT license covers only this project's code.
 
@@ -85,20 +84,24 @@ affiliated with, endorsed by, or a fork of**
 
 ## Install
 
-### npm (recommended once published)
+The extension is distributed **through git only** — there is no npm package, so
+every install path is `pi install git:...`.
+
+### GitHub (private repository)
 
 ```bash
-pi install npm:pi-billion-memory
+# Latest main — simplest, but not reproducible
+pi install git:git@github.com:tjp72/pi-billion-memory.git
+
+# HTTPS instead of SSH — git credentials are required
+pi install git:https://github.com/tjp72/pi-billion-memory.git
 ```
 
-### GitHub (private or public repository)
+Append `@<tag>` to pin a release (reproducible; tags are listed on the
+[Releases](https://github.com/tjp72/pi-billion-memory/releases) page):
 
 ```bash
-# SSH (recommended for a private repository)
-pi install git:git@github.com:tjp72/pi-billion-memory.git@v0.5.0
-
-# HTTPS (private repository; git credentials are required)
-pi install git:https://github.com:tjp72/pi-billion-memory.git@v0.5.0
+pi install git:git@github.com:tjp72/pi-billion-memory.git@<tag>
 ```
 
 > `pi install git:...` clones the repository and runs `npm install --omit=dev`.
@@ -131,8 +134,6 @@ Then in a pi session:
 ### Uninstall
 
 ```bash
-pi remove npm:pi-billion-memory
-# or
 pi remove git:git@github.com:tjp72/pi-billion-memory.git
 ```
 

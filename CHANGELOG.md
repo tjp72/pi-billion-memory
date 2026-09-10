@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Distribution is git-only. The release workflow no longer publishes to npm: it checks that the
+  tag matches `package.json`, re-checks the committed `dist/`, and creates the GitHub release from
+  the matching `CHANGELOG.md` section. `pi install git:...` is the only documented install path,
+  and the npm badge and npm install/uninstall sections were removed from both READMEs.
+
+### Added
+
+- README "Scope: single user, single machine" section: no accounts, server, sync, or per-user
+  permissions; one store per OS user; SQLite WAL locking is single-host only, so the database file
+  must never be shared; ephemeral homes rebuild the index; redaction is best-effort over a
+  plaintext, permission-unhardened store; sync sidecars, not the database, across machines.
+
 ## [0.5.0] - 2026-09-10
 
 ### Added
