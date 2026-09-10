@@ -84,7 +84,7 @@ pi install npm:pi-billion-memory
 # SSH（私有仓库推荐）
 pi install git:git@github.com:tjp72/pi-billion-memory.git@v0.5.0
 
-# HTTPS（公开仓库；凭据由 git 处理）
+# HTTPS（私有仓库；需要 git 凭据）
 pi install git:https://github.com/tjp72/pi-billion-memory.git@v0.5.0
 ```
 
@@ -316,6 +316,26 @@ npm run verify:dist  # 构建并检查已提交的 dist/ 是否过期
 - `.github/workflows/` — CI 和发布流程。
 
 修改规则见 `CONTRIBUTING.md` 和 `AGENTS.md`。
+
+## 适用范围：单用户、单机
+
+这个扩展是为「一个人在自己的机器上索引自己的会话」设计的，而且也只有这种用法是安全的。
+
+- **没有账号、没有服务端、没有共享层**：没有登录、没有同步、没有按用户的权限模型。
+  库就是一个本地 SQLite 文件。`memory_search` 的 `project` 参数只是过滤条件，**不是权限控制**。
+- **同一个系统用户 = 同一份记忆库**：共享工作站、云端沙箱、以及所有人共用 `root` 的容器里，
+  记忆内容和预览对**该账号下的所有人**都可检索；若开了 `expandEnabled`，原始会话消息也可被读取。
+  多人使用请各自用独立的系统用户（和独立 home）。
+- **绝对不要共享数据库文件**：SQLite 以 WAL 模式打开、busy timeout 5 秒，这些机制只能协调
+  **同一台主机**上的多进程；把 `dbPath` 放到 NFS/SMB 或任何跨主机卷上可能损坏库。
+- **home 不持久 = 每次重建索引**：CI 或无状态容器里每次启动都会重建索引；介意的话把 `dbPath`
+  和白名单指到持久化位置。
+- **脱敏是尽力而为，存储是明文**：密钥/URL 过滤基于正则，只作用于新入库的块，已有行永不重写。
+  数据库不加密，也**没有做文件权限收紧**，因此任何能读该 home 目录的进程都能读它。
+  除 `/memory prune` 外没有配额、保留策略或审计日志。
+- **跨机器**：同步 sidecar 文件，不要同步数据库；每台机器用自己的源文件各建一份索引。
+
+需要共享或集中管控的记忆，这个扩展**不适合**——它刻意只做本机。
 
 ## 已知限制
 

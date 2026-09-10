@@ -97,7 +97,7 @@ pi install npm:pi-billion-memory
 # SSH (recommended for a private repository)
 pi install git:git@github.com:tjp72/pi-billion-memory.git@v0.5.0
 
-# HTTPS (public repository; credentials are handled by git)
+# HTTPS (private repository; git credentials are required)
 pi install git:https://github.com:tjp72/pi-billion-memory.git@v0.5.0
 ```
 
@@ -365,6 +365,36 @@ Repository layout:
 - `.github/workflows/` — CI and release automation.
 
 See `CONTRIBUTING.md` and `AGENTS.md` for the rules that apply to changes.
+
+## Scope: single user, single machine
+
+This extension is built for one person indexing their own sessions on their own
+machine. That is also the only configuration it is safe in.
+
+- **No accounts, no server, no sharing layer.** There is no login, no sync, no
+  per-user permission model. The store is a local SQLite file. `project` in a
+  `memory_search` call filters results; it is not access control.
+- **Everyone using the same OS user shares one store.** On a shared workstation,
+  a remote/cloud sandbox, or a container that runs as `root` for everyone,
+  memories and their previews become searchable by every user of that account,
+  and — with `expandEnabled` on — original session messages become readable.
+  Use a separate OS user (and home directory) per person.
+- **Never share the database file.** SQLite is opened in WAL mode with a 5 s
+  busy timeout, which coordinates concurrent processes on **one host only**.
+  Putting `dbPath` on NFS/SMB or any cross-host volume can corrupt the store.
+- **Ephemeral homes rebuild from scratch.** In CI or a container with a
+  non-persistent home, the index is rebuilt on every start; point `dbPath` (and
+  the allow-list) at persistent storage if that matters.
+- **Redaction is best-effort, storage is plaintext.** The secret/URL filter is
+  regex-based, applies to newly ingested blocks only, and existing rows are
+  never rewritten. The database is not encrypted and file permissions are not
+  hardened, so any process that can read the home directory can read it. There
+  is no quota, retention policy, or audit log beyond `/memory prune`.
+- **Cross-machine use**: sync the sidecar files, not the database. Each machine
+  should build its own index from its own source files.
+
+If you need shared or centrally governed memory, this extension is the wrong
+tool — it is deliberately local-only.
 
 ## Known limitations
 
