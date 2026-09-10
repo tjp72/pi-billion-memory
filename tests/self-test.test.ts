@@ -1358,6 +1358,14 @@ check(
 );
 
 // --- cleanup --------------------------------------------------------------------
+// Windows locks a database file while a handle is open, so the unlink below fails with EBUSY.
+// configureForTests() replaces the connection, which means the `db` captured above can be a stale
+// handle: close the current one as well (getDb() may have opened a later store).
+try {
+  internals.getDb().close();
+} catch {
+  // No store open, or it is latched closed: nothing to release.
+}
 db.close();
 fs.rmSync(tmp, { recursive: true, force: true });
 if (failures.length) {
