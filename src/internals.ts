@@ -1,5 +1,6 @@
 // Test-only entry point. The published extension entry is src/index.ts.
 export { default } from "./extension.js";
+import { expandBlock, parseMsgIds, readSessionMessages, renderMessage, splitMessageId } from "./expand.js";
 import {
   MemoryDb,
   loadSqlite,
@@ -19,6 +20,8 @@ import {
   getPiHeaderReadCount,
 } from "./extension.js";
 
+export { expandBlock, parseMsgIds, readSessionMessages, renderMessage, splitMessageId };
+
 export const internals = {
   MemoryDb,
   loadSqlite,
@@ -36,4 +39,9 @@ export const internals = {
   _setConfig: configureForTests,
   _resetPiHeaderReadCount: resetPiHeaderReadCount,
   _piHeaderReadCount: getPiHeaderReadCount,
+  expandBlock,
+  parseMsgIds,
+  readSessionMessages,
+  renderMessage,
+  splitMessageId,
 };

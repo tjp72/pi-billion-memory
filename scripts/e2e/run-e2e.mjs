@@ -9,6 +9,7 @@ process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome;
 
 let shutdownHandler = null;
+let expandShutdownHandler = null;
 let ctx = null;
 
 try {
@@ -63,8 +64,43 @@ try {
     "memory status should open the SQLite store through node:sqlite",
   );
 
+  // Opt-in gate: memory_expand must exist only when expandEnabled is true. Config is read at
+  // module load, so the enabled case needs a cache-busted import of the same bundle.
+  fs.writeFileSync(path.join(tmpHome, ".pi", "pi-billion-memory.json"), JSON.stringify({ expandEnabled: true }));
+  const { default: expandFactory } = await import("../../dist/index.js?expandEnabled=1");
+  const expandRegistrations = [];
+  const expandHandlers = new Map();
+  await expandFactory({
+    on(event, handler) {
+      expandRegistrations.push(`on:${event}`);
+      expandHandlers.set(event, handler);
+    },
+    registerTool(tool) {
+      expandRegistrations.push(`tool:${tool.name}`);
+      assert.equal(typeof tool.execute, "function", `${tool.name} must have an execute function`);
+    },
+    registerCommand(name) {
+      expandRegistrations.push(`command:${name}`);
+    },
+  });
+  assert.ok(!registrations.includes("tool:memory_expand"), "memory_expand must stay unregistered by default");
+  assert.ok(
+    expandRegistrations.includes("tool:memory_expand"),
+    `expandEnabled:true must register memory_expand (got: ${expandRegistrations.join(", ")})`,
+  );
+  assert.ok(expandRegistrations.includes("tool:memory_search"), "enabling expansion must not drop memory_search");
+  expandShutdownHandler = expandHandlers.get("session_shutdown");
+
   console.log(`e2e ok: ${registrations.join(", ")}; node:sqlite store opened`);
+  console.log(`e2e ok: expandEnabled -> ${expandRegistrations.join(", ")}`);
 } finally {
+  if (expandShutdownHandler && ctx) {
+    try {
+      await expandShutdownHandler({}, ctx);
+    } catch {
+      // best-effort close before removing the temporary home
+    }
+  }
   if (shutdownHandler && ctx) {
     try {
       await shutdownHandler({}, ctx);

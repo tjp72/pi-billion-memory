@@ -42,7 +42,7 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
 - **白名单优先**：扫描范围只来自白名单文件中的 root/pattern，不会全局发现所有
   session 或消息文件，因此即使 session 很多，扫描成本也可控。
 - **只处理压缩块**：pi 适配器读取 `<session>.jsonl.acp.json`；opencode 适配器
-  读取 `ses_*.json` state 文件。原始对话消息永远不会被解析。
+  读取 `ses_*.json` state 文件。**入库时**不解析原始对话消息。
 - **增量且持久**：每个源文件用 `mtime + size` 水位线记录进度；
   `UNIQUE(source_file, block_id)` + `INSERT OR IGNORE` 去重；`prune()` 会写
   tombstone，后续 rescan 不会复活已删除的块。
@@ -51,6 +51,9 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
   不调用 LLM 翻译或生成关键词。
 - **惰性项目解析**：只有在 sidecar 需要（重新）入库时才读取 pi session 文件的
   **第一行**（`cwd` 等 header 元数据）；未变化的库不会产生 header 读取。
+- **可选块展开**：开启 `expandEnabled` 后，`memory_expand` 可按需把某个块记录的
+  消息指针还原成原始 session 消息。两段式（先看清单，再显式选段）、有硬上限、
+  走与入库相同的过滤，并且**不写回本地库**。
 - **不 hook context**：扩展只负责索引和搜索压缩摘要，不参与 pi 的上下文压缩。
 
 ## 环境要求
@@ -150,8 +153,10 @@ opencode-acp ses_*.json ────────┘                             
 ## 数据与隐私
 
 - **无网络**：扩展不发起网络请求，没有遥测。
-- **不读原始消息**：只入库压缩块/sidecar；需要解析项目名时，只读 pi session
-  文件第一行的 header（`cwd`、`id`、`timestamp`、`type`、`version`）。
+- **入库时不读原始消息**：只入库压缩块/sidecar；需要解析项目名时，只读 pi
+  session 文件第一行的 header（`cwd`、`id`、`timestamp`、`type`、`version`）。
+  只有在显式开启 `expandEnabled` 并调用 `memory_expand` 时，才会读取“被某个块
+  指向的那些具体消息”。
 - **敏感信息与网址过滤**：入库前扫描块的 `topic`/`summary`，命中常见凭据（密码、API key、
   token、私钥、JWT、Authorization 头、Cookie、中文标签等）时替换为 `[REDACTED]`，命中网址
   时替换为 `[REDACTED_URL]`，并在日志里记录命中数量（不记录值本身）。这是尽力而为的
@@ -173,7 +178,11 @@ opencode-acp ses_*.json ────────┘                             
   "maxSummaryChars": 20000,
   "debug": false,
   "excludeDirs": [],
-  "scanOnStartup": true
+  "scanOnStartup": true,
+  "expandEnabled": false,
+  "expandMaxChars": 40000,
+  "expandMaxMessages": 200,
+  "expandMaxReadBytes": 33554432
 }
 ```
 
@@ -185,7 +194,13 @@ opencode-acp ses_*.json ────────┘                             
 - `debug`：详细日志；
 - `excludeDirs`：在 pi-sidecar 源 root 内要跳过的目录名；
 - `scanOnStartup`：启动时是否后台全量扫描。关闭后，当前 session 仍会强制扫描
-  一次，其他源由后续扫描逐步发现。
+  一次，其他源由后续扫描逐步发现；
+- `expandEnabled`：是否注册可选的 `memory_expand` 工具（默认 `false`），
+  详见下文“展开块”；
+- `expandMaxChars`：单次 `memory_expand` 返回字符数硬上限（默认 40000）；
+- `expandMaxMessages`：单次 `memory_expand` 渲染消息数硬上限（默认 200）；
+- `expandMaxReadBytes`：单次 `memory_expand` 读取 session 文件的字节数硬上限
+  （默认 33554432，即 32 MB）。
 
 ## 白名单源
 
@@ -223,6 +238,42 @@ opencode-acp ses_*.json ────────┘                             
 - **长短混合查询**对长 token 用 FTS、短 token 用 `LIKE`，并保持 AND 语义；
 - 纯 `LIKE` 查询不会 join FTS 表，而是用 `idx_blocks_created` 排序；
 - schema 是普通 JSON，不依赖 `typebox` 或其他运行时依赖。
+
+## 展开块（可选）
+
+`memory_search` 返回的是摘要。当确切的原始措辞重要时，可以开启一个可选工具，
+把块里记录的消息指针还原成它当初压缩掉的 session 消息：
+
+```json
+{
+  "expandEnabled": true
+}
+```
+
+写入 `~/.pi/pi-billion-memory.json` 后重启 pi（或 `/reload`）。只有开启时才会
+注册 `memory_expand` 工具。
+
+展开被**故意设计成两段式**，避免还原文本把压缩刚省下的上下文又悄悄花掉：
+
+```text
+memory_expand({ block: "b1" })
+  -> 只返回清单：每条被压缩消息的序号、role、大小、ref，不含任何正文
+memory_expand({ block: "b1", mode: "full", select: [1, 2] })
+  -> 只渲染第 1、2 条
+```
+
+- `block` 来自 `memory_search` 的结果。同一个块 id 可能存在于多个 session，
+  结果不唯一时用 `source`（`Source:` 标签的子串，如 session 文件名或项目名）消歧；
+- `limit` 和 `chars` 限制单次调用；它们还会被 `expandMaxMessages` /
+  `expandMaxChars` 二次压制；
+- 只有 pi 源（`*.jsonl.acp.json`）可展开；opencode-acp state 文件不暴露消息引用；
+- 引用带 `#call_...` 后缀时，只渲染那一次工具调用，不含它所在的 assistant 消息；
+- 引用的消息已不存在（session 文件被删除或截断）时，报告为缺失，而不是让调用失败；
+- 展开出的文本会走与入库相同的敏感信息/网址过滤，且不会写回本地库。
+
+0.5.0 之前入库的块没有记录指针。升级后会重置一次水位线账本，使下一次扫描重新
+读取已有 sidecar 并补全指针，且不会重复插入块：`INSERT OR IGNORE` 仍然保护已存的
+摘要正文，tombstone 仍然阻止复活。想立即触发补全可执行 `/memory rescan`。
 
 ## 规模与清理
 
@@ -269,9 +320,10 @@ npm run verify:dist  # 构建并检查已提交的 dist/ 是否过期
 ## 已知限制
 
 - 记忆内容是 ACP 压缩摘要，不是原始消息；未实现语义（embedding）搜索，
-  trigram 是字面子串匹配。
-- 如果上游重写了某个块，已入库的行不会更新（`INSERT OR IGNORE`）；
-  `/memory rescan` 只会添加新块。
+  trigram 是字面子串匹配。`memory_expand` 只能还原 pi 源、且只能还原记录了消息
+  指针的块。
+- 如果上游重写了某个块，已入库的**摘要正文**不会更新（`INSERT OR IGNORE`），
+  只有消息指针会被刷新；`/memory rescan` 会补上新的块。
 - 上游压缩格式是内部实现，可能变化。适配器会跳过格式错误/写到一半的文件并
   在下次扫描重试，但格式变化仍可能需要更新适配器。
 - 多层级块**故意不去重**：tier-2/3 父块和 tier-1 子块可能同时命中。

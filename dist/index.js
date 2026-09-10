@@ -4,6 +4,221 @@ import * as path from 'path';
 
 // pi-billion-memory - MIT License
 
+
+// src/expand.ts
+var CALL_SEPARATOR = "#";
+function splitMessageId(raw) {
+  const s = typeof raw === "string" ? raw : String(raw ?? "");
+  const at = s.indexOf(CALL_SEPARATOR);
+  if (at <= 0) return { base: s, callId: null };
+  const callId = s.slice(at + CALL_SEPARATOR.length);
+  return { base: s.slice(0, at), callId: callId || null };
+}
+function parseMsgIds(json) {
+  if (typeof json !== "string" || !json.trim()) return [];
+  let value;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const item of value) {
+    if (typeof item !== "string") continue;
+    const id = item.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+function stringifyArgs(args) {
+  if (args == null) return "";
+  try {
+    const s = JSON.stringify(args);
+    return s === void 0 ? String(args) : s;
+  } catch {
+    return "[unserializable arguments]";
+  }
+}
+function renderContentItem(item, callId) {
+  if (!item || typeof item !== "object") return null;
+  const it = item;
+  const type = it.type;
+  if (type === "text") {
+    if (callId) return null;
+    return { callId: null, kind: "text", text: typeof it.text === "string" ? it.text : String(it.text ?? "") };
+  }
+  if (type === "thinking") {
+    if (callId) return null;
+    const text = typeof it.thinking === "string" ? it.thinking : String(it.thinking ?? "");
+    return { callId: null, kind: "thinking", text };
+  }
+  if (type === "toolCall") {
+    const id = typeof it.id === "string" && it.id ? it.id : null;
+    if (callId && id !== callId) return null;
+    const name = typeof it.name === "string" && it.name ? it.name : "tool";
+    return { callId: id, kind: "toolCall", text: `${name}(${stringifyArgs(it.arguments)})` };
+  }
+  if (callId) return null;
+  return null;
+}
+function renderMessage(line, callId) {
+  if (!line || typeof line !== "object") return null;
+  const message = line.message;
+  if (!message || typeof message !== "object") return null;
+  const role = typeof message.role === "string" && message.role ? message.role : "unknown";
+  const content = message.content;
+  const items = [];
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      const rendered = renderContentItem(item, callId);
+      if (rendered) items.push(rendered);
+    }
+  } else if (typeof content === "string") {
+    if (!callId) items.push({ callId: null, kind: "text", text: content });
+  }
+  if (items.length === 0) return null;
+  return { role, items };
+}
+async function readSessionMessages(sessionFile, maxReadBytes, readFile = (file) => readWholeFile(file)) {
+  const messages = /* @__PURE__ */ new Map();
+  const buffer = await readFile(sessionFile);
+  const totalBytes = buffer.length;
+  const cap = Math.max(0, Math.floor(maxReadBytes));
+  const truncated = totalBytes > cap;
+  const slice = truncated ? buffer.subarray(0, cap) : buffer;
+  const text = slice.toString("utf8");
+  const parts = text.split("\n");
+  if (truncated) parts.pop();
+  for (const part of parts) {
+    const raw = part.trim();
+    if (!raw) continue;
+    let line;
+    try {
+      line = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    if (!line || typeof line !== "object") continue;
+    if (line.type !== "message") continue;
+    if (typeof line.id !== "string" || !line.id) continue;
+    messages.set(line.id, line);
+  }
+  return { messages, bytesRead: slice.length, totalBytes, truncated };
+}
+async function readWholeFile(file) {
+  const { promises: fsp } = await import('fs');
+  return fsp.readFile(file);
+}
+function renderEntry(rendered) {
+  const parts = [];
+  for (const item of rendered.items) {
+    const label = item.kind === "thinking" ? "thinking" : item.kind === "toolCall" ? `tool call${item.callId ? ` ${item.callId}` : ""}` : item.kind;
+    parts.push(item.kind === "text" ? item.text : `-- ${label} --
+${item.text}`);
+  }
+  return parts.join("\n");
+}
+async function expandBlock(opts) {
+  const select = Array.isArray(opts.select) ? opts.select.filter((n) => Number.isInteger(n) && n > 0) : null;
+  const read = await readSessionMessages(opts.sessionFile, opts.maxReadBytes, opts.readFile);
+  const entries = [];
+  const renderedByIndex = /* @__PURE__ */ new Map();
+  let availableChars = 0;
+  let index = 0;
+  for (const ref of opts.msgIds) {
+    index++;
+    const { base: base2, callId } = splitMessageId(ref);
+    const line = read.messages.get(base2);
+    const rendered = line ? renderMessage(line, callId) : null;
+    const body = rendered ? renderEntry(rendered) : "";
+    if (rendered) {
+      renderedByIndex.set(index, rendered);
+      availableChars += body.length;
+    }
+    entries.push({
+      index,
+      ref,
+      messageId: base2,
+      callId,
+      role: rendered ? rendered.role : null,
+      chars: body.length,
+      found: Boolean(rendered)
+    });
+  }
+  const base = {
+    entries,
+    text: null,
+    truncated: false,
+    availableChars,
+    returnedChars: 0,
+    skippedMessages: 0,
+    readTruncated: read.truncated,
+    bytesRead: read.bytesRead,
+    totalBytes: read.totalBytes
+  };
+  if (opts.mode === "list") return { ...base, text: null };
+  const wanted = select && select.length > 0 ? new Set(select) : null;
+  let requestedCount = 0;
+  for (const entry of entries) {
+    if (wanted && !wanted.has(entry.index)) continue;
+    if (entry.found) requestedCount++;
+  }
+  const maxChars = Math.max(0, Math.floor(opts.maxChars));
+  const maxMessages = Math.max(1, Math.floor(opts.maxMessages));
+  const chunks = [];
+  let used = 0;
+  let returned = 0;
+  let skipped = 0;
+  for (const entry of entries) {
+    if (wanted && !wanted.has(entry.index)) continue;
+    if (!entry.found) continue;
+    if (returned >= maxMessages) {
+      skipped++;
+      continue;
+    }
+    const rendered = renderedByIndex.get(entry.index);
+    if (!rendered) continue;
+    let body = renderEntry(rendered);
+    if (opts.redact) body = opts.redact(body).text;
+    const header = `### [${entry.index}] ${entry.role ?? "unknown"}${entry.callId ? ` \xB7 ${entry.callId}` : ""} \xB7 ${body.length} chars
+`;
+    const block = `${header}${body}`;
+    const cost = block.length + (chunks.length ? 2 : 0);
+    if (used + cost > maxChars && returned > 0) {
+      skipped++;
+      continue;
+    }
+    if (used + cost > maxChars && returned === 0) {
+      const room = Math.max(0, maxChars - header.length);
+      chunks.push(`${header}${body.slice(0, room)}
+[entry truncated at ${maxChars} chars]`);
+      used += header.length + room;
+      returned++;
+      base.truncated = true;
+      continue;
+    }
+    chunks.push(block);
+    used += cost;
+    returned++;
+  }
+  if (returned === 0) {
+    base.text = "";
+    base.truncated = skipped > 0;
+    base.skippedMessages = skipped;
+    return base;
+  }
+  base.text = chunks.join("\n\n");
+  base.returnedChars = used;
+  base.skippedMessages = skipped;
+  base.truncated = skipped > 0 || returned < requestedCount;
+  return base;
+}
+
+// src/extension.ts
 var HOME = os.homedir();
 var PI_DIR = path.join(HOME, ".pi");
 var CFG_PATH = path.join(PI_DIR, "pi-billion-memory.json");
@@ -21,10 +236,24 @@ var DEFAULT_CFG = {
   /** JSONL allow-list of compression source roots (one JSON object per line) */
   sourcesPath: path.join(PI_DIR, "pi-billion-memory.sources.jsonl"),
   /** Log file (overridable so tests never write to the real ~/.pi log) */
-  logPath: path.join(PI_DIR, "pi-billion-memory.log")
+  logPath: path.join(PI_DIR, "pi-billion-memory.log"),
+  /**
+   * Register the `memory_expand` tool, which resolves a stored block back to the original
+   * session messages it absorbed. Off by default: expansion re-reads raw conversation lines,
+   * which the ingestion path deliberately never touches, so it must be enabled on purpose.
+   */
+  expandEnabled: false,
+  /** Hard cap on characters returned by one `memory_expand` call. */
+  expandMaxChars: 4e4,
+  /** Hard cap on messages rendered by one `memory_expand` call. */
+  expandMaxMessages: 200,
+  /** Hard cap on bytes read from a session file by one `memory_expand` call. */
+  expandMaxReadBytes: 32 * 1024 * 1024
 };
 var MAX_TOPIC_CHARS = 200;
 var PREVIEW_CHARS = 600;
+var MAX_MSG_IDS = 4e3;
+var EXPAND_MANIFEST_MAX = 300;
 var DEFAULT_RESULT_LIMIT = 6;
 var MAX_RESULT_LIMIT = 20;
 var LOG_MAX_BYTES = 1e6;
@@ -43,6 +272,12 @@ function sanitizeCfg(over) {
   if (typeof over.scanOnStartup === "boolean") out.scanOnStartup = over.scanOnStartup;
   if (typeof over.sourcesPath === "string" && over.sourcesPath) out.sourcesPath = over.sourcesPath;
   if (typeof over.logPath === "string" && over.logPath) out.logPath = over.logPath;
+  if (typeof over.expandEnabled === "boolean") out.expandEnabled = over.expandEnabled;
+  if (Number.isInteger(over.expandMaxChars) && over.expandMaxChars > 0) out.expandMaxChars = over.expandMaxChars;
+  if (Number.isInteger(over.expandMaxMessages) && over.expandMaxMessages > 0)
+    out.expandMaxMessages = over.expandMaxMessages;
+  if (Number.isInteger(over.expandMaxReadBytes) && over.expandMaxReadBytes > 0)
+    out.expandMaxReadBytes = over.expandMaxReadBytes;
   return out;
 }
 var cfg = { ...DEFAULT_CFG };
@@ -278,6 +513,21 @@ async function listSourceFiles(source) {
 function cleanOpencodeSummary(summary) {
   return String(summary).replace(/\s*<dcp-message-id>.*?<\/dcp-message-id>\s*$/s, "").trim();
 }
+function collectMsgIds(block) {
+  const raw = block?.effectiveMessageIds ?? block?.messageIds;
+  if (!Array.isArray(raw)) return null;
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const id = item.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+    if (out.length >= MAX_MSG_IDS) break;
+  }
+  return out.length ? out : null;
+}
 function normalizePiBlocks(data) {
   if (!data || typeof data !== "object" || !Array.isArray(data.blocks)) return null;
   const out = [];
@@ -290,6 +540,7 @@ function normalizePiBlocks(data) {
       tier: Number.isInteger(b.tier) ? b.tier : null,
       topic: typeof b.topic === "string" && b.topic ? b.topic.slice(0, MAX_TOPIC_CHARS) : null,
       summary: b.summary,
+      msgIds: collectMsgIds(b),
       refStart: typeof b.startRef === "string" ? b.startRef : null,
       refEnd: typeof b.endRef === "string" ? b.endRef : null,
       compressedTokens: Number.isInteger(b.compressedTokens) ? b.compressedTokens : null,
@@ -314,6 +565,7 @@ function normalizeOpencodeBlocks(data) {
         MAX_TOPIC_CHARS
       ) || null,
       summary: cleanOpencodeSummary(b.summary),
+      msgIds: collectMsgIds(b),
       refStart: typeof b.startId === "string" ? b.startId : null,
       refEnd: typeof b.endId === "string" ? b.endId : null,
       compressedTokens: Number.isInteger(b.compressedTokens) ? b.compressedTokens : null,
@@ -370,6 +622,7 @@ var MemoryDb = class {
         ref_end           TEXT,
         compressed_tokens INTEGER,
         created_at        INTEGER,            -- block.createdAt / block.createdAt (ms)
+        msg_ids           TEXT,               -- JSON array of raw message ids (NULL = not expandable)
         UNIQUE(source_file, block_id)
       );
       CREATE INDEX IF NOT EXISTS idx_blocks_source ON blocks(source_file);
@@ -394,6 +647,12 @@ var MemoryDb = class {
         tokenize='trigram'
       );
     `);
+    const blockCols = this.db.prepare("PRAGMA table_info(blocks)").all();
+    if (!blockCols.some((c) => c.name === "msg_ids")) {
+      this.db.exec("ALTER TABLE blocks ADD COLUMN msg_ids TEXT;");
+      this.db.exec("UPDATE source_watermarks SET last_mtime_ms = 0, last_size = 0;");
+      logLine("migrated blocks.msg_ids; watermark ledger reset once for pointer backfill");
+    }
     this.db.exec(`
       INSERT OR IGNORE INTO source_watermarks(source_file, last_mtime_ms, last_size, updated_at)
       SELECT source_file, last_mtime_ms, last_size, updated_at
@@ -519,6 +778,7 @@ var MemoryDb = class {
     }
     const now = Date.now();
     let inserted = 0;
+    let refreshed = 0;
     let redactedHits = 0;
     this.db.exec("BEGIN");
     try {
@@ -543,9 +803,13 @@ var MemoryDb = class {
       ).run(sourceFile, mtimeMs, size, now);
       const ins = this.db.prepare(
         `INSERT OR IGNORE INTO blocks
-           (source_file, kind, block_id, run_id, tier, topic, summary, ref_start, ref_end, compressed_tokens, created_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           (source_file, kind, block_id, run_id, tier, topic, summary, ref_start, ref_end, compressed_tokens, created_at, msg_ids)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE NOT EXISTS (SELECT 1 FROM block_tombstones WHERE source_file = ? AND block_id = ?)`
+      );
+      const updMsgIds = this.db.prepare(
+        `UPDATE blocks SET msg_ids = ?
+          WHERE source_file = ? AND block_id = ? AND (msg_ids IS NULL OR msg_ids <> ?)`
       );
       for (const b of blocks) {
         if (!b || typeof b.summary !== "string") continue;
@@ -554,6 +818,7 @@ var MemoryDb = class {
         redactedHits += redactedSummary.hits + redactedTopic.hits;
         const summary = redactedSummary.text.length > cfg.maxSummaryChars ? redactedSummary.text.slice(0, cfg.maxSummaryChars) : redactedSummary.text;
         if (!summary.trim()) continue;
+        const msgIdsJson = Array.isArray(b.msgIds) && b.msgIds.length ? JSON.stringify(b.msgIds) : null;
         const r = ins.run(
           sourceFile,
           kind,
@@ -566,10 +831,12 @@ var MemoryDb = class {
           b.refEnd,
           b.compressedTokens,
           b.createdAt,
+          msgIdsJson,
           sourceFile,
           b.blockId
         );
         if (r.changes > 0) inserted++;
+        else if (msgIdsJson && updMsgIds.run(msgIdsJson, sourceFile, b.blockId, msgIdsJson).changes > 0) refreshed++;
       }
       this.db.exec("COMMIT");
     } catch (e) {
@@ -583,7 +850,36 @@ var MemoryDb = class {
       logLine(`redacted ${redactedHits} potential secret(s) before storing ${path.basename(sourceFile)}`);
     }
     log(`ingest ${path.basename(sourceFile)} kind=${kind} project=${project} blocks=${blocks.length} new=${inserted}`);
-    return { ok: true, parsed: true, total: blocks.length, inserted, redacted: redactedHits, mtimeMs, size };
+    return { ok: true, parsed: true, total: blocks.length, inserted, refreshed, redacted: redactedHits, mtimeMs, size };
+  }
+  /**
+   * Look up stored blocks for `memory_expand`.
+   * @param {string} blockId block id as shown by memory_search (e.g. "b1")
+   * @param {string|null} source optional substring match on the source file name or project
+   * @param {number} limit max candidate rows returned for disambiguation
+   * @returns {Array<object>} camelCase rows, newest first
+   */
+  findBlocks(blockId, source = null, limit = 10) {
+    this.open();
+    const params = [String(blockId)];
+    let where = "b.block_id = ?";
+    if (source) {
+      where += " AND (b.source_file LIKE ? ESCAPE '\\' OR s.project LIKE ? ESCAPE '\\')";
+      const like = `%${String(source).replace(/[\\%_]/g, (m) => "\\" + m)}%`;
+      params.push(like, like);
+    }
+    params.push(Math.max(1, Math.min(50, limit)));
+    return this.db.prepare(
+      `SELECT b.id, b.source_file AS sourceFile, b.kind AS kind,
+                b.block_id AS blockId, b.tier, b.topic, b.summary,
+                b.ref_start AS refStart, b.ref_end AS refEnd,
+                b.compressed_tokens AS tokens, b.created_at AS createdAt,
+                b.msg_ids AS msgIds, s.project, s.cwd
+           FROM blocks b LEFT JOIN sources s ON s.source_file = b.source_file
+          WHERE ${where}
+          ORDER BY b.created_at DESC, b.id DESC
+          LIMIT ?`
+    ).all(...params);
   }
   /**
    * Build the search SQL shared by search()/explainSearch().
@@ -940,6 +1236,42 @@ ${topic}${summary}`;
   });
   return head + parts.join("\n\n---\n\n");
 }
+function formatExpansion(row, sessionFile, res, mode) {
+  const lines = [
+    `Block ${row.blockId}${row.tier != null ? ` (tier ${row.tier})` : ""} \xB7 project ${row.project || "unknown"}${row.createdAt ? ` \xB7 ${fmtTs(row.createdAt)}` : ""} \xB7 ${res.entries.length} message ref(s) \xB7 ${fmtTokens(row.tokens) || "?"} tok compressed`,
+    `Source: ${sourceLabel(row)}`,
+    `Session: ${sessionFile}`
+  ];
+  const kb = (n) => `${Math.round(n / 1024)} KB`;
+  lines.push(
+    res.readTruncated ? `Read: ${kb(res.bytesRead)} of ${kb(res.totalBytes)} (read cap hit; later messages may be missing)` : `Read: ${kb(res.totalBytes)} (complete)`
+  );
+  const missing = res.entries.filter((e) => !e.found).length;
+  if (missing > 0) lines.push(`Missing: ${missing} referenced message(s) not present in the session file`);
+  lines.push("");
+  if (mode === "list") {
+    const shown = res.entries.slice(0, EXPAND_MANIFEST_MAX);
+    for (const e of shown) {
+      const role = (e.found ? e.role || "?" : "missing").padEnd(11);
+      const size = e.found ? `${String(e.chars).padStart(6)} chars` : "          ";
+      lines.push(`${String(e.index).padStart(4)}  ${role} ${size}  ${e.ref}`);
+    }
+    if (res.entries.length > shown.length) lines.push(`       ... and ${res.entries.length - shown.length} more`);
+    lines.push("");
+    lines.push(
+      `Text: ${res.availableChars} chars available. Read a selection with memory_expand({ block: "${row.blockId}", mode: "full", select: [1, 2, 3] }).`
+    );
+  } else {
+    lines.push(res.text || "(no text selected)");
+    if (res.truncated) {
+      lines.push("");
+      lines.push(
+        `[truncated: ${res.returnedChars} of ${res.availableChars} chars returned; ${res.skippedMessages} message(s) skipped \u2014 narrow 'select' or raise expandMaxChars]`
+      );
+    }
+  }
+  return lines.join("\n");
+}
 var MEMORY_SEARCH_PARAMETERS = {
   type: "object",
   properties: {
@@ -958,6 +1290,42 @@ var MEMORY_SEARCH_PARAMETERS = {
   },
   required: ["query"]
 };
+var MEMORY_EXPAND_PARAMETERS = {
+  type: "object",
+  properties: {
+    block: {
+      type: "string",
+      description: "Block id taken from a memory_search result, e.g. 'b1'"
+    },
+    source: {
+      type: "string",
+      description: "Optional disambiguator when the same block id exists in several sessions: a substring of the memory_search 'Source:' label (session file name or project)"
+    },
+    mode: {
+      type: "string",
+      enum: ["list", "full"],
+      description: "'list' (default) returns a manifest of the absorbed messages with no conversation text; 'full' renders the selected text"
+    },
+    select: {
+      type: "array",
+      items: { type: "number" },
+      description: "1-based message indices from a 'list' result to render; omit to render all (still bounded)"
+    },
+    limit: { type: "number", description: "Max messages to render, default from expandMaxMessages" },
+    chars: { type: "number", description: "Max characters to return, default from expandMaxChars" }
+  },
+  required: ["block"]
+};
+function readMemoryExpandParams(raw) {
+  const value = raw && typeof raw === "object" ? raw : {};
+  const block = typeof value.block === "string" ? value.block.trim() : "";
+  const source = typeof value.source === "string" && value.source.trim() ? value.source.trim() : null;
+  const mode = value.mode === "full" ? "full" : "list";
+  const select = Array.isArray(value.select) ? value.select.filter((n) => typeof n === "number" && Number.isInteger(n) && n > 0) : null;
+  const limit = typeof value.limit === "number" && Number.isInteger(value.limit) && value.limit > 0 ? value.limit : null;
+  const chars = typeof value.chars === "number" && Number.isInteger(value.chars) && value.chars > 0 ? value.chars : null;
+  return { block, source, mode, select, limit, chars };
+}
 function readMemorySearchParams(raw) {
   const value = raw && typeof raw === "object" ? raw : {};
   const query = typeof value.query === "string" ? value.query : "";
@@ -1057,6 +1425,118 @@ async function factory(pi) {
       }
     }
   });
+  if (cfg.expandEnabled) {
+    pi.registerTool({
+      name: "memory_expand",
+      label: "Memory Expand",
+      description: "Recover the original session messages absorbed by one stored compression block \u2014 the inverse of memory_search. Only registered when expandEnabled is true in ~/.pi/pi-billion-memory.json. Default mode 'list' returns just a manifest (ref, role, size); call again with mode 'full' and an explicit 'select' to read text. Expansion is deliberately two-step and bounded, because it spends the context that compression saved. Returned text passes through the same secret redaction as ingestion, and nothing is written to the store.",
+      promptSnippet: "Expand one memory block back to its original messages (opt-in; list before full)",
+      promptGuidelines: [
+        "Use mode 'list' first: it is cheap and shows which messages a block absorbed, with role and size.",
+        "Request mode 'full' with a narrow 'select' only when the exact original wording matters.",
+        "memory_expand reads raw conversation lines from the session file; it only resolves references already recorded in a stored block."
+      ],
+      parameters: MEMORY_EXPAND_PARAMETERS,
+      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+        try {
+          const p = readMemoryExpandParams(params);
+          if (!p.block) {
+            return {
+              content: [{ type: "text", text: `memory_expand: 'block' is required (e.g. block: "b1").` }],
+              details: { mode: "error", hits: 0 }
+            };
+          }
+          const rows = getDb().findBlocks(p.block, p.source);
+          if (rows.length === 0) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `memory_expand: no stored block '${p.block}'${p.source ? ` matching source '${p.source}'` : ""}. Run memory_search first and pass the block id from a result.`
+                }
+              ],
+              details: { mode: "missing", hits: 0 }
+            };
+          }
+          if (rows.length > 1) {
+            const list = rows.map(
+              (r) => `- ${r.blockId} \xB7 project ${r.project || "?"} \xB7 ${fmtTs(r.createdAt) || "time unknown"} \xB7 ${path.basename(r.sourceFile)}`
+            ).join("\n");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `memory_expand: ${rows.length} blocks share the id '${p.block}'. Add 'source' to pick one:
+${list}`
+                }
+              ],
+              details: { mode: "ambiguous", hits: rows.length }
+            };
+          }
+          const row = rows[0];
+          if (!String(row.sourceFile).endsWith(".acp.json")) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `memory_expand: block ${row.blockId} comes from ${sourceLabel(row)}, not a pi ACP sidecar. Expansion is currently supported only for pi sidecars.`
+                }
+              ],
+              details: { mode: "unsupported", hits: 1 }
+            };
+          }
+          const msgIds = parseMsgIds(row.msgIds);
+          if (msgIds.length === 0) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `memory_expand: block ${row.blockId} has no recorded message references, so it cannot be expanded. This happens for rows ingested before 0.5.0. Run /memory rescan to backfill the pointers from the sidecar.`
+                }
+              ],
+              details: { mode: "no-refs", hits: 1 }
+            };
+          }
+          const sessionFile = row.sourceFile.slice(0, -".acp.json".length);
+          const res = await expandBlock({
+            sessionFile,
+            msgIds,
+            mode: p.mode,
+            select: p.select,
+            maxChars: Math.min(cfg.expandMaxChars, p.chars ?? cfg.expandMaxChars),
+            maxMessages: Math.min(cfg.expandMaxMessages, p.limit ?? cfg.expandMaxMessages),
+            maxReadBytes: cfg.expandMaxReadBytes,
+            redact: redactSecrets
+          });
+          log(
+            `expand ${row.blockId} mode=${p.mode} refs=${msgIds.length} found=${res.entries.filter((e) => e.found).length} returned=${res.returnedChars}`
+          );
+          return {
+            content: [{ type: "text", text: formatExpansion(row, sessionFile, res, p.mode) }],
+            details: {
+              mode: p.mode,
+              block: row.blockId,
+              refs: msgIds.length,
+              found: res.entries.filter((e) => e.found).length,
+              chars: res.returnedChars,
+              truncated: res.truncated
+            }
+          };
+        } catch (e) {
+          logLine(`memory_expand error: ${e.stack || e.message}`);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `memory_expand failed: ${e.message} (see ${cfg.logPath || DEFAULT_CFG.logPath})`
+              }
+            ],
+            details: { mode: "error", hits: 0 }
+          };
+        }
+      }
+    });
+  }
   pi.registerCommand("memory", {
     description: "pi-billion-memory: /memory (status), rescan (force rescan), sources (show allow-list), prune <days> (delete blocks older than N days)",
     handler: async (args, ctx) => {

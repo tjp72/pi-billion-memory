@@ -84,6 +84,14 @@ Coverage that must be preserved and extended, never removed:
   bare `www.` hosts, database URLs, trailing punctuation, and incomplete `https://` text) and
   end-to-end ingestion where the stored summary/topic contains `[REDACTED]`/`[REDACTED_URL]`,
   the original secret/URL is not searchable, and surrounding benign text is still searchable;
+- **block expansion (opt-in)**: `msg_ids` pointers stored at ingestion from pi
+  `effectiveMessageIds` / opencode `messageIds` (including `#call_...` selectors, duplicates,
+  dangling refs, and malformed pointer payloads); `list` mode returns a manifest with no
+  conversation text; `full` mode renders only an explicit `select`, and a narrow selection is
+  **not** reported as truncation; `maxChars`/`maxMessages` caps and the injected redactor are
+  honored; missing session files and byte-capped reads degrade instead of throwing; pointer
+  backfill refreshes existing rows without re-inserting them; the 0.4.x -> 0.5.0 migration adds
+  `msg_ids` and resets the watermark ledger exactly once;
 
 Fixture conventions: sessions live under encoded-dir names like `--home-dev-ProjA--` with a
 matching neutral cwd (`/home/dev/ProjA` -> project `ProjA`). Keep it that way — no real paths.
@@ -91,7 +99,9 @@ matching neutral cwd (`/home/dev/ProjA` -> project `ProjA`). Keep it that way �
 Additional gates:
 
 - `npm run e2e` loads the built `dist/index.js`, asserts the default export is a function,
-  checks that the factory registers the three session events, `memory_search`, and `/memory`, and
+  checks that the factory registers the three session events, `memory_search`, and `/memory` —
+  and that it does **not** register `memory_expand` under the default config — then re-imports the
+  bundle with `expandEnabled: true` to prove the expansion tool appears only when opted in, and
   opens the SQLite store through `node:sqlite` in an isolated temporary home.
 - `npm run verify:dist` rebuilds and fails if the committed `dist/` differs from a fresh build.
   `dist/` is committed because pi's git installer runs `npm install --omit=dev` and never runs a
@@ -107,9 +117,10 @@ The design is deliberately minimal; preserve these properties:
   `oxlint`, `prettier`, `@types/node` in `devDependencies`) are fine — they never ship in the
   runtime path.
 - **Module layout**: `src/index.ts` is the pi entry (default export only); `src/extension.ts`
-  contains the factory and wiring; `src/internals.ts` is a test-only re-export module that is
-  excluded from `tsconfig.build.json` and is never bundled. The pi entry must stay free of test
-  hooks. `tests/` holds self-tests, `scripts/e2e/` holds the dist smoke test.
+  contains the factory and wiring; `src/expand.ts` holds the opt-in block-expansion reader and is
+  the **only** module allowed to read session message lines; `src/internals.ts` is a test-only
+  re-export module that is excluded from `tsconfig.build.json` and is never bundled. The pi entry
+  must stay free of test hooks. `tests/` holds self-tests, `scripts/e2e/` holds the dist smoke test.
 - **Build output is committed**: `npm run build` bundles `src/index.ts` to `dist/index.js` with
   tsup and emits declarations with `tsc -p tsconfig.build.json`. `dist/` is committed so
   `pi install git:...` works without a build step. Never rely on `prepare`/`postinstall` for
@@ -122,8 +133,11 @@ The design is deliberately minimal; preserve these properties:
   is absent). Never globally discover every session/message file. Raw conversation content is
   never parsed: for an allow-listed pi source the extension may read the session file's **first
   line only** (header metadata: `cwd,id,timestamp,type,version`) to resolve the working
-  directory; message lines are never read. Raw message databases are never parsed; `opencode.db`
-  is opened read-only/`query_only` only to map session IDs to working directories.
+  directory; message lines are never read during ingestion. Raw message databases are never
+  parsed; `opencode.db` is opened read-only/`query_only` only to map session IDs to working
+  directories. The single exception is opt-in expansion: when `expandEnabled` is true and
+  `memory_expand` is called, `src/expand.ts` may read the specific message lines a stored block
+  references — never a scan, never a cache, never a write.
 - **Secret redaction before storage**: `redactSecrets()` runs on every normalized block's
   `topic` and `summary` inside `ingestSourceFile()` before the `blocks` insert; it is not
   optional. Log a hit count (never the secret) and continue ingesting the redacted block.
@@ -137,6 +151,15 @@ The design is deliberately minimal; preserve these properties:
   does not advance it); `UNIQUE(source_file, block_id)` + `INSERT OR IGNORE` for dedup; summaries
   truncated to `maxSummaryChars`. `prune()` writes a `block_tombstones` row per deleted block, and
   ingestion skips tombstoned `(source_file, block_id)` pairs.
+- **Expansion is opt-in, two-step, and read-only**: `memory_expand` is registered only when
+  `expandEnabled` is true (default false). `list` mode returns a manifest with no conversation
+  text; `full` mode renders only an explicit selection, bounded by `expandMaxChars`,
+  `expandMaxMessages`, and `expandMaxReadBytes`. Expanded text passes through `redactSecrets()`,
+  and nothing is written to the store. `blocks.msg_ids` is populated from the sidecar at
+  ingestion — ingestion itself must never read message lines. The 0.5.0 migration adds the column
+  and resets the watermark ledger **once** to backfill pointers; `INSERT OR IGNORE` must keep
+  protecting stored summaries (only `msg_ids` may be refreshed in place, which keeps the
+  external-content FTS table valid) and tombstones must keep blocking resurrection.
 - **Chinese strategy is fixed**: FTS5 trigram for >=3 chars, AND-ed `LIKE` for shorter queries
   (matching `summary OR topic`), and a mixed mode that combines FTS for long tokens with `LIKE`
   for short ones. Pure-LIKE queries must not join `blocks_fts` (so `idx_blocks_created` can
@@ -153,11 +176,16 @@ The design is deliberately minimal; preserve these properties:
   runtime guard. Do not add `typebox` or another runtime schema dependency.
 - Config: `~/.pi/pi-billion-memory.json` merged over `DEFAULT_CFG`; allow-list
   `~/.pi/pi-billion-memory.sources.jsonl`; log `~/.pi/pi-billion-memory.log` (1 MB cap). All under
-  `os.homedir()/.pi` unless overridden by user config — never hardcode paths.
+  `os.homedir()/.pi` unless overridden by user config — never hardcode paths. `expandEnabled`
+  (default `false`), `expandMaxChars`, `expandMaxMessages`, and `expandMaxReadBytes` bound the
+  optional expansion tool.
 
 ## 5. Scope and known boundaries
 
-- The store contains ACP **summaries**, not original messages. Semantic (embedding) search is a
+- The store contains ACP **summaries**, not original messages. `memory_expand` can recover
+  originals for pi sources when explicitly enabled, but only for blocks that recorded pointers and
+  only for the messages a block names; it must never grow into a general session reader or become
+  a search path. Semantic (embedding) search is a
   recognized future enhancement — if added, it must **augment** the trigram/LIKE path (keep it as
   the offline fallback) and come with self-test coverage; it must not add runtime dependencies
   beyond what the extension already requires, nor change search result semantics silently.

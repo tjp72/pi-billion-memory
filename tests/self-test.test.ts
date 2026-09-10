@@ -740,6 +740,313 @@ check("redacted secret is not searchable", sdb.search(fakeMarker).rows.length ==
 check("redacted URL path is not searchable", sdb.search("secretPath").rows.length === 0);
 check("benign text around the redacted secret remains searchable", sdb.search("benignMarker").rows.length > 0);
 
+// --- Optional block expansion: msg_ids pointers + memory_expand internals ---------
+check(
+  "splitMessageId splits a base id from its tool-call selector",
+  JSON.stringify(internals.splitMessageId("4d17483d#call_00_abc")) ===
+    JSON.stringify({ base: "4d17483d", callId: "call_00_abc" }) &&
+    JSON.stringify(internals.splitMessageId("4d17483d")) === JSON.stringify({ base: "4d17483d", callId: null }) &&
+    JSON.stringify(internals.splitMessageId("4d17483d#")) === JSON.stringify({ base: "4d17483d", callId: null }) &&
+    JSON.stringify(internals.splitMessageId("#call_00_abc")) ===
+      JSON.stringify({ base: "#call_00_abc", callId: null }) &&
+    JSON.stringify(internals.splitMessageId(42)) === JSON.stringify({ base: "42", callId: null }),
+);
+check(
+  "parseMsgIds tolerates malformed pointer payloads",
+  JSON.stringify(internals.parseMsgIds('["a","b","a","  "]')) === JSON.stringify(["a", "b"]) &&
+    JSON.stringify(internals.parseMsgIds('["a",7,null]')) === JSON.stringify(["a"]) &&
+    JSON.stringify(internals.parseMsgIds(null)) === "[]" &&
+    JSON.stringify(internals.parseMsgIds("")) === "[]" &&
+    JSON.stringify(internals.parseMsgIds("not json")) === "[]" &&
+    JSON.stringify(internals.parseMsgIds('{"a":1}')) === "[]",
+);
+
+const exRoot = path.join(tmp, "expand-root");
+const exSession = path.join(exRoot, "--home-dev-ExpandProj--", "2024-03-03T00-00-00-000Z_expand.jsonl");
+const exSidecar = `${exSession}.acp.json`;
+fs.mkdirSync(path.dirname(exSession), { recursive: true });
+// A realistic session file: one user message, one assistant message carrying two tool
+// calls, one string-content message, plus non-message lines that must be ignored.
+const exLines = [
+  { type: "session", id: "sess-expand" },
+  {
+    type: "message",
+    id: "aaa11111",
+    message: { role: "user", content: [{ type: "text", text: "expandAlphaMarker the original user wording" }] },
+  },
+  {
+    type: "message",
+    id: "bbb22222",
+    message: {
+      role: "assistant",
+      content: [
+        { type: "text", text: "expandBetaMarker assistant prose" },
+        { type: "toolCall", id: "call_00_one", name: "read", arguments: { path: "src/a.ts" } },
+        { type: "toolCall", id: "call_01_two", name: "grep", arguments: { pattern: "expandGammaMarker" } },
+      ],
+    },
+  },
+  {
+    type: "message",
+    id: "ccc33333",
+    message: { role: "user", content: "expandStringMarker plain string content" },
+  },
+  { type: "model_change", id: "not-a-message" },
+];
+fs.writeFileSync(exSession, `${exLines.map((l) => JSON.stringify(l)).join("\n")}\n`);
+
+// b1 records pointers via effectiveMessageIds (incl. a #call_ selector and a duplicate),
+// b2 exercises the messageIds fallback key, and one pointer is intentionally dangling.
+writeSidecar(exSession, [
+  {
+    blockId: "b1",
+    runId: "r1",
+    tier: 1,
+    topic: "Expand pointers",
+    summary: "expandDeltaMarker block carrying raw message pointers",
+    compressedTokens: 4242,
+    createdAt: T2,
+    startRef: "m00001",
+    endRef: "m00009",
+    effectiveMessageIds: ["aaa11111", "bbb22222", "bbb22222#call_01_two", "ccc33333", "deadbeef", "aaa11111"],
+  },
+  {
+    blockId: "b2",
+    runId: "r1",
+    tier: 1,
+    topic: "Fallback pointers",
+    summary: "expandEpsilonMarker block using the messageIds fallback key",
+    compressedTokens: 99,
+    createdAt: T2 + 1,
+    startRef: "m00010",
+    endRef: "m00011",
+    messageIds: ["aaa11111"],
+  },
+]);
+
+const exDb = new internals.MemoryDb(path.join(exRoot, "expand.db"));
+const exIngest = await exDb.ingestSidecarFile(exSession, "/home/dev/ExpandProj");
+check(
+  "ingest stores pointers and never reads the session text",
+  exIngest.ok && exIngest.parsed && exIngest.inserted === 2 && exIngest.refreshed === 0 && exIngest.redacted === 0,
+);
+const exRow = exDb.findBlocks("b1");
+check(
+  "findBlocks returns the stored pointer list with its metadata",
+  exRow.length === 1 &&
+    internals.parseMsgIds(exRow[0].msgIds).length === 5 &&
+    exRow[0].project === "ExpandProj" &&
+    exRow[0].tokens === 4242 &&
+    exRow[0].sourceFile === exSidecar,
+);
+check("findBlocks reports an unknown block id as empty", exDb.findBlocks("b404").length === 0);
+check(
+  "findBlocks narrows candidates by source substring",
+  exDb.findBlocks("b1", "no-such-source").length === 0 && exDb.findBlocks("b1", "ExpandProj").length === 1,
+);
+check("ingest falls back to the messageIds key", internals.parseMsgIds(exDb.findBlocks("b2")[0].msgIds).length === 1);
+
+const exIds = internals.parseMsgIds(exRow[0].msgIds);
+const exBudget = { maxChars: 40000, maxMessages: 200, maxReadBytes: 32 * 1024 * 1024 };
+
+const exList = await internals.expandBlock({
+  sessionFile: exSession,
+  msgIds: exIds,
+  mode: "list",
+  select: null,
+  ...exBudget,
+  redact: null,
+});
+check(
+  "list mode reports a manifest and returns no conversation text",
+  exList.text === null &&
+    exList.entries.length === 5 &&
+    exList.entries[0].role === "user" &&
+    exList.entries[1].role === "assistant" &&
+    exList.entries[2].callId === "call_01_two" &&
+    exList.entries[4].found === false &&
+    exList.entries[4].chars === 0 &&
+    exList.entries.filter((e) => e.found).length === 4 &&
+    !exList.truncated &&
+    exList.availableChars > 0,
+);
+const exFull = await internals.expandBlock({
+  sessionFile: exSession,
+  msgIds: exIds,
+  mode: "full",
+  select: [1],
+  ...exBudget,
+  redact: null,
+});
+check(
+  "full mode renders only the selected reference",
+  exFull.text.includes("expandAlphaMarker") &&
+    !exFull.text.includes("expandBetaMarker") &&
+    exFull.returnedChars > 0 &&
+    !exFull.truncated,
+);
+check(
+  "a narrow explicit selection is not reported as truncation",
+  !exFull.truncated && exFull.skippedMessages === 0 && exFull.availableChars > exFull.returnedChars,
+);
+const exCall = await internals.expandBlock({
+  sessionFile: exSession,
+  msgIds: exIds,
+  mode: "full",
+  select: [3],
+  ...exBudget,
+  redact: null,
+});
+check(
+  "a #call_ reference renders only that tool call, not the surrounding prose",
+  exCall.text.includes("grep(") &&
+    exCall.text.includes("expandGammaMarker") &&
+    !exCall.text.includes("expandBetaMarker") &&
+    !exCall.text.includes("src/a.ts"),
+);
+const exString = await internals.expandBlock({
+  sessionFile: exSession,
+  msgIds: exIds,
+  mode: "full",
+  select: [4],
+  ...exBudget,
+  redact: null,
+});
+check("plain string content is rendered", exString.text.includes("expandStringMarker"));
+const exTrunc = await internals.expandBlock({
+  sessionFile: exSession,
+  msgIds: exIds,
+  mode: "full",
+  select: null,
+  ...exBudget,
+  maxChars: 1,
+  redact: null,
+});
+check(
+  "a tiny char budget still returns one entry and flags truncation",
+  exTrunc.truncated && exTrunc.text.length > 0 && exTrunc.skippedMessages === 3 && exTrunc.returnedChars <= 1 + 200,
+);
+const exFew = await internals.expandBlock({
+  sessionFile: exSession,
+  msgIds: exIds,
+  mode: "full",
+  select: [1, 2, 3, 4],
+  ...exBudget,
+  maxMessages: 1,
+  redact: null,
+});
+check(
+  "maxMessages caps how many messages are rendered",
+  exFew.text.includes("expandAlphaMarker") &&
+    !exFew.text.includes("expandBetaMarker") &&
+    exFew.skippedMessages === 3 &&
+    exFew.truncated,
+);
+const exRedact = await internals.expandBlock({
+  sessionFile: exSession,
+  msgIds: exIds,
+  mode: "full",
+  select: [1],
+  ...exBudget,
+  redact: (s) => ({ text: s.replace(/expandAlphaMarker/g, "[REDACTED]"), hits: 1 }),
+});
+check(
+  "the injected redactor is applied to expanded text",
+  exRedact.text.includes("[REDACTED]") && !exRedact.text.includes("expandAlphaMarker"),
+);
+
+const exCapRead = await internals.readSessionMessages(exSession, 40);
+check(
+  "a byte-capped read reports truncation without corrupting messages",
+  exCapRead.truncated && exCapRead.bytesRead === 40 && exCapRead.totalBytes > 40,
+);
+const exFullRead = await internals.readSessionMessages(exSession, 10 * 1024 * 1024);
+check(
+  "an uncapped read indexes only type:message lines",
+  !exFullRead.truncated && exFullRead.messages.size === 3 && !exFullRead.messages.has("not-a-message"),
+);
+check(
+  "renderMessage returns null for a line without a message body",
+  internals.renderMessage({ type: "message", id: "x" }, null) === null && internals.renderMessage(null, null) === null,
+);
+let exMissing = "";
+try {
+  await internals.readSessionMessages(path.join(exRoot, "nope.jsonl"), 1000);
+} catch (e) {
+  exMissing = e.message;
+}
+check("a missing session file surfaces a read error", exMissing.includes("ENOENT"));
+
+// Pointers must backfill onto rows that predate the column, and must not churn afterwards.
+exDb.db.exec("UPDATE blocks SET msg_ids = NULL");
+fs.utimesSync(exSidecar, new Date(T2), new Date(T2));
+const exRefresh = await exDb.ingestSidecarFile(exSession, "/home/dev/ExpandProj");
+check(
+  "re-ingest backfills pointers onto existing rows",
+  exRefresh.ok && exRefresh.parsed && exRefresh.inserted === 0 && exRefresh.refreshed === 2,
+);
+fs.utimesSync(exSidecar, new Date(T2 + 1), new Date(T2 + 1));
+const exNoop = await exDb.ingestSidecarFile(exSession, "/home/dev/ExpandProj");
+check(
+  "re-ingest leaves intact pointers untouched",
+  exNoop.ok && exNoop.parsed && exNoop.inserted === 0 && exNoop.refreshed === 0,
+);
+check("pointers stay searchable but are not FTS-indexed", exDb.search("expandDeltaMarker").rows.length === 1);
+exDb.close();
+
+// --- Migration (0.4.x -> 0.5.0): add msg_ids and reset the ledger once ----------------
+const ptrPath = path.join(tmp, "pointers.db");
+const ptrRaw = new DatabaseSync(ptrPath);
+ptrRaw.exec(`
+  CREATE TABLE sources(
+    source_file TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'pi', project TEXT NOT NULL, cwd TEXT,
+    last_mtime_ms INTEGER DEFAULT 0, last_size INTEGER DEFAULT 0, first_seen_at INTEGER, updated_at INTEGER
+  );
+  CREATE TABLE blocks(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, source_file TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'pi',
+    block_id TEXT NOT NULL, run_id TEXT, tier INTEGER, topic TEXT, summary TEXT NOT NULL,
+    ref_start TEXT, ref_end TEXT, compressed_tokens INTEGER, created_at INTEGER,
+    UNIQUE(source_file, block_id)
+  );
+  CREATE TABLE source_watermarks(
+    source_file TEXT PRIMARY KEY, last_mtime_ms INTEGER NOT NULL DEFAULT 0,
+    last_size INTEGER NOT NULL DEFAULT 0, updated_at INTEGER
+  );
+  INSERT INTO sources(source_file, kind, project, cwd, last_mtime_ms, last_size, first_seen_at, updated_at)
+  VALUES ('${exSidecar}', 'pi', 'ExpandProj', '/home/dev/ExpandProj', 777, 888, 1, 1);
+  INSERT INTO source_watermarks(source_file, last_mtime_ms, last_size, updated_at)
+  VALUES ('${exSidecar}', 777, 888, 1);
+  INSERT INTO blocks(source_file, kind, block_id, run_id, tier, topic, summary, compressed_tokens, created_at)
+  VALUES ('${exSidecar}', 'pi', 'b1', 'r1', 1, 'legacy', 'legacyPointerMarker', 42, ${T1});
+`);
+ptrRaw.close();
+const ptrDb = new internals.MemoryDb(ptrPath);
+ptrDb.open();
+check(
+  "a pre-0.5.0 store gains the msg_ids column on open",
+  ptrDb.db
+    .prepare("PRAGMA table_info(blocks)")
+    .all()
+    .some((c) => c.name === "msg_ids"),
+);
+const ptrWm = ptrDb.db.prepare("SELECT last_mtime_ms, last_size FROM source_watermarks").all();
+check(
+  "the pointer migration resets the watermark ledger so rows backfill once",
+  ptrWm.length === 1 && ptrWm[0].last_mtime_ms === 0 && ptrWm[0].last_size === 0,
+);
+const ptrIngest = await ptrDb.ingestSidecarFile(exSession, "/home/dev/ExpandProj");
+check(
+  "post-migration ingest backfills pointers into the legacy row",
+  ptrIngest.ok &&
+    ptrIngest.parsed &&
+    ptrIngest.inserted === 1 &&
+    ptrIngest.refreshed === 1 &&
+    internals.parseMsgIds(ptrDb.findBlocks("b1", "ExpandProj")[0].msgIds).length === 5,
+);
+const ptrAgain = await ptrDb.ingestSidecarFile(exSession, "/home/dev/ExpandProj");
+check("the pointer migration runs at most once", ptrAgain.ok && !ptrAgain.parsed);
+ptrDb.close();
+
 // --- cleanup --------------------------------------------------------------------
 db.close();
 fs.rmSync(tmp, { recursive: true, force: true });

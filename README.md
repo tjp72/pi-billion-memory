@@ -49,7 +49,7 @@ affiliated with, endorsed by, or a fork of**
   message file, so scanning stays bounded even with many sessions.
 - **Compression blocks only**: the pi adapter reads
   `<session>.jsonl.acp.json`; the opencode adapter reads `ses_*.json` state
-  files. Raw conversation messages are never parsed.
+  files. Raw conversation messages are never parsed during ingestion.
 - **Incremental and durable**: per-source `mtime + size` watermarks live in a
   durable ledger; `UNIQUE(source_file, block_id)` + `INSERT OR IGNORE` dedupes
   blocks. `prune()` writes tombstones so a later rescan cannot resurrect
@@ -60,6 +60,10 @@ affiliated with, endorsed by, or a fork of**
 - **Lazy project resolution**: the pi session header is read only when a source
   file actually needs (re)ingestion, and only its first line is read. An
   unchanged store costs no header reads.
+- **Optional block expansion**: with `expandEnabled`, `memory_expand` resolves a
+  block's recorded message pointers back to the original session messages on
+  demand. It is two-step (manifest first, then an explicit selection), bounded,
+  filtered like ingestion, and never written to the store.
 - **No context hook**: the extension never participates in pi's `context`
   event; it only indexes and searches compression summaries.
 
@@ -169,9 +173,11 @@ opencode-acp ses_*.json ────────┘                             
 ## Data and privacy
 
 - **No network**: the extension makes no network requests and has no telemetry.
-- **No raw messages**: only compression blocks/sidecars are ingested. The pi
-  session file is read only for its first-line header (`cwd`, `id`,
-  `timestamp`, `type`, `version`) when project resolution is needed.
+- **No raw messages at ingestion**: only compression blocks/sidecars are
+  ingested. The pi session file is read for its first-line header (`cwd`, `id`,
+  `timestamp`, `type`, `version`) when project resolution is needed, and — only
+  when the opt-in `expandEnabled` is on and `memory_expand` is called — for the
+  specific messages a stored block points at.
 - **Secret and URL filter**: before a block is stored, its `topic` and
   `summary` are scanned for common credentials (passwords, API keys, tokens,
   private keys, JWTs, auth headers, cookies, and Chinese credential labels) and
@@ -197,7 +203,11 @@ opencode-acp ses_*.json ────────┘                             
   "maxSummaryChars": 20000,
   "debug": false,
   "excludeDirs": [],
-  "scanOnStartup": true
+  "scanOnStartup": true,
+  "expandEnabled": false,
+  "expandMaxChars": 40000,
+  "expandMaxMessages": 200,
+  "expandMaxReadBytes": 33554432
 }
 ```
 
@@ -212,6 +222,14 @@ opencode-acp ses_*.json ────────┘                             
 - `scanOnStartup`: run a background allow-list scan at session start. If
   disabled, the current session is still force-scanned once and other sources
   are picked up by later scans.
+- `expandEnabled`: register the opt-in `memory_expand` tool (default `false`).
+  See "Expand a block" below.
+- `expandMaxChars`: hard cap on characters returned by one `memory_expand` call
+  (default 40000).
+- `expandMaxMessages`: hard cap on messages rendered by one `memory_expand` call
+  (default 200).
+- `expandMaxReadBytes`: hard cap on bytes read from a session file by one
+  `memory_expand` call (default 33554432, i.e. 32 MB).
 
 ## Allow-list sources
 
@@ -256,6 +274,51 @@ Run `/memory sources` to confirm, then `/memory rescan`.
   `idx_blocks_created` for ordering.
 - The schema is plain JSON; the extension does not require `typebox` or any
   other runtime dependency.
+
+## Expand a block
+
+`memory_search` returns summaries. When the exact original wording matters, an
+opt-in tool resolves a block's recorded message pointers back to the session
+messages it absorbed:
+
+```json
+{
+  "expandEnabled": true
+}
+```
+
+Set it in `~/.pi/pi-billion-memory.json`, then restart pi (or `/reload`).
+`memory_expand` is only registered when this is on.
+
+Expansion is deliberately two-step so that recovering text cannot silently
+re-spend the context that compression just saved:
+
+```text
+memory_expand({ block: "b1" })
+  -> manifest only: index, role, size and ref per absorbed message, no text
+memory_expand({ block: "b1", mode: "full", select: [1, 2] })
+  -> renders only messages 1 and 2
+```
+
+- `block` comes from a `memory_search` result. The same id can exist in several
+  sessions, so add `source` (a substring of the `Source:` label, e.g. a session
+  file name or project) when the lookup is ambiguous.
+- `limit` and `chars` bound a single call; they are additionally clamped by
+  `expandMaxMessages` and `expandMaxChars`.
+- Only pi sources (`*.jsonl.acp.json`) are expandable; opencode-acp state files
+  do not expose message references.
+- A `#call_...` suffix on a reference renders only that one tool call, not the
+  surrounding assistant message.
+- A reference whose message is gone (deleted or truncated session file) is
+  reported as missing rather than failing the call.
+- Expanded text passes through the same secret/URL filter as ingestion, and
+  nothing is written back to the store.
+
+Blocks ingested before 0.5.0 have no recorded pointers. Upgrading resets the
+watermark ledger once, so the next scan re-reads the existing sidecars and
+backfills the pointers without duplicating blocks: `INSERT OR IGNORE` still
+protects the stored summary text, and tombstones still block resurrection.
+Run `/memory rescan` to trigger the backfill immediately.
 
 ## Scale and prune
 
@@ -307,9 +370,11 @@ See `CONTRIBUTING.md` and `AGENTS.md` for the rules that apply to changes.
 
 - Memory entries are ACP compression summaries, not original messages.
   Semantic (embedding) search is not implemented; trigram is literal substring
-  matching.
-- If a block is rewritten upstream, the already-ingested row is not updated
-  (`INSERT OR IGNORE`); `/memory rescan` only adds new blocks.
+  matching. `memory_expand` recovers the originals only for pi sources and only
+  for blocks that recorded message pointers.
+- If a block is rewritten upstream, the already-ingested summary text is not
+  updated (`INSERT OR IGNORE`); only its message pointers are refreshed.
+  `/memory rescan` adds new blocks.
 - Upstream compression formats are internal implementations that can change.
   The adapters are defensive (malformed/mid-write files are skipped and
   retried), but a format change may require an adapter update.

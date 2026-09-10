@@ -1,6 +1,6 @@
 {
   "name": "pi-billion-memory",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Independent SQLite/FTS5 long-term memory index for the pi coding agent; reads allow-listed ACP compression sidecars (including billion-context-pi output) and exposes the memory_search tool.",
   "type": "module",
   "private": true,

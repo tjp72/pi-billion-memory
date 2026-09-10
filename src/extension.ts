@@ -47,6 +47,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { expandBlock, parseMsgIds } from "./expand.js";
 
 // ---------------------------------------------------------------------------
 // Constants / config / logging
@@ -71,10 +72,26 @@ const DEFAULT_CFG = {
   sourcesPath: path.join(PI_DIR, "pi-billion-memory.sources.jsonl"),
   /** Log file (overridable so tests never write to the real ~/.pi log) */
   logPath: path.join(PI_DIR, "pi-billion-memory.log"),
+  /**
+   * Register the `memory_expand` tool, which resolves a stored block back to the original
+   * session messages it absorbed. Off by default: expansion re-reads raw conversation lines,
+   * which the ingestion path deliberately never touches, so it must be enabled on purpose.
+   */
+  expandEnabled: false,
+  /** Hard cap on characters returned by one `memory_expand` call. */
+  expandMaxChars: 40000,
+  /** Hard cap on messages rendered by one `memory_expand` call. */
+  expandMaxMessages: 200,
+  /** Hard cap on bytes read from a session file by one `memory_expand` call. */
+  expandMaxReadBytes: 32 * 1024 * 1024,
 };
 
 const MAX_TOPIC_CHARS = 200;
 const PREVIEW_CHARS = 600;
+/** Max message references stored per block (guards against an unbounded sidecar array). */
+const MAX_MSG_IDS = 4000;
+/** Max manifest lines rendered by a `list` expansion. */
+const EXPAND_MANIFEST_MAX = 300;
 const DEFAULT_RESULT_LIMIT = 6;
 const MAX_RESULT_LIMIT = 20;
 const LOG_MAX_BYTES = 1_000_000;
@@ -96,6 +113,12 @@ function sanitizeCfg(over) {
   if (typeof over.scanOnStartup === "boolean") out.scanOnStartup = over.scanOnStartup;
   if (typeof over.sourcesPath === "string" && over.sourcesPath) out.sourcesPath = over.sourcesPath;
   if (typeof over.logPath === "string" && over.logPath) out.logPath = over.logPath;
+  if (typeof over.expandEnabled === "boolean") out.expandEnabled = over.expandEnabled;
+  if (Number.isInteger(over.expandMaxChars) && over.expandMaxChars > 0) out.expandMaxChars = over.expandMaxChars;
+  if (Number.isInteger(over.expandMaxMessages) && over.expandMaxMessages > 0)
+    out.expandMaxMessages = over.expandMaxMessages;
+  if (Number.isInteger(over.expandMaxReadBytes) && over.expandMaxReadBytes > 0)
+    out.expandMaxReadBytes = over.expandMaxReadBytes;
   return out;
 }
 
@@ -399,6 +422,30 @@ function cleanOpencodeSummary(summary) {
     .trim();
 }
 
+/**
+ * Collect the raw message ids a block absorbed.
+ *
+ * pi sidecars expose `effectiveMessageIds`, whose entries may be `"<messageId>#<callId>"` when the
+ * block covered one tool call inside an assistant message. opencode-acp state files use
+ * `messageIds`. An unrecognized shape yields null, so the block is stored as "not expandable"
+ * instead of failing ingestion.
+ */
+function collectMsgIds(block: any): string[] | null {
+  const raw = block?.effectiveMessageIds ?? block?.messageIds;
+  if (!Array.isArray(raw)) return null;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const id = item.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+    if (out.length >= MAX_MSG_IDS) break;
+  }
+  return out.length ? out : null;
+}
+
 function normalizePiBlocks(data: any) {
   // null = unrecognized payload shape: the caller must not advance the watermark (retry later)
   if (!data || typeof data !== "object" || !Array.isArray(data.blocks)) return null;
@@ -412,6 +459,7 @@ function normalizePiBlocks(data: any) {
       tier: Number.isInteger(b.tier) ? b.tier : null,
       topic: typeof b.topic === "string" && b.topic ? b.topic.slice(0, MAX_TOPIC_CHARS) : null,
       summary: b.summary,
+      msgIds: collectMsgIds(b),
       refStart: typeof b.startRef === "string" ? b.startRef : null,
       refEnd: typeof b.endRef === "string" ? b.endRef : null,
       compressedTokens: Number.isInteger(b.compressedTokens) ? b.compressedTokens : null,
@@ -439,6 +487,7 @@ function normalizeOpencodeBlocks(data: any) {
           MAX_TOPIC_CHARS,
         ) || null,
       summary: cleanOpencodeSummary(b.summary),
+      msgIds: collectMsgIds(b),
       refStart: typeof b.startId === "string" ? b.startId : null,
       refEnd: typeof b.endId === "string" ? b.endId : null,
       compressedTokens: Number.isInteger(b.compressedTokens) ? b.compressedTokens : null,
@@ -508,6 +557,7 @@ export class MemoryDb {
         ref_end           TEXT,
         compressed_tokens INTEGER,
         created_at        INTEGER,            -- block.createdAt / block.createdAt (ms)
+        msg_ids           TEXT,               -- JSON array of raw message ids (NULL = not expandable)
         UNIQUE(source_file, block_id)
       );
       CREATE INDEX IF NOT EXISTS idx_blocks_source ON blocks(source_file);
@@ -532,6 +582,15 @@ export class MemoryDb {
         tokenize='trigram'
       );
     `);
+    // Idempotent migration (0.4.x -> 0.5.0): blocks.msg_ids powers the optional memory_expand tool.
+    // Rows created before the column existed keep NULL, so reset the watermark ledger once to force
+    // a re-parse of every source and backfill the pointers. Tombstones still block resurrection.
+    const blockCols = this.db.prepare("PRAGMA table_info(blocks)").all();
+    if (!blockCols.some((c) => c.name === "msg_ids")) {
+      this.db.exec("ALTER TABLE blocks ADD COLUMN msg_ids TEXT;");
+      this.db.exec("UPDATE source_watermarks SET last_mtime_ms = 0, last_size = 0;");
+      logLine("migrated blocks.msg_ids; watermark ledger reset once for pointer backfill");
+    }
     // Idempotent migration: seed the watermark ledger from existing sources rows.
     this.db.exec(`
       INSERT OR IGNORE INTO source_watermarks(source_file, last_mtime_ms, last_size, updated_at)
@@ -670,6 +729,7 @@ export class MemoryDb {
     }
     const now = Date.now();
     let inserted = 0;
+    let refreshed = 0;
     let redactedHits = 0;
     this.db.exec("BEGIN");
     try {
@@ -698,9 +758,15 @@ export class MemoryDb {
         .run(sourceFile, mtimeMs, size, now);
       const ins = this.db.prepare(
         `INSERT OR IGNORE INTO blocks
-           (source_file, kind, block_id, run_id, tier, topic, summary, ref_start, ref_end, compressed_tokens, created_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           (source_file, kind, block_id, run_id, tier, topic, summary, ref_start, ref_end, compressed_tokens, created_at, msg_ids)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE NOT EXISTS (SELECT 1 FROM block_tombstones WHERE source_file = ? AND block_id = ?)`,
+      );
+      // INSERT OR IGNORE leaves existing rows alone, so refresh the pointer column separately.
+      // Only msg_ids changes, which keeps the FTS external-content table valid.
+      const updMsgIds = this.db.prepare(
+        `UPDATE blocks SET msg_ids = ?
+          WHERE source_file = ? AND block_id = ? AND (msg_ids IS NULL OR msg_ids <> ?)`,
       );
       for (const b of blocks) {
         if (!b || typeof b.summary !== "string") continue;
@@ -712,6 +778,7 @@ export class MemoryDb {
             ? redactedSummary.text.slice(0, cfg.maxSummaryChars)
             : redactedSummary.text;
         if (!summary.trim()) continue;
+        const msgIdsJson = Array.isArray(b.msgIds) && b.msgIds.length ? JSON.stringify(b.msgIds) : null;
         const r = ins.run(
           sourceFile,
           kind,
@@ -724,10 +791,12 @@ export class MemoryDb {
           b.refEnd,
           b.compressedTokens,
           b.createdAt,
+          msgIdsJson,
           sourceFile,
           b.blockId,
         );
         if (r.changes > 0) inserted++;
+        else if (msgIdsJson && updMsgIds.run(msgIdsJson, sourceFile, b.blockId, msgIdsJson).changes > 0) refreshed++;
       }
       this.db.exec("COMMIT");
     } catch (e) {
@@ -742,7 +811,39 @@ export class MemoryDb {
       logLine(`redacted ${redactedHits} potential secret(s) before storing ${path.basename(sourceFile)}`);
     }
     log(`ingest ${path.basename(sourceFile)} kind=${kind} project=${project} blocks=${blocks.length} new=${inserted}`);
-    return { ok: true, parsed: true, total: blocks.length, inserted, redacted: redactedHits, mtimeMs, size };
+    return { ok: true, parsed: true, total: blocks.length, inserted, refreshed, redacted: redactedHits, mtimeMs, size };
+  }
+
+  /**
+   * Look up stored blocks for `memory_expand`.
+   * @param {string} blockId block id as shown by memory_search (e.g. "b1")
+   * @param {string|null} source optional substring match on the source file name or project
+   * @param {number} limit max candidate rows returned for disambiguation
+   * @returns {Array<object>} camelCase rows, newest first
+   */
+  findBlocks(blockId, source = null, limit = 10) {
+    this.open();
+    const params: any[] = [String(blockId)];
+    let where = "b.block_id = ?";
+    if (source) {
+      where += " AND (b.source_file LIKE ? ESCAPE '\\' OR s.project LIKE ? ESCAPE '\\')";
+      const like = `%${String(source).replace(/[\\%_]/g, (m) => "\\" + m)}%`;
+      params.push(like, like);
+    }
+    params.push(Math.max(1, Math.min(50, limit)));
+    return this.db
+      .prepare(
+        `SELECT b.id, b.source_file AS sourceFile, b.kind AS kind,
+                b.block_id AS blockId, b.tier, b.topic, b.summary,
+                b.ref_start AS refStart, b.ref_end AS refEnd,
+                b.compressed_tokens AS tokens, b.created_at AS createdAt,
+                b.msg_ids AS msgIds, s.project, s.cwd
+           FROM blocks b LEFT JOIN sources s ON s.source_file = b.source_file
+          WHERE ${where}
+          ORDER BY b.created_at DESC, b.id DESC
+          LIMIT ?`,
+      )
+      .all(...params);
   }
 
   /**
@@ -1205,6 +1306,53 @@ export function formatResults(res) {
   return head + parts.join("\n\n---\n\n");
 }
 
+/**
+ * Render one expansion result for the model. `list` mode never emits conversation text; it only
+ * reports what is available so the caller has to make an explicit, bounded second call.
+ */
+function formatExpansion(row, sessionFile, res, mode) {
+  const lines = [
+    `Block ${row.blockId}${row.tier != null ? ` (tier ${row.tier})` : ""} · project ${row.project || "unknown"}` +
+      `${row.createdAt ? ` · ${fmtTs(row.createdAt)}` : ""} · ${res.entries.length} message ref(s)` +
+      ` · ${fmtTokens(row.tokens) || "?"} tok compressed`,
+    `Source: ${sourceLabel(row)}`,
+    `Session: ${sessionFile}`,
+  ];
+  const kb = (n) => `${Math.round(n / 1024)} KB`;
+  lines.push(
+    res.readTruncated
+      ? `Read: ${kb(res.bytesRead)} of ${kb(res.totalBytes)} (read cap hit; later messages may be missing)`
+      : `Read: ${kb(res.totalBytes)} (complete)`,
+  );
+  const missing = res.entries.filter((e) => !e.found).length;
+  if (missing > 0) lines.push(`Missing: ${missing} referenced message(s) not present in the session file`);
+  lines.push("");
+  if (mode === "list") {
+    const shown = res.entries.slice(0, EXPAND_MANIFEST_MAX);
+    for (const e of shown) {
+      const role = (e.found ? e.role || "?" : "missing").padEnd(11);
+      const size = e.found ? `${String(e.chars).padStart(6)} chars` : "          ";
+      lines.push(`${String(e.index).padStart(4)}  ${role} ${size}  ${e.ref}`);
+    }
+    if (res.entries.length > shown.length) lines.push(`       ... and ${res.entries.length - shown.length} more`);
+    lines.push("");
+    lines.push(
+      `Text: ${res.availableChars} chars available. Read a selection with ` +
+        `memory_expand({ block: "${row.blockId}", mode: "full", select: [1, 2, 3] }).`,
+    );
+  } else {
+    lines.push(res.text || "(no text selected)");
+    if (res.truncated) {
+      lines.push("");
+      lines.push(
+        `[truncated: ${res.returnedChars} of ${res.availableChars} chars returned; ` +
+          `${res.skippedMessages} message(s) skipped — narrow 'select' or raise expandMaxChars]`,
+      );
+    }
+  }
+  return lines.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Tool parameter schema (plain JSON Schema; no typebox runtime dependency)
 // ---------------------------------------------------------------------------
@@ -1234,6 +1382,59 @@ interface MemorySearchParams {
   query: string;
   project: string | null;
   limit: number;
+}
+
+const MEMORY_EXPAND_PARAMETERS = {
+  type: "object",
+  properties: {
+    block: {
+      type: "string",
+      description: "Block id taken from a memory_search result, e.g. 'b1'",
+    },
+    source: {
+      type: "string",
+      description:
+        "Optional disambiguator when the same block id exists in several sessions: a substring of the memory_search 'Source:' label (session file name or project)",
+    },
+    mode: {
+      type: "string",
+      enum: ["list", "full"],
+      description:
+        "'list' (default) returns a manifest of the absorbed messages with no conversation text; 'full' renders the selected text",
+    },
+    select: {
+      type: "array",
+      items: { type: "number" },
+      description: "1-based message indices from a 'list' result to render; omit to render all (still bounded)",
+    },
+    limit: { type: "number", description: "Max messages to render, default from expandMaxMessages" },
+    chars: { type: "number", description: "Max characters to return, default from expandMaxChars" },
+  },
+  required: ["block"],
+} as const;
+
+interface MemoryExpandParams {
+  block: string;
+  source: string | null;
+  mode: "list" | "full";
+  select: number[] | null;
+  limit: number | null;
+  chars: number | null;
+}
+
+function readMemoryExpandParams(raw: unknown): MemoryExpandParams {
+  const value = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const block = typeof value.block === "string" ? value.block.trim() : "";
+  const source = typeof value.source === "string" && value.source.trim() ? value.source.trim() : null;
+  const mode = value.mode === "full" ? "full" : "list";
+  const select = Array.isArray(value.select)
+    ? value.select.filter((n) => typeof n === "number" && Number.isInteger(n) && n > 0)
+    : null;
+  const limit =
+    typeof value.limit === "number" && Number.isInteger(value.limit) && value.limit > 0 ? value.limit : null;
+  const chars =
+    typeof value.chars === "number" && Number.isInteger(value.chars) && value.chars > 0 ? value.chars : null;
+  return { block, source, mode, select, limit, chars };
 }
 
 function readMemorySearchParams(raw: unknown): MemorySearchParams {
@@ -1360,6 +1561,135 @@ export default async function factory(pi: ExtensionAPI) {
       }
     },
   });
+
+  if (cfg.expandEnabled) {
+    pi.registerTool({
+      name: "memory_expand",
+      label: "Memory Expand",
+      description:
+        "Recover the original session messages absorbed by one stored compression block — the " +
+        "inverse of memory_search. Only registered when expandEnabled is true in " +
+        "~/.pi/pi-billion-memory.json. Default mode 'list' returns just a manifest (ref, role, size); " +
+        "call again with mode 'full' and an explicit 'select' to read text. Expansion is deliberately " +
+        "two-step and bounded, because it spends the context that compression saved. Returned text " +
+        "passes through the same secret redaction as ingestion, and nothing is written to the store.",
+      promptSnippet: "Expand one memory block back to its original messages (opt-in; list before full)",
+      promptGuidelines: [
+        "Use mode 'list' first: it is cheap and shows which messages a block absorbed, with role and size.",
+        "Request mode 'full' with a narrow 'select' only when the exact original wording matters.",
+        "memory_expand reads raw conversation lines from the session file; it only resolves references already recorded in a stored block.",
+      ],
+      parameters: MEMORY_EXPAND_PARAMETERS,
+      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+        try {
+          const p = readMemoryExpandParams(params);
+          if (!p.block) {
+            return {
+              content: [{ type: "text", text: "memory_expand: 'block' is required (e.g. block: \"b1\")." }],
+              details: { mode: "error", hits: 0 },
+            };
+          }
+          const rows = getDb().findBlocks(p.block, p.source);
+          if (rows.length === 0) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `memory_expand: no stored block '${p.block}'` +
+                    `${p.source ? ` matching source '${p.source}'` : ""}. ` +
+                    "Run memory_search first and pass the block id from a result.",
+                },
+              ],
+              details: { mode: "missing", hits: 0 },
+            };
+          }
+          if (rows.length > 1) {
+            const list = rows
+              .map(
+                (r) =>
+                  `- ${r.blockId} · project ${r.project || "?"} · ${fmtTs(r.createdAt) || "time unknown"}` +
+                  ` · ${path.basename(r.sourceFile)}`,
+              )
+              .join("\n");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `memory_expand: ${rows.length} blocks share the id '${p.block}'. Add 'source' to pick one:\n${list}`,
+                },
+              ],
+              details: { mode: "ambiguous", hits: rows.length },
+            };
+          }
+          const row = rows[0];
+          if (!String(row.sourceFile).endsWith(".acp.json")) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `memory_expand: block ${row.blockId} comes from ${sourceLabel(row)}, not a pi ACP sidecar. ` +
+                    "Expansion is currently supported only for pi sidecars.",
+                },
+              ],
+              details: { mode: "unsupported", hits: 1 },
+            };
+          }
+          const msgIds = parseMsgIds(row.msgIds);
+          if (msgIds.length === 0) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `memory_expand: block ${row.blockId} has no recorded message references, so it cannot be expanded. ` +
+                    "This happens for rows ingested before 0.5.0. Run /memory rescan to backfill the pointers from the sidecar.",
+                },
+              ],
+              details: { mode: "no-refs", hits: 1 },
+            };
+          }
+          const sessionFile = row.sourceFile.slice(0, -".acp.json".length);
+          const res = await expandBlock({
+            sessionFile,
+            msgIds,
+            mode: p.mode,
+            select: p.select,
+            maxChars: Math.min(cfg.expandMaxChars, p.chars ?? cfg.expandMaxChars),
+            maxMessages: Math.min(cfg.expandMaxMessages, p.limit ?? cfg.expandMaxMessages),
+            maxReadBytes: cfg.expandMaxReadBytes,
+            redact: redactSecrets,
+          });
+          log(
+            `expand ${row.blockId} mode=${p.mode} refs=${msgIds.length} found=${res.entries.filter((e) => e.found).length} returned=${res.returnedChars}`,
+          );
+          return {
+            content: [{ type: "text", text: formatExpansion(row, sessionFile, res, p.mode) }],
+            details: {
+              mode: p.mode,
+              block: row.blockId,
+              refs: msgIds.length,
+              found: res.entries.filter((e) => e.found).length,
+              chars: res.returnedChars,
+              truncated: res.truncated,
+            },
+          };
+        } catch (e) {
+          logLine(`memory_expand error: ${e.stack || e.message}`);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `memory_expand failed: ${e.message} (see ${cfg.logPath || DEFAULT_CFG.logPath})`,
+              },
+            ],
+            details: { mode: "error", hits: 0 },
+          };
+        }
+      },
+    });
+  }
 
   pi.registerCommand("memory", {
     description:

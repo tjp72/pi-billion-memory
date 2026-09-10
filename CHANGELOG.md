@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-10
+
+### Added
+
+- Opt-in block expansion: a `memory_expand` tool (registered only when
+  `expandEnabled` is true) resolves a stored block back to the original session
+  messages it absorbed. It is two-step by design — `mode: "list"` returns a
+  manifest of ref/role/size with no conversation text, and `mode: "full"` renders
+  only an explicit `select`. Rendering is bounded by `expandMaxChars`,
+  `expandMaxMessages`, and `expandMaxReadBytes`, passes through the same secret
+  and URL filter as ingestion, and is never written back to the store. Only pi
+  sources are expandable; a `#call_...` reference renders just that tool call.
+- `blocks.msg_ids` records the message pointers behind each block, populated
+  from the sidecar at ingestion (pi `effectiveMessageIds`, opencode
+  `messageIds`). Pointers are not FTS-indexed and never affect search ranking.
+
+### Changed
+
+- Upgrading from 0.4.x resets the watermark ledger once, so the next scan
+  re-reads existing sidecars and backfills pointers onto already-ingested blocks
+  without duplicating them. `INSERT OR IGNORE` still protects the stored summary
+  text; only `msg_ids` is refreshed in place.
+
 ## [0.4.0] - 2026-09-09
 
 ### Added
