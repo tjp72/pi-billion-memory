@@ -235,6 +235,12 @@ The design is deliberately minimal; preserve these properties:
   `git add -f` them. `dist/` is intentionally tracked.
 - Configure a neutral identity before committing: `user.name` should be the public GitHub handle
   and `user.email` should be a GitHub noreply address. Never commit a real email address.
+- **Never bypass branch protection.** `main` requires CI status checks. Never push in a way that
+  bypasses required checks — if the remote reports `Bypassed rule violations` (or a push would be
+  rejected pending checks), stop and report instead of pushing. Land changes through a pull
+  request so the checks run and pass before merge; push directly to `main` only with the owner's
+  explicit approval of the bypass. A privileged/force-push credential is never a reason to skip
+  the checks.
 - If history ever needs scrubbing: orphan-branch rebuild is the approved procedure, **then**
   `git reflog expire --expire=now --all && git gc --prune=now`, and verify with
   `git fsck --no-reflogs` (no dangling output) and `git log --all` (only intended commits).
@@ -258,3 +264,5 @@ The design is deliberately minimal; preserve these properties:
    `README.zh-CN.md` and test fixtures.
 9. `git status` clean after commit; `git log --oneline` shows only intended, English, factual
    history.
+10. Push must not bypass branch protection: if the remote reports a bypass of required status
+    checks, the push must not happen (see §6).
