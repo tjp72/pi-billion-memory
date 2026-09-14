@@ -31,7 +31,8 @@ affiliated with, endorsed by, or a fork of**
   bundle, call, or modify billion-context-pi, and it has no code dependency on
   it.
 - billion-context-pi is optional. Without it, pi sessions have no sidecars to
-  index; the extension can still index opencode-acp state files if configured.
+  index; the extension can still index opencode-acp state files and
+  billion-context proxy session files if configured.
 - This extension **does not hook pi's `context` event**. It only registers the
   `memory_search` tool and the `/memory` command, so it is safe to run
   alongside billion-context-pi. It does not participate in context-compression
@@ -48,8 +49,10 @@ affiliated with, endorsed by, or a fork of**
   allow-list file. There is no global discovery across every session or
   message file, so scanning stays bounded even with many sessions.
 - **Compression blocks only**: the pi adapter reads
-  `<session>.jsonl.acp.json`; the opencode adapter reads `ses_*.json` state
-  files. Raw conversation messages are never parsed during ingestion.
+  `<session>.jsonl.acp.json`, the opencode adapter reads `ses_*.json` state
+  files, and the bili adapter reads billion-context proxy sessions
+  (`<host>_<hash>.json`). Raw conversation messages are never parsed during
+  ingestion.
 - **Incremental and durable**: per-source `mtime + size` watermarks live in a
   durable ledger; `UNIQUE(source_file, block_id)` + `INSERT OR IGNORE` dedupes
   blocks. `prune()` writes tombstones so a later rescan cannot resurrect
@@ -77,8 +80,10 @@ affiliated with, endorsed by, or a fork of**
   public extension APIs).
 - At least one enabled compression source:
   - [billion-context-pi](https://github.com/ranxianglei/billion-context-pi)
-    for pi sidecars (**recommended**), or
-  - [opencode-acp](https://www.npmjs.com/package/opencode-acp) state files.
+    for pi sidecars (**recommended**),
+  - [opencode-acp](https://www.npmjs.com/package/opencode-acp) state files, or
+  - a billion-context proxy session directory (e.g. WorkBuddy/codebuddy
+    sessions) with `adapter: "bili-session"`.
 - No third-party runtime dependencies. The extension uses Node built-ins and the
   pi host API (`@earendil-works/pi-coding-agent`, a peer dependency). Optional
   billion-context-pi sidecars are read from disk.
@@ -160,9 +165,9 @@ database, or `~/.pi/agent/settings.json` to remove this extension.
 ## How it works
 
 ```
-pi sidecars (.jsonl.acp.json) ─┐
-                                ├─ allow-list ─► scanSources() ─► ~/.pi/pi-billion-memory.db
-opencode-acp ses_*.json ────────┘                                (SQLite + FTS5 trigram)
+pi sidecars (.jsonl.acp.json)     ┐
+opencode-acp ses_*.json           ┤─ allow-list ─► scanSources() ─► ~/.pi/pi-billion-memory.db
+bili sessions (<host>_<hash>.json)┘                                 (SQLite + FTS5 trigram)
                                                                         │
                                                                         ▼
                                                          memory_search tool (on demand)
@@ -180,6 +185,9 @@ opencode-acp ses_*.json ────────┘                             
 5. For opencode sources, `opencode.db` is opened read-only (or `query_only`)
    only to map session IDs to working directories. Conversation content is
    never read.
+6. For bili sources, the proxy session file is read for its compression blocks
+   under `payload.state.blocks`; the project name comes from the file's
+   `<host>` segment. Message content is never read.
 
 ## Data and privacy
 
@@ -262,6 +270,21 @@ extension uses these two built-in defaults:
   adapter resolve each state file to its real working directory (project name)
   via a read-only lookup.
 
+Example: index a billion-context proxy session directory (WorkBuddy/codebuddy):
+
+```jsonl
+{
+  "id": "bili",
+  "adapter": "bili-session",
+  "root": "~/.local/share/billion-context/sessions",
+  "pattern": "**/*.json",
+  "enabled": true
+}
+```
+
+- `bili-session` reads blocks under `payload.state.blocks` from each matched
+  `<host>_<hash>.json` file; the project name is the `<host>` segment.
+
 Example: scan only a pi sessions subtree plus one extra sidecar root:
 
 ```jsonl
@@ -320,7 +343,7 @@ memory_expand({ block: "b1", mode: "full", select: [1, 2] })
 - `mode: "full"` requires a non-empty `select`: it refuses to render a whole block,
   so recovering text always stays an explicit choice.
 - Only pi sources (`*.jsonl.acp.json`) are expandable; opencode-acp state files
-  do not expose message references.
+  and bili proxy sessions do not expose message references.
 - A `#call_...` suffix on a reference renders only that one tool call, not the
   surrounding assistant message.
 - A reference whose message is gone (deleted or truncated session file) is

@@ -9,6 +9,8 @@
  *              under ~/.pi/agent/sessions/** (default source "pi")
  *   - opencode: opencode-acp state files    ses_*.json (filename = <session.id>.json)
  *              under <home>/.local/share/opencode/storage/plugin/acp (default source "opencode")
+ *   - bili:     billion-context proxy session files <host>_<hash>.json (WorkBuddy/codebuddy
+ *              proxied sessions) under <home>/.local/share/billion-context/sessions/** (no default)
  *
  * The allow-list lives in ~/.pi/pi-billion-memory.sources.jsonl (one JSON object per line).
  * Each line points at a root directory + file pattern and selects the adapter that knows how
@@ -360,7 +362,7 @@ export function withoutPaths(text: string): string {
 }
 
 /** Adapter ids the scanner understands; anything else is rejected where the allow-list is read. */
-const SOURCE_ADAPTERS = new Set(["pi-sidecar", "opencode-acp"]);
+const SOURCE_ADAPTERS = new Set(["pi-sidecar", "opencode-acp", "bili-session"]);
 
 /** @internal Test seam: the same validation the allow-list loader applies. */
 export function sanitizeSource(raw) {
@@ -617,6 +619,57 @@ function normalizeOpencodeBlocks(data: any) {
   return out;
 }
 
+/**
+ * bili (billion-context proxy) session files store block scalars as strings, unlike the pi and
+ * opencode sidecars which store them as JSON numbers. Convert a scalar to an integer, or null when
+ * it is absent, empty, or not a number.
+ */
+function toInt(v: any) {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+  return Number.isInteger(n) ? n : null;
+}
+
+/**
+ * bili session files are named `<host>_<hash>.json` (one file per proxied upstream). The proxy does
+ * not record a working directory, so the upstream host is the best available "project" name.
+ */
+function biliHost(sourceFile) {
+  const base = path.basename(sourceFile, ".json");
+  const idx = base.lastIndexOf("_");
+  return idx > 0 ? base.slice(0, idx) : base || "unknown";
+}
+
+/**
+ * bili (billion-context proxy, e.g. WorkBuddy/codebuddy) sessions: the file is
+ * `{ version, savedAt, id, payload }` and the compression blocks live under
+ * `payload.state.blocks`. Blocks record `startRef`/`endRef`, but the raw message ids (`h_...`) are
+ * kept separately from the blocks and the session is one JSON document rather than line-delimited
+ * messages — so bili blocks are stored as not expandable (msgIds = null), like opencode state files.
+ */
+function normalizeBiliBlocks(data: any) {
+  const blocks = (data as any)?.payload?.state?.blocks;
+  // null = unrecognized payload shape: the caller must not advance the watermark (retry later)
+  if (!Array.isArray(blocks)) return null;
+  const out: any[] = [];
+  for (const b of blocks) {
+    if (!b || (typeof b.blockId !== "string" && typeof b.blockId !== "number") || typeof b.summary !== "string")
+      continue;
+    out.push({
+      blockId: String(b.blockId),
+      runId: typeof b.runId === "string" ? b.runId : typeof b.runId === "number" ? String(b.runId) : null,
+      tier: toInt(b.tier),
+      topic: typeof b.topic === "string" && b.topic ? b.topic.slice(0, MAX_TOPIC_CHARS) : null,
+      summary: b.summary,
+      msgIds: null,
+      refStart: typeof b.startRef === "string" ? b.startRef : null,
+      refEnd: typeof b.endRef === "string" ? b.endRef : null,
+      compressedTokens: toInt(b.compressedTokens),
+      createdAt: toInt(b.createdAt),
+    });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // SQLite store
 // ---------------------------------------------------------------------------
@@ -669,7 +722,7 @@ export class MemoryDb {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sources(
         source_file    TEXT PRIMARY KEY,      -- actual file that was parsed (sidecar or ACP state file)
-        kind           TEXT NOT NULL DEFAULT 'pi',  -- 'pi' | 'opencode'
+        kind           TEXT NOT NULL DEFAULT 'pi',  -- 'pi' | 'opencode' | 'bili'
         project        TEXT NOT NULL,         -- working dir folder name (basename(cwd))
         cwd            TEXT,
         last_mtime_ms  INTEGER DEFAULT 0,     -- source file mtime of last successful scan
@@ -810,7 +863,7 @@ export class MemoryDb {
     }
     const mtimeMs = st.mtimeMs;
     const size = st.size;
-    const kind = meta?.kind === "opencode" ? "opencode" : "pi";
+    const kind = meta?.kind === "opencode" ? "opencode" : meta?.kind === "bili" ? "bili" : "pi";
     let cwd = typeof meta?.cwd === "string" && meta.cwd ? meta.cwd : null;
     let project = typeof meta?.project === "string" && meta.project ? meta.project : null;
     if (!force) {
@@ -842,6 +895,7 @@ export class MemoryDb {
     if (!project) {
       if (cwd) project = path.basename(cwd);
       else if (kind === "pi") project = path.basename(path.dirname(sourceFile));
+      else if (kind === "bili") project = biliHost(sourceFile);
       else project = "unknown";
     }
     let data;
@@ -851,7 +905,12 @@ export class MemoryDb {
       // Possibly mid-write by another process: leave watermark untouched, retry next scan
       return { ok: false, parsed: false, total: 0, inserted: 0, mtimeMs, size, error: `parse: ${e.message}` };
     }
-    const blocks = kind === "pi" ? normalizePiBlocks(data) : normalizeOpencodeBlocks(data);
+    const blocks =
+      kind === "pi"
+        ? normalizePiBlocks(data)
+        : kind === "bili"
+          ? normalizeBiliBlocks(data)
+          : normalizeOpencodeBlocks(data);
     if (blocks === null) {
       // Unrecognized payload shape (upstream format drift): do not advance the watermark, retry.
       return {
@@ -1444,6 +1503,9 @@ async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) 
     } else if (source.adapter === "opencode-acp") {
       const info = opencodeMap?.get(file);
       meta = { kind: "opencode", cwd: info?.cwd ?? null, project: info?.project ?? null };
+    } else if (source.adapter === "bili-session") {
+      // bili sessions carry no working directory; project is derived from the file's host segment.
+      meta = { kind: "bili", cwd: null, project: null };
     } else {
       logLine(`unknown source adapter '${source.adapter}' for ${source.id}; skipped`);
       tally.failed++;
@@ -1494,7 +1556,7 @@ function fmtTokens(n) {
 }
 
 function sourceLabel(row) {
-  const kind = row.kind === "opencode" ? "opencode" : "pi";
+  const kind = row.kind === "opencode" || row.kind === "bili" ? row.kind : "pi";
   let base = path.basename(row.sourceFile || "");
   if (kind === "pi" && base.endsWith(".acp.json")) base = base.slice(0, -".acp.json".length);
   return `[${kind}] ${base}`;
@@ -1508,7 +1570,7 @@ export function formatResults(res) {
       "No memory matches. Try: 1) shorter / more common keywords; 2) drop the project filter; " +
       "3) if a compression happened moments ago, retry later (ingestion follows scan timing). " +
       "The store only contains ACP block summaries from allow-listed sources " +
-      "(pi billion-context-pi sidecars and opencode-acp state files)."
+      "(pi billion-context-pi sidecars, opencode-acp state files, and billion-context sessions)."
     );
   }
   const modeLabel =
@@ -1786,7 +1848,7 @@ export default async function factory(pi: ExtensionAPI) {
     label: "Memory Search",
     description:
       "Search pi's long-term memory store: block summaries produced by ACP compression from " +
-      "allow-listed sources (pi billion-context-pi sidecars and opencode-acp state files) across all " +
+      "allow-listed sources (pi billion-context-pi sidecars, opencode-acp state files, and billion-context sessions) across all " +
       "allowed projects. Use when the user asks about past work, conclusions, decisions, technical " +
       "pitfalls, code locations, project context, or content compressed earlier in this session. " +
       "Query with Chinese or English keywords / phrases; results are relevance-ranked and annotated " +

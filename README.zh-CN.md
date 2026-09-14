@@ -27,7 +27,8 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
 - 本扩展**只读**这些 sidecar 文件。它不 import、不打包、不调用、不修改
   billion-context-pi，也没有代码依赖。
 - billion-context-pi 是**可选的**。没有它，pi session 就不会产生 sidecar 文件；
-  如果你配置了 opencode 源，本扩展仍然可以索引 opencode-acp 的 state 文件。
+  如果你配置了 opencode 源或 billion-context 代理源，本扩展仍然可以索引
+  opencode-acp 的 state 文件或 billion-context 的代理 session 文件。
 - 本扩展**不会 hook pi 的 `context` 事件**，只注册 `memory_search` 工具和
   `/memory` 命令，因此可以和 billion-context-pi 同时运行，不会参与上下文压缩的
   顺序竞争，也不会覆盖压缩结果。
@@ -42,7 +43,8 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
 - **白名单优先**：扫描范围只来自白名单文件中的 root/pattern，不会全局发现所有
   session 或消息文件，因此即使 session 很多，扫描成本也可控。
 - **只处理压缩块**：pi 适配器读取 `<session>.jsonl.acp.json`；opencode 适配器
-  读取 `ses_*.json` state 文件。**入库时**不解析原始对话消息。
+  读取 `ses_*.json` state 文件；bili 适配器读取 billion-context 代理 session
+  （`<host>_<hash>.json`）。**入库时**不解析原始对话消息。
 - **增量且持久**：每个源文件用 `mtime + size` 水位线记录进度；
   `UNIQUE(source_file, block_id)` + `INSERT OR IGNORE` 去重；`prune()` 会写
   tombstone，后续 rescan 不会复活已删除的块。
@@ -64,8 +66,10 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
 - **pi coding agent >= 0.85.1**（使用公开扩展 API；已测试 0.85.1）。
 - 至少一个启用的压缩源：
   - [billion-context-pi](https://github.com/ranxianglei/billion-context-pi)
-    （pi sidecar，**推荐**），或
-  - [opencode-acp](https://www.npmjs.com/package/opencode-acp) state 文件。
+    （pi sidecar，**推荐**），
+  - [opencode-acp](https://www.npmjs.com/package/opencode-acp) state 文件，或
+  - billion-context 代理 session 目录（如 WorkBuddy/codebuddy 的 session），
+    使用 `adapter: "bili-session"`。
 - 无第三方运行时依赖；只使用 Node 内置模块和 pi 宿主 API
   （`@earendil-works/pi-coding-agent`，peer dependency）。可选的
   billion-context-pi sidecar 只从磁盘读取。
@@ -144,9 +148,9 @@ opencode 数据库或 `~/.pi/agent/settings.json`。
 ## 工作原理
 
 ```
-pi sidecars (.jsonl.acp.json) ─┐
-                                ├─ 白名单 ─► scanSources() ─► ~/.pi/pi-billion-memory.db
-opencode-acp ses_*.json ────────┘                              (SQLite + FTS5 trigram)
+pi sidecars (.jsonl.acp.json)     ┐
+opencode-acp ses_*.json           ┤─ 白名单 ─► scanSources() ─► ~/.pi/pi-billion-memory.db
+bili sessions (<host>_<hash>.json)┘                              (SQLite + FTS5 trigram)
                                                                       │
                                                                       ▼
                                                        memory_search 工具（按需调用）
@@ -159,6 +163,8 @@ opencode-acp ses_*.json ────────┘                             
    文件的**第一行**来解析 `cwd` 项目名；消息行永远不会被读取。
 5. 对于 opencode 源，`opencode.db` 以只读（或 `query_only`）方式打开，仅用于把
    session ID 映射到工作目录，不会读取对话内容。
+6. 对于 bili 源，只读取代理 session 文件中 `payload.state.blocks` 下的压缩块；
+   项目名取自文件名的 `<host>` 段。不会读取消息内容。
 
 ## 数据与隐私
 
@@ -229,6 +235,21 @@ opencode-acp ses_*.json ────────┘                             
 - `opencodeDb` 对 opencode 源可选但推荐：用于只读解析每个 state 文件对应的
   工作目录（项目名）。
 
+例如索引一个 billion-context 代理 session 目录（WorkBuddy/codebuddy）：
+
+```jsonl
+{
+  "id": "bili",
+  "adapter": "bili-session",
+  "root": "~/.local/share/billion-context/sessions",
+  "pattern": "**/*.json",
+  "enabled": true
+}
+```
+
+- `bili-session` 从每个匹配的 `<host>_<hash>.json` 文件读取 `payload.state.blocks`
+  下的块；项目名是 `<host>` 段。
+
 例如只扫描一个 pi sessions 子树和一个额外的 sidecar root：
 
 ```jsonl
@@ -278,7 +299,8 @@ memory_expand({ block: "b1", mode: "full", select: [1, 2] })
 - `limit` 和 `chars` 限制单次调用；它们还会被 `expandMaxMessages` /
   `expandMaxChars` 二次压制；
 - `mode: "full"` 必须提供非空 `select`：它拒绝渲染整个块，还原正文始终是一次显式选择；
-- 只有 pi 源（`*.jsonl.acp.json`）可展开；opencode-acp state 文件不暴露消息引用；
+- 只有 pi 源（`*.jsonl.acp.json`）可展开；opencode-acp state 文件和 bili 代理
+  session 不暴露消息引用；
 - 引用带 `#call_...` 后缀时，只渲染那一次工具调用，不含它所在的 assistant 消息；
 - 引用的消息已不存在（session 文件被删除或截断）时，报告为缺失，而不是让调用失败；
 - 扩展注入的 `custom_message` 上下文可按用户文本展开；生成类 id（`acp_summary_*`）

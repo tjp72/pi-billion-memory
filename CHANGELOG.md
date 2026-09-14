@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `bili-session` adapter: indexes billion-context proxy session files
+  (`<host>_<hash>.json`, blocks under `payload.state.blocks`, e.g. WorkBuddy/codebuddy sessions).
+  The project name is the file's `<host>` segment; bili blocks are stored as not expandable, like
+  opencode state files.
+
 ### Changed
 
 - `CONTRIBUTING.md` documents the `main` branch-protection rule and how to lift force-push

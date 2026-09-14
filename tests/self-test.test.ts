@@ -261,7 +261,7 @@ check("query is trimmed before matching", qW.rows.length >= 1);
 const r6 = await db.ingestSidecarFile(sess1, cwd1, true);
 check("second force rescan is idempotent", r6.ok && r6.inserted === 0);
 
-// --- allow-list scan: pi sidecar + opencode-acp -------------------------------
+// --- allow-list scan: pi sidecar + opencode-acp + bili-session ----------------
 const whiteRoot = path.join(tmp, "white-root");
 const whiteDir = path.join(whiteRoot, "--home-dev-WhiteProj--");
 const whiteSession = path.join(whiteDir, "2024-02-01T00-00-00-000Z_white.jsonl");
@@ -329,6 +329,34 @@ ocDb.exec("CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, path TEXT, 
 ocDb.prepare("INSERT INTO session VALUES (?, ?, ?, ?)").run("ses_abc123", "/home/dev/OpenProj", null, null);
 ocDb.close();
 
+const biliRoot = path.join(tmp, "bili-root");
+fs.mkdirSync(biliRoot, { recursive: true });
+const biliFile = path.join(biliRoot, "example.test_abc12345def67890.json");
+fs.writeFileSync(
+  biliFile,
+  JSON.stringify({
+    version: 3,
+    id: "pfa-test",
+    payload: {
+      state: {
+        blocks: [
+          {
+            blockId: "b1",
+            runId: "r1",
+            tier: "1",
+            topic: "WorkBuddy topic",
+            summary: "biliMarker billion-context proxy session block.",
+            compressedTokens: "321",
+            createdAt: String(T2),
+            startRef: "m00001",
+            endRef: "m00002",
+          },
+        ],
+      },
+    },
+  }),
+);
+
 fs.writeFileSync(
   sourcesPath,
   [
@@ -347,6 +375,13 @@ fs.writeFileSync(
       enabled: true,
       opencodeDb: ocDbPath,
     }),
+    JSON.stringify({
+      id: "bili",
+      adapter: "bili-session",
+      root: biliRoot,
+      pattern: "*.json",
+      enabled: true,
+    }),
     "",
   ].join("\n"),
 );
@@ -355,10 +390,10 @@ const qOutBefore = db.search("outsideMarker");
 check("outside-root file is absent before scan", qOutBefore.rows.length === 0);
 
 const scanR = await internals.scanSources(false);
-check("scanSources only scans allow-listed roots", scanR.files === 2 && scanR.scanned === 2 && scanR.sources === 2);
+check("scanSources only scans allow-listed roots", scanR.files === 3 && scanR.scanned === 3 && scanR.sources === 3);
 
 const st4 = db.stats();
-check("allow-list scan adds pi + opencode sources", st4.sources === 3 && st4.blocks === 7);
+check("allow-list scan adds pi + opencode + bili sources", st4.sources === 4 && st4.blocks === 8);
 
 const qWhite = db.search("whiteMarker");
 check(
@@ -382,6 +417,23 @@ check(
   !qOc.rows[0].summary.includes("dcp-message-id") && qOc.rows[0].summary.includes("opencodeMarker"),
 );
 check("source label formatting includes kind", internals.formatResults(qOc).includes("[opencode]"));
+
+const qBili = db.search("biliMarker");
+check(
+  "bili-session proxy block is ingested via adapter",
+  qBili.rows.length === 1 &&
+    qBili.rows[0].kind === "bili" &&
+    qBili.rows[0].project === "example.test" &&
+    qBili.rows[0].blockId === "b1" &&
+    qBili.rows[0].refStart === "m00001" &&
+    qBili.rows[0].refEnd === "m00002" &&
+    qBili.rows[0].tier === 1,
+);
+check(
+  "bili blocks are stored as not expandable (no msg ids)",
+  db.db.prepare("SELECT msg_ids FROM blocks WHERE kind = 'bili'").get().msg_ids === null,
+);
+check("source label formatting includes bili kind", internals.formatResults(qBili).includes("[bili]"));
 
 const qOutside = db.search("outsideMarker");
 check("files outside the allow-list are never ingested", qOutside.rows.length === 0);

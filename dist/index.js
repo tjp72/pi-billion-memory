@@ -479,7 +479,7 @@ function blockFilter(blockId, source) {
 function withoutPaths(text) {
   return String(text).replace(/file:\/\/\/[^\s'"]+/g, "file://<path>").replace(/(?<![\w:/\\])(?:[A-Za-z]:[\\/]|\\\\|\/\/)[^\s'"]+(?: [^\s'"]*[\\/][^\s'"]*)*/g, "<path>").replace(/(?<![\w.:/\\])~?\/(?:[^\s'":,)]*\/)*[^\s'":,)]+(?: [^\s'":,)]*\/[^\s'":,)]*)*/g, "<path>");
 }
-var SOURCE_ADAPTERS = /* @__PURE__ */ new Set(["pi-sidecar", "opencode-acp"]);
+var SOURCE_ADAPTERS = /* @__PURE__ */ new Set(["pi-sidecar", "opencode-acp", "bili-session"]);
 function sanitizeSource(raw) {
   if (!raw || typeof raw !== "object") return null;
   const id = typeof raw.id === "string" ? raw.id : null;
@@ -673,6 +673,37 @@ function normalizeOpencodeBlocks(data) {
   }
   return out;
 }
+function toInt(v) {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+  return Number.isInteger(n) ? n : null;
+}
+function biliHost(sourceFile) {
+  const base = path.basename(sourceFile, ".json");
+  const idx = base.lastIndexOf("_");
+  return idx > 0 ? base.slice(0, idx) : base || "unknown";
+}
+function normalizeBiliBlocks(data) {
+  const blocks = data?.payload?.state?.blocks;
+  if (!Array.isArray(blocks)) return null;
+  const out = [];
+  for (const b of blocks) {
+    if (!b || typeof b.blockId !== "string" && typeof b.blockId !== "number" || typeof b.summary !== "string")
+      continue;
+    out.push({
+      blockId: String(b.blockId),
+      runId: typeof b.runId === "string" ? b.runId : typeof b.runId === "number" ? String(b.runId) : null,
+      tier: toInt(b.tier),
+      topic: typeof b.topic === "string" && b.topic ? b.topic.slice(0, MAX_TOPIC_CHARS) : null,
+      summary: b.summary,
+      msgIds: null,
+      refStart: typeof b.startRef === "string" ? b.startRef : null,
+      refEnd: typeof b.endRef === "string" ? b.endRef : null,
+      compressedTokens: toInt(b.compressedTokens),
+      createdAt: toInt(b.createdAt)
+    });
+  }
+  return out;
+}
 var MemoryDb = class {
   dbPath;
   db = null;
@@ -708,7 +739,7 @@ var MemoryDb = class {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sources(
         source_file    TEXT PRIMARY KEY,      -- actual file that was parsed (sidecar or ACP state file)
-        kind           TEXT NOT NULL DEFAULT 'pi',  -- 'pi' | 'opencode'
+        kind           TEXT NOT NULL DEFAULT 'pi',  -- 'pi' | 'opencode' | 'bili'
         project        TEXT NOT NULL,         -- working dir folder name (basename(cwd))
         cwd            TEXT,
         last_mtime_ms  INTEGER DEFAULT 0,     -- source file mtime of last successful scan
@@ -838,7 +869,7 @@ var MemoryDb = class {
     }
     const mtimeMs = st.mtimeMs;
     const size = st.size;
-    const kind = meta?.kind === "opencode" ? "opencode" : "pi";
+    const kind = meta?.kind === "opencode" ? "opencode" : meta?.kind === "bili" ? "bili" : "pi";
     let cwd = typeof meta?.cwd === "string" && meta.cwd ? meta.cwd : null;
     let project = typeof meta?.project === "string" && meta.project ? meta.project : null;
     if (!force) {
@@ -865,6 +896,7 @@ var MemoryDb = class {
     if (!project) {
       if (cwd) project = path.basename(cwd);
       else if (kind === "pi") project = path.basename(path.dirname(sourceFile));
+      else if (kind === "bili") project = biliHost(sourceFile);
       else project = "unknown";
     }
     let data;
@@ -873,7 +905,7 @@ var MemoryDb = class {
     } catch (e) {
       return { ok: false, parsed: false, total: 0, inserted: 0, mtimeMs, size, error: `parse: ${e.message}` };
     }
-    const blocks = kind === "pi" ? normalizePiBlocks(data) : normalizeOpencodeBlocks(data);
+    const blocks = kind === "pi" ? normalizePiBlocks(data) : kind === "bili" ? normalizeBiliBlocks(data) : normalizeOpencodeBlocks(data);
     if (blocks === null) {
       return {
         ok: false,
@@ -1343,6 +1375,8 @@ async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) 
     } else if (source.adapter === "opencode-acp") {
       const info = opencodeMap?.get(file);
       meta = { kind: "opencode", cwd: info?.cwd ?? null, project: info?.project ?? null };
+    } else if (source.adapter === "bili-session") {
+      meta = { kind: "bili", cwd: null, project: null };
     } else {
       logLine(`unknown source adapter '${source.adapter}' for ${source.id}; skipped`);
       tally.failed++;
@@ -1377,7 +1411,7 @@ function fmtTokens(n) {
   return n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n);
 }
 function sourceLabel(row) {
-  const kind = row.kind === "opencode" ? "opencode" : "pi";
+  const kind = row.kind === "opencode" || row.kind === "bili" ? row.kind : "pi";
   let base = path.basename(row.sourceFile || "");
   if (kind === "pi" && base.endsWith(".acp.json")) base = base.slice(0, -".acp.json".length);
   return `[${kind}] ${base}`;
@@ -1385,7 +1419,7 @@ function sourceLabel(row) {
 function formatResults(res) {
   const rows = res.rows;
   if (rows.length === 0) {
-    return "No memory matches. Try: 1) shorter / more common keywords; 2) drop the project filter; 3) if a compression happened moments ago, retry later (ingestion follows scan timing). The store only contains ACP block summaries from allow-listed sources (pi billion-context-pi sidecars and opencode-acp state files).";
+    return "No memory matches. Try: 1) shorter / more common keywords; 2) drop the project filter; 3) if a compression happened moments ago, retry later (ingestion follows scan timing). The store only contains ACP block summaries from allow-listed sources (pi billion-context-pi sidecars, opencode-acp state files, and billion-context sessions).";
   }
   const modeLabel = res.mode === "like" ? " (short-query LIKE mode)" : res.mode === "mixed" ? " (mixed trigram + LIKE mode)" : " (trigram relevance sort)";
   const head = `Memory hits: ${rows.length}${modeLabel}:
@@ -1582,7 +1616,7 @@ async function factory(pi) {
   pi.registerTool({
     name: "memory_search",
     label: "Memory Search",
-    description: "Search pi's long-term memory store: block summaries produced by ACP compression from allow-listed sources (pi billion-context-pi sidecars and opencode-acp state files) across all allowed projects. Use when the user asks about past work, conclusions, decisions, technical pitfalls, code locations, project context, or content compressed earlier in this session. Query with Chinese or English keywords / phrases; results are relevance-ranked and annotated with source kind, project, file, block and time.",
+    description: "Search pi's long-term memory store: block summaries produced by ACP compression from allow-listed sources (pi billion-context-pi sidecars, opencode-acp state files, and billion-context sessions) across all allowed projects. Use when the user asks about past work, conclusions, decisions, technical pitfalls, code locations, project context, or content compressed earlier in this session. Query with Chinese or English keywords / phrases; results are relevance-ranked and annotated with source kind, project, file, block and time.",
     promptSnippet: "Search pi's accumulated memory of past sessions (ACP compression summaries across allowed sources)",
     promptGuidelines: [
       "Use memory_search when the user asks about past work, conclusions, decisions, or context from earlier sessions or from earlier in this session after compression.",
