@@ -77,6 +77,9 @@ affiliated with, endorsed by, or a fork of**
   reported separately instead of being interleaved; `related` returns blocks
   connected to an anchor by compression lineage, run, source neighbor, or shared
   terms, each with its reason labels.
+- **Exact-duplicate merge**: a memory copied across source files (fork/copy
+  artifacts) is shown once and lists its alternate sources; blocks from the same
+  source (multi-tier parent/child) are never collapsed.
 - **Lazy project resolution**: the pi session header is read only when a source
   file actually needs (re)ingestion, and only its first line is read. An
   unchanged store costs no header reads.
@@ -241,6 +244,7 @@ bili sessions (<host>_<hash>.json)┘                                 (SQLite + 
   "maxSummaryChars": 20000,
   "debug": false,
   "excludeDirs": [],
+  "excludePaths": [],
   "scanOnStartup": true,
   "expandEnabled": false,
   "expandMaxChars": 40000,
@@ -257,6 +261,9 @@ bili sessions (<host>_<hash>.json)┘                                 (SQLite + 
   restart pi to rebuild from source.
 - `debug`: verbose logging.
 - `excludeDirs`: directory names to skip inside pi-sidecar source roots.
+- `excludePaths`: case-insensitive path substrings skipped for every source,
+  matched against the path relative to the source root (e.g. `["Temp","probe"]`
+  drops test/temp run trees).
 - `scanOnStartup`: run a background allow-list scan at session start. If
   disabled, the current session is still force-scanned once and other sources
   are picked up by later scans.

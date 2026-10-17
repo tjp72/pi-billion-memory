@@ -64,6 +64,8 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
   依靠同源时间锚点推算的位置会标注，时间和顺序都没有的块单独提示而不混排；
   `related` 返回与锚点由压缩谱系、同一次压缩、源内相邻或共同词关联的块，
   并给出理由标签。
+- **重复内容合并**：被 fork/复制到不同源文件的完全相同记忆只显示一条，并列出
+  其它出处；同一源内的多层级父子块不会被合并。
 - **惰性项目解析**：只有在 sidecar 需要（重新）入库时才读取 pi session 文件的
   **第一行**（`cwd` 等 header 元数据）；未变化的库不会产生 header 读取。
 - **可选块展开**：开启 `expandEnabled` 后，`memory_expand` 可按需把某个块记录的
@@ -208,6 +210,7 @@ bili sessions (<host>_<hash>.json)┘                              (SQLite + FTS
   "maxSummaryChars": 20000,
   "debug": false,
   "excludeDirs": [],
+  "excludePaths": [],
   "scanOnStartup": true,
   "expandEnabled": false,
   "expandMaxChars": 40000,
@@ -223,6 +226,8 @@ bili sessions (<host>_<hash>.json)┘                              (SQLite + FTS
   并重启 pi 可从源文件重建；
 - `debug`：详细日志；
 - `excludeDirs`：在 pi-sidecar 源 root 内要跳过的目录名；
+- `excludePaths`：对每个源都生效的路径子串（大小写不敏感），按相对源 root 的路径
+  匹配，例如 `["Temp","probe"]` 可排除测试/临时 run 目录；
 - `scanOnStartup`：启动时是否后台全量扫描。关闭后，当前 session 仍会强制扫描
   一次，其他源由后续扫描逐步发现；
 - `expandEnabled`：是否注册可选的 `memory_expand` 工具（默认 `false`），

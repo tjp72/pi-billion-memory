@@ -69,6 +69,11 @@ const DEFAULT_CFG = {
   debug: false,
   /** Directory names to skip inside pi-sidecar source roots (e.g. encoded private project dirs) */
   excludeDirs: [],
+  /**
+   * Case-insensitive path substrings to skip for every source (e.g. test/temp run directories
+   * such as "Temp", "probe", "compare"). Matched against the path relative to the source root.
+   */
+  excludePaths: [],
   /** Background full allow-list scan on session start; disable for faster startups */
   scanOnStartup: true,
   /** JSONL allow-list of compression source roots (one JSON object per line) */
@@ -106,6 +111,15 @@ const TIMELINE_CANDIDATE_LIMIT = 500;
 const RELATED_CANDIDATE_LIMIT = 200;
 /** A gap larger than this between consecutive timed entries is rendered as a gap marker. */
 const TIMELINE_GAP_MS = 6 * 60 * 60 * 1000;
+/**
+ * Related-line scoring window. Text shorter than the minimum carries too little signal to relate
+ * on; text longer than the maximum is truncated before token extraction. Both bounds apply to the
+ * seed and to every candidate.
+ */
+const RELATED_TEXT_MIN_CHARS = 20;
+const RELATED_TEXT_MAX_CHARS = 800;
+/** Max significant tokens taken from one side of a related comparison. */
+const RELATED_MAX_TOKENS = 40;
 /** Shared column list for the timeline/related candidate queries (blocks search keeps its own). */
 const BLOCK_ROW_COLUMNS =
   "b.id, b.source_file AS sourceFile, b.kind AS kind, b.block_id AS blockId, b.run_id AS runId, b.tier, b.topic, " +
@@ -187,6 +201,8 @@ export function sanitizeCfg(over) {
   }
   if (typeof over.debug === "boolean") out.debug = over.debug;
   if (Array.isArray(over.excludeDirs)) out.excludeDirs = over.excludeDirs.filter((x) => typeof x === "string");
+  if (Array.isArray(over.excludePaths))
+    out.excludePaths = over.excludePaths.filter((x) => typeof x === "string" && x.trim() !== "").map((x) => x.trim());
   if (typeof over.scanOnStartup === "boolean") out.scanOnStartup = over.scanOnStartup;
   if (typeof over.sourcesPath === "string" && over.sourcesPath) out.sourcesPath = expandHome(over.sourcesPath);
   if (typeof over.logPath === "string" && over.logPath) out.logPath = expandHome(over.logPath);
@@ -1355,7 +1371,7 @@ export class MemoryDb {
       logLine(`search error: ${withoutPaths(e.message)} | sql=${built.sql}`);
       rows = [];
     }
-    return { mode: built.mode, rows };
+    return { mode: built.mode, rows: mergeDuplicateRows(rows) };
   }
 
   /** EXPLAIN QUERY PLAN for the same SQL as search(); used by tests to lock the LIKE plan. */
@@ -1454,7 +1470,13 @@ export class MemoryDb {
       if (as !== bs) return as - bs;
       return (a.id ?? 0) - (b.id ?? 0);
     });
-    return { mode: "timeline", rows: entries.slice(0, limit), unknown, total: rows.length, verbose };
+    return {
+      mode: "timeline",
+      rows: mergeDuplicateRows(entries).slice(0, limit),
+      unknown,
+      total: rows.length,
+      verbose,
+    };
   }
 
   /**
@@ -1477,6 +1499,9 @@ export class MemoryDb {
       seed = s.rows[0] || null;
     }
     if (!seed) return { mode: "related", rows: [], note: "seed not found" };
+    if (relatedText(seed).trim().length < RELATED_TEXT_MIN_CHARS) {
+      return { mode: "related", rows: [], note: "seed summary is too short for a reliable relation" };
+    }
     const candidates = new Map();
     const baseSql =
       `SELECT ${BLOCK_ROW_COLUMNS} FROM blocks b JOIN sources s ON s.source_file = b.source_file ` +
@@ -1491,7 +1516,7 @@ export class MemoryDb {
     } catch (e) {
       logLine(`related candidates error: ${withoutPaths(e.message)}`);
     }
-    const seedTokens = significantTokens(`${seed.topic || ""} ${seed.summary || ""}`);
+    const seedTokens = significantTokens(relatedText(seed));
     const filter = seedTokens.length ? this._buildFilter(seedTokens.slice(0, 6).join(" "), opts.project || null) : null;
     if (filter) {
       const sql = `SELECT ${BLOCK_ROW_COLUMNS} ${filter.from} WHERE b.id != ? AND ${filter.where} ORDER BY b.created_at DESC LIMIT ?`;
@@ -1503,14 +1528,16 @@ export class MemoryDb {
       }
     }
     const scored = [...candidates.values()]
+      .filter((r) => relatedText(r).trim().length >= RELATED_TEXT_MIN_CHARS)
       .map((r) => {
         const { score, reasons } = relatedScore(seed, r);
         return { ...r, score, reasons };
       })
+      .filter((r) => r.score > 0)
       .sort((a, b) => b.score - a.score || (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id - b.id);
     return {
       mode: "related",
-      rows: scored.slice(0, limit),
+      rows: mergeDuplicateRows(scored).slice(0, limit),
       seed: { blockId: seed.blockId, project: seed.project, sourceFile: seed.sourceFile },
     };
   }
@@ -1831,6 +1858,15 @@ async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) 
   let files = listing.files;
   // Auxiliary store files (content-store, fallback slots, SQLite) are not compression sources.
   files = files.filter((f) => !isAuxiliarySourceFile(f));
+  if (cfg.excludePaths.length) {
+    // Case-insensitive substring match on the path relative to the source root; a cheap way to
+    // drop whole test/temp run trees (e.g. "Temp", "probe", "compare") without a glob engine.
+    const needles = cfg.excludePaths.map((s) => s.toLowerCase());
+    files = files.filter((f) => {
+      const rel = path.relative(source.root, f).toLowerCase();
+      return !needles.some((n) => rel.includes(n));
+    });
+  }
   if (listing.errors.length) {
     // An unreadable or missing root must be visible: treating it as "0 files" hid permission
     // errors and stale allow-list paths from both the log and the failure tally.
@@ -1923,6 +1959,11 @@ function sourceLabel(row) {
   return `[${kind}] ${base}`;
 }
 
+/** Secondary-source line for a memory that was copied across source files (fork artifacts). */
+function duplicateNote(row) {
+  return row && row.alsoFrom && row.alsoFrom.length ? `Also from: ${row.alsoFrom.join(", ")}\n` : "";
+}
+
 /** Numeric suffix of a block id ("b12" -> 12, "12" -> 12), or null when there is none. */
 function blockSeqNum(blockId) {
   const m = /\d+/.exec(String(blockId ?? ""));
@@ -1940,14 +1981,58 @@ function parseDirectBlockIds(raw) {
   }
 }
 
-/** Significant tokens of a summary/topic for related-line matching (>=3 chars, deduped). */
-function significantTokens(text) {
+/** Significant tokens of a summary/topic for related-line matching (>=3 chars, deduped, capped). */
+function significantTokens(text, max = RELATED_MAX_TOKENS) {
   const out = new Set();
   const s = String(text || "");
-  for (const m of s.matchAll(/[A-Za-z0-9_]{3,}/g)) out.add(m[0].toLowerCase());
+  for (const m of s.matchAll(/[A-Za-z0-9_]{3,}/g)) {
+    out.add(m[0].toLowerCase());
+    if (out.size >= max) return [...out];
+  }
   // CJK runs stay whole; they are already distinct enough at 2+ chars.
-  for (const m of s.matchAll(/[\u4e00-\u9fff]{2,}/g)) out.add(m[0]);
+  for (const m of s.matchAll(/[\u4e00-\u9fff]{2,}/g)) {
+    out.add(m[0]);
+    if (out.size >= max) break;
+  }
   return [...out];
+}
+
+/** The bounded text used to compare two blocks for relatedness (topic + head of the summary). */
+function relatedText(row) {
+  return `${row?.topic || ""} ${row?.summary || ""}`.slice(0, RELATED_TEXT_MAX_CHARS);
+}
+
+/**
+ * Collapse exact-duplicate memories copied across source files (fork/copy artifacts) into one row
+ * that lists the alternate sources. Blocks from the same source are never merged, so multi-tier
+ * parent/child pairs survive. `rows` must already be in display order; the first row of a group is
+ * kept and the rest only contribute their source labels.
+ */
+function mergeDuplicateRows(rows) {
+  const groups = new Map();
+  const keyOf = (r) => `${r.kind}\u0000${r.topic || ""}\u0000${r.summary || ""}`;
+  for (const r of rows) {
+    const key = keyOf(r);
+    const g = groups.get(key);
+    if (g) {
+      g.sourceFiles.add(r.sourceFile);
+      g.rows.push(r);
+    } else {
+      groups.set(key, { sourceFiles: new Set([r.sourceFile]), rows: [r] });
+    }
+  }
+  const out = [];
+  for (const r of rows) {
+    const g = groups.get(keyOf(r));
+    if (g.sourceFiles.size > 1) {
+      if (g.rows[0] !== r) continue; // only the first row of a merged group survives
+      const others = [...new Set(g.rows.filter((x) => x.sourceFile !== r.sourceFile).map((x) => sourceLabel(x)))];
+      out.push({ ...r, duplicateCount: others.length, alsoFrom: others.slice(0, 8) });
+    } else {
+      out.push(r); // same-source rows (multi-tier parent/child) are never collapsed
+    }
+  }
+  return out;
 }
 
 /**
@@ -2001,9 +2086,9 @@ function relatedScore(seed, row) {
       reasons.push("neighbor");
     }
   }
-  const seedTokens = new Set(significantTokens(`${seed.topic || ""} ${seed.summary || ""}`));
+  const seedTokens = new Set(significantTokens(relatedText(seed)));
   const shared = [];
-  for (const t of significantTokens(`${row.topic || ""} ${row.summary || ""}`)) {
+  for (const t of significantTokens(relatedText(row))) {
     if (seedTokens.has(t)) shared.push(t);
   }
   if (shared.length) {
@@ -2053,7 +2138,7 @@ export function formatResults(res) {
       `[${i + 1}] project ${project} · ${tm || "time unknown"} · ${r.blockId || ""}` +
       ` · tier${r.tier ?? "?"} · ${fmtTokens(r.tokens) || "?"} tokens compressed${refs}\n` +
       `Source: ${sourceLabel(r)}\n` +
-      `${topic}${summary}`
+      `${duplicateNote(r)}${topic}${summary}`
     );
   });
   return head + parts.join("\n\n---\n\n");
@@ -2090,7 +2175,7 @@ export function formatTimeline(res) {
     return (
       `${gap}[${i + 1}] ${time}${est} · project ${r.project || "?"} · ${r.blockId || ""}` +
       ` · tier${r.tier ?? "?"}${active}\n` +
-      `Source: ${sourceLabel(r)}\n${topic}${summary}`
+      `Source: ${sourceLabel(r)}\n${duplicateNote(r)}${topic}${summary}`
     );
   });
   const scope = res.total && res.total > rows.length ? `${rows.length} of ${res.total}` : `${rows.length}`;
@@ -2118,7 +2203,7 @@ export function formatRelated(res) {
     return (
       `[${i + 1}] score ${(r.score ?? 0).toFixed(2)} · ${time} · project ${r.project || "?"} · ${r.blockId || ""}` +
       ` · tier${r.tier ?? "?"}\nWhy: ${(r.reasons || []).join(", ") || "related"}\n` +
-      `Source: ${sourceLabel(r)}\n${topic}${summary}`
+      `Source: ${sourceLabel(r)}\n${duplicateNote(r)}${topic}${summary}`
     );
   });
   return `Related blocks${seed}: ${rows.length}:\n` + parts.join("\n\n---\n\n");

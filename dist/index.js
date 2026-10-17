@@ -484,6 +484,11 @@ var DEFAULT_CFG = {
   debug: false,
   /** Directory names to skip inside pi-sidecar source roots (e.g. encoded private project dirs) */
   excludeDirs: [],
+  /**
+   * Case-insensitive path substrings to skip for every source (e.g. test/temp run directories
+   * such as "Temp", "probe", "compare"). Matched against the path relative to the source root.
+   */
+  excludePaths: [],
   /** Background full allow-list scan on session start; disable for faster startups */
   scanOnStartup: true,
   /** JSONL allow-list of compression source roots (one JSON object per line) */
@@ -514,6 +519,9 @@ var MAX_TIMELINE_LIMIT = 50;
 var TIMELINE_CANDIDATE_LIMIT = 500;
 var RELATED_CANDIDATE_LIMIT = 200;
 var TIMELINE_GAP_MS = 6 * 60 * 60 * 1e3;
+var RELATED_TEXT_MIN_CHARS = 20;
+var RELATED_TEXT_MAX_CHARS = 800;
+var RELATED_MAX_TOKENS = 40;
 var BLOCK_ROW_COLUMNS = "b.id, b.source_file AS sourceFile, b.kind AS kind, b.block_id AS blockId, b.run_id AS runId, b.tier, b.topic, b.ref_start AS refStart, b.ref_end AS refEnd, b.compressed_tokens AS tokens, b.created_at AS createdAt, b.summary, b.active AS active, b.direct_block_ids AS directBlockIds, b.duration_ms AS durationMs, b.generation AS generation, b.survived_count AS survivedCount, b.compress_call_id AS compressCallId, s.project, s.cwd";
 var LOG_MAX_BYTES = 1e6;
 var TRIGRAM_MIN_LEN = 3;
@@ -556,6 +564,8 @@ function sanitizeCfg(over) {
   }
   if (typeof over.debug === "boolean") out.debug = over.debug;
   if (Array.isArray(over.excludeDirs)) out.excludeDirs = over.excludeDirs.filter((x) => typeof x === "string");
+  if (Array.isArray(over.excludePaths))
+    out.excludePaths = over.excludePaths.filter((x) => typeof x === "string" && x.trim() !== "").map((x) => x.trim());
   if (typeof over.scanOnStartup === "boolean") out.scanOnStartup = over.scanOnStartup;
   if (typeof over.sourcesPath === "string" && over.sourcesPath) out.sourcesPath = expandHome(over.sourcesPath);
   if (typeof over.logPath === "string" && over.logPath) out.logPath = expandHome(over.logPath);
@@ -1459,7 +1469,7 @@ var MemoryDb = class {
       logLine(`search error: ${withoutPaths(e.message)} | sql=${built.sql}`);
       rows = [];
     }
-    return { mode: built.mode, rows };
+    return { mode: built.mode, rows: mergeDuplicateRows(rows) };
   }
   /** EXPLAIN QUERY PLAN for the same SQL as search(); used by tests to lock the LIKE plan. */
   explainSearch(query, opts = {}) {
@@ -1556,7 +1566,13 @@ var MemoryDb = class {
       if (as !== bs) return as - bs;
       return (a.id ?? 0) - (b.id ?? 0);
     });
-    return { mode: "timeline", rows: entries.slice(0, limit), unknown, total: rows.length, verbose };
+    return {
+      mode: "timeline",
+      rows: mergeDuplicateRows(entries).slice(0, limit),
+      unknown,
+      total: rows.length,
+      verbose
+    };
   }
   /**
    * Related-line view: score other blocks against a seed block by structural evidence first
@@ -1578,6 +1594,9 @@ var MemoryDb = class {
       seed = s.rows[0] || null;
     }
     if (!seed) return { mode: "related", rows: [], note: "seed not found" };
+    if (relatedText(seed).trim().length < RELATED_TEXT_MIN_CHARS) {
+      return { mode: "related", rows: [], note: "seed summary is too short for a reliable relation" };
+    }
     const candidates = /* @__PURE__ */ new Map();
     const baseSql = `SELECT ${BLOCK_ROW_COLUMNS} FROM blocks b JOIN sources s ON s.source_file = b.source_file WHERE b.id != ? AND ${seed.project ? "s.project = ?" : "b.source_file = ?"} ORDER BY b.created_at DESC, b.id DESC LIMIT ?`;
     try {
@@ -1586,7 +1605,7 @@ var MemoryDb = class {
     } catch (e) {
       logLine(`related candidates error: ${withoutPaths(e.message)}`);
     }
-    const seedTokens = significantTokens(`${seed.topic || ""} ${seed.summary || ""}`);
+    const seedTokens = significantTokens(relatedText(seed));
     const filter = seedTokens.length ? this._buildFilter(seedTokens.slice(0, 6).join(" "), opts.project || null) : null;
     if (filter) {
       const sql = `SELECT ${BLOCK_ROW_COLUMNS} ${filter.from} WHERE b.id != ? AND ${filter.where} ORDER BY b.created_at DESC LIMIT ?`;
@@ -1597,13 +1616,13 @@ var MemoryDb = class {
         logLine(`related token error: ${withoutPaths(e.message)}`);
       }
     }
-    const scored = [...candidates.values()].map((r) => {
+    const scored = [...candidates.values()].filter((r) => relatedText(r).trim().length >= RELATED_TEXT_MIN_CHARS).map((r) => {
       const { score, reasons } = relatedScore(seed, r);
       return { ...r, score, reasons };
-    }).sort((a, b) => b.score - a.score || (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id - b.id);
+    }).filter((r) => r.score > 0).sort((a, b) => b.score - a.score || (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id - b.id);
     return {
       mode: "related",
-      rows: scored.slice(0, limit),
+      rows: mergeDuplicateRows(scored).slice(0, limit),
       seed: { blockId: seed.blockId, project: seed.project, sourceFile: seed.sourceFile }
     };
   }
@@ -1842,6 +1861,13 @@ async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) 
   const listing = await listSourceFiles(source);
   let files = listing.files;
   files = files.filter((f) => !isAuxiliarySourceFile(f));
+  if (cfg.excludePaths.length) {
+    const needles = cfg.excludePaths.map((s) => s.toLowerCase());
+    files = files.filter((f) => {
+      const rel = path.relative(source.root, f).toLowerCase();
+      return !needles.some((n) => rel.includes(n));
+    });
+  }
   if (listing.errors.length) {
     tally.failed += listing.errors.length;
     const first = listing.errors[0];
@@ -1909,6 +1935,10 @@ function sourceLabel(row) {
   if (kind === "pi" && base.endsWith(".acp.json")) base = base.slice(0, -".acp.json".length);
   return `[${kind}] ${base}`;
 }
+function duplicateNote(row) {
+  return row && row.alsoFrom && row.alsoFrom.length ? `Also from: ${row.alsoFrom.join(", ")}
+` : "";
+}
 function blockSeqNum(blockId) {
   const m = /\d+/.exec(String(blockId ?? ""));
   return m ? parseInt(m[0], 10) : null;
@@ -1922,12 +1952,47 @@ function parseDirectBlockIds(raw) {
     return [];
   }
 }
-function significantTokens(text) {
+function significantTokens(text, max = RELATED_MAX_TOKENS) {
   const out = /* @__PURE__ */ new Set();
   const s = String(text || "");
-  for (const m of s.matchAll(/[A-Za-z0-9_]{3,}/g)) out.add(m[0].toLowerCase());
-  for (const m of s.matchAll(/[\u4e00-\u9fff]{2,}/g)) out.add(m[0]);
+  for (const m of s.matchAll(/[A-Za-z0-9_]{3,}/g)) {
+    out.add(m[0].toLowerCase());
+    if (out.size >= max) return [...out];
+  }
+  for (const m of s.matchAll(/[\u4e00-\u9fff]{2,}/g)) {
+    out.add(m[0]);
+    if (out.size >= max) break;
+  }
   return [...out];
+}
+function relatedText(row) {
+  return `${row?.topic || ""} ${row?.summary || ""}`.slice(0, RELATED_TEXT_MAX_CHARS);
+}
+function mergeDuplicateRows(rows) {
+  const groups = /* @__PURE__ */ new Map();
+  const keyOf = (r) => `${r.kind}\0${r.topic || ""}\0${r.summary || ""}`;
+  for (const r of rows) {
+    const key = keyOf(r);
+    const g = groups.get(key);
+    if (g) {
+      g.sourceFiles.add(r.sourceFile);
+      g.rows.push(r);
+    } else {
+      groups.set(key, { sourceFiles: /* @__PURE__ */ new Set([r.sourceFile]), rows: [r] });
+    }
+  }
+  const out = [];
+  for (const r of rows) {
+    const g = groups.get(keyOf(r));
+    if (g.sourceFiles.size > 1) {
+      if (g.rows[0] !== r) continue;
+      const others = [...new Set(g.rows.filter((x) => x.sourceFile !== r.sourceFile).map((x) => sourceLabel(x)))];
+      out.push({ ...r, duplicateCount: others.length, alsoFrom: others.slice(0, 8) });
+    } else {
+      out.push(r);
+    }
+  }
+  return out;
 }
 function timelineKey(row, anchorsBySource) {
   if (Number.isInteger(row.createdAt)) return { time: row.createdAt, rank: 0, estimated: false };
@@ -1972,9 +2037,9 @@ function relatedScore(seed, row) {
       reasons.push("neighbor");
     }
   }
-  const seedTokens = new Set(significantTokens(`${seed.topic || ""} ${seed.summary || ""}`));
+  const seedTokens = new Set(significantTokens(relatedText(seed)));
   const shared = [];
-  for (const t of significantTokens(`${row.topic || ""} ${row.summary || ""}`)) {
+  for (const t of significantTokens(relatedText(row))) {
     if (seedTokens.has(t)) shared.push(t);
   }
   if (shared.length) {
@@ -2007,7 +2072,7 @@ function formatResults(res) {
     summary = summary.replace(/\n{3,}/g, "\n\n").trim();
     return `[${i + 1}] project ${project} \xB7 ${tm || "time unknown"} \xB7 ${r.blockId || ""} \xB7 tier${r.tier ?? "?"} \xB7 ${fmtTokens(r.tokens) || "?"} tokens compressed${refs}
 Source: ${sourceLabel(r)}
-${topic}${summary}`;
+${duplicateNote(r)}${topic}${summary}`;
   });
   return head + parts.join("\n\n---\n\n");
 }
@@ -2033,7 +2098,7 @@ function formatTimeline(res) {
     summary = summary.replace(/\n{3,}/g, "\n\n").trim();
     return `${gap}[${i + 1}] ${time}${est} \xB7 project ${r.project || "?"} \xB7 ${r.blockId || ""} \xB7 tier${r.tier ?? "?"}${active}
 Source: ${sourceLabel(r)}
-${topic}${summary}`;
+${duplicateNote(r)}${topic}${summary}`;
   });
   const scope = res.total && res.total > rows.length ? `${rows.length} of ${res.total}` : `${rows.length}`;
   let out = `Memory timeline: ${scope} entr${rows.length === 1 ? "y" : "ies"}:
@@ -2060,7 +2125,7 @@ function formatRelated(res) {
     return `[${i + 1}] score ${(r.score ?? 0).toFixed(2)} \xB7 ${time} \xB7 project ${r.project || "?"} \xB7 ${r.blockId || ""} \xB7 tier${r.tier ?? "?"}
 Why: ${(r.reasons || []).join(", ") || "related"}
 Source: ${sourceLabel(r)}
-${topic}${summary}`;
+${duplicateNote(r)}${topic}${summary}`;
   });
   return `Related blocks${seed}: ${rows.length}:
 ` + parts.join("\n\n---\n\n");

@@ -781,6 +781,139 @@ const storedMissing = await internals.expandStoredBlock({
 });
 check("stored block expansion degrades to sessionMissing", storedMissing.sessionMissing === true);
 
+// --- Fork duplication merge + related length window ---------------------------------
+const dupSessA = path.join(tmp, "--home-dev-DupProj--", "dupA.jsonl");
+const dupSessB = path.join(tmp, "--home-dev-DupProj--", "dupB.jsonl");
+const dupSessC = path.join(tmp, "--home-dev-DupProj--", "dupC.jsonl");
+const sharedDup = {
+  runId: "rDup",
+  tier: 1,
+  topic: "dup topic",
+  summary: "dupMergeMarker shared body text",
+  compressedTokens: 5,
+  createdAt: T2,
+  startRef: "m00001",
+  endRef: "m00002",
+};
+writeSidecar(dupSessA, [
+  { ...sharedDup, blockId: "bA" },
+  {
+    blockId: "bU",
+    runId: "rA",
+    tier: 1,
+    topic: "u",
+    summary: "uniqueAMarker",
+    compressedTokens: 1,
+    createdAt: T2 + 1000,
+    startRef: "m00003",
+    endRef: "m00004",
+  },
+]);
+writeSidecar(dupSessB, [
+  { ...sharedDup, blockId: "bB" },
+  {
+    blockId: "bV",
+    runId: "rB",
+    tier: 1,
+    topic: "v",
+    summary: "uniqueBMarker",
+    compressedTokens: 1,
+    createdAt: T2 + 2000,
+    startRef: "m00005",
+    endRef: "m00006",
+  },
+]);
+writeSidecar(dupSessC, [
+  {
+    blockId: "bP",
+    runId: "rC",
+    tier: 1,
+    topic: "same-source",
+    summary: "dupSameSourceMarker identical",
+    compressedTokens: 1,
+    createdAt: T2,
+    startRef: "m00007",
+    endRef: "m00008",
+  },
+  {
+    blockId: "bQ",
+    runId: "rC",
+    tier: 2,
+    topic: "same-source",
+    summary: "dupSameSourceMarker identical",
+    compressedTokens: 1,
+    createdAt: T2 + 1,
+    startRef: "m00009",
+    endRef: "m00010",
+  },
+]);
+await db.ingestSidecarFile(dupSessA, "/home/dev/DupProj");
+await db.ingestSidecarFile(dupSessB, "/home/dev/DupProj");
+await db.ingestSidecarFile(dupSessC, "/home/dev/DupProj");
+const dupSearch = db.search("dupMergeMarker", { project: "DupProj" });
+check(
+  "identical blocks copied across sources merge into one result",
+  dupSearch.rows.length === 1 && dupSearch.rows[0].duplicateCount >= 1 && dupSearch.rows[0].alsoFrom.length >= 1,
+);
+check("the merged formatter lists the alternate source", internals.formatResults(dupSearch).includes("Also from:"));
+const sameSearch = db.search("dupSameSourceMarker", { project: "DupProj" });
+check("same-source parent/child blocks with identical text are not merged", sameSearch.rows.length === 2);
+
+const relSess = path.join(tmp, "--home-dev-RelProj--", "rel.jsonl");
+writeSidecar(relSess, [
+  {
+    blockId: "bS",
+    runId: "rSeed",
+    tier: 1,
+    topic: "relseed",
+    summary: "relatedMinMaxSeedMarker long enough body",
+    compressedTokens: 1,
+    createdAt: T2,
+    startRef: "m00001",
+    endRef: "m00002",
+  },
+  {
+    blockId: "bShort",
+    runId: "rShort",
+    tier: 1,
+    topic: "s",
+    summary: "short body",
+    compressedTokens: 1,
+    createdAt: null,
+    startRef: "m00003",
+    endRef: "m00004",
+  },
+  {
+    blockId: "bLong",
+    runId: "rLong",
+    tier: 1,
+    topic: "l",
+    summary: "z".repeat(900) + " relatedMinMaxSeedMarker",
+    compressedTokens: 1,
+    createdAt: null,
+    startRef: "m00005",
+    endRef: "m00006",
+  },
+]);
+await db.ingestSidecarFile(relSess, "/home/dev/RelProj");
+const relMinMax = db.related("", { block: "bS", project: "RelProj" });
+check(
+  "related drops candidates below the minimum length and beyond the maximum window",
+  relMinMax.rows.every((r) => r.blockId !== "bShort" && r.blockId !== "bLong"),
+);
+const relShortSeed = db.related("", { block: "bShort", project: "RelProj" });
+check(
+  "a too-short seed is refused for related",
+  relShortSeed.note === "seed summary is too short for a reliable relation",
+);
+
+// --- excludePaths config --------------------------------------------------------------
+const cfgEx = internals.sanitizeCfg({ excludePaths: ["Temp", " probe "] });
+check(
+  "sanitizeCfg trims excludePaths and drops blanks",
+  JSON.stringify(cfgEx.excludePaths) === JSON.stringify(["Temp", "probe"]),
+);
+
 // --- Durable prune: tombstones + watermark ledger ---------------------------------
 const pruneDb = new internals.MemoryDb(path.join(tmp, "prune.db"));
 const pruneSess = path.join(tmp, "--home-dev-Prune--", "prune.jsonl");
@@ -1751,6 +1884,42 @@ check(
   "an unreadable session file degrades to missing instead of failing the tool call",
   exDenied.missing === true && exDenied.messages.size === 0,
 );
+
+// --- excludePaths integration (runs last: it replaces the allow-list) ---------------
+const exPathsRoot = path.join(tmp, "exclude-root");
+const exPathsDir = path.join(exPathsRoot, "run-Temp-exclude-me");
+fs.mkdirSync(exPathsDir, { recursive: true });
+const exPathsSess = path.join(exPathsDir, "ex.jsonl");
+writeSidecar(exPathsSess, [
+  {
+    blockId: "b1",
+    runId: "r",
+    tier: 1,
+    topic: "t",
+    summary: "excludePathMarker",
+    compressedTokens: 1,
+    createdAt: T2,
+    startRef: "m00001",
+    endRef: "m00002",
+  },
+]);
+fs.writeFileSync(
+  sourcesPath,
+  JSON.stringify({
+    id: "ex",
+    adapter: "pi-sidecar",
+    root: exPathsRoot,
+    pattern: "**/*.jsonl.acp.json",
+    enabled: true,
+  }) + "\n",
+);
+internals._setConfig({ excludePaths: ["Temp"] });
+await internals.scanSources(false);
+check(
+  "excludePaths keeps matching sources out of the store",
+  internals.getDb().search("excludePathMarker").rows.length === 0,
+);
+internals._setConfig({ excludePaths: [] });
 
 // --- cleanup --------------------------------------------------------------------
 // Windows locks a database file while a handle is open, so the unlink below fails with EBUSY.

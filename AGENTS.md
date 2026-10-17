@@ -103,8 +103,10 @@ Coverage that must be preserved and extended, never removed:
 
 - **memory_search modes**: `timeline` mixes exact and estimated entries in order, marks estimated
   rows (blank time), counts and hides unplaceable rows unless `verbose`, and never displays an
-  estimated timestamp; `related` ranks lineage first and labels its reasons; the default `blocks`
-  result semantics and the pure-LIKE query plan are unchanged.
+  estimated timestamp; `related` ranks lineage first, enforces the min/max text window, drops
+  zero-evidence candidates, and labels its reasons; cross-source exact duplicates merge into one
+  result while same-source parent/child blocks do not; `excludePaths` keeps matching sources out of
+  the store; the default `blocks` result semantics and the pure-LIKE query plan are unchanged.
 
 Fixture conventions: sessions live under encoded-dir names like `--home-dev-ProjA--` with a
 matching neutral cwd (`/home/dev/ProjA` -> project `ProjA`). Keep it that way — no real paths.
@@ -185,15 +187,18 @@ The design is deliberately minimal; preserve these properties:
   with neither a timestamp nor an orderable block id is reported separately (only listed with
   `verbose`). Never fabricate or display an estimated wall-clock time. `related` scores other
   blocks against a seed by compression lineage (`direct_block_ids`), same `run_id`, source
-  neighbor, shared tokens, and project-time proximity, and must label its reasons. All modes
-  stay offline, bounded, and dependency-free.
+  neighbor, shared tokens, and project-time proximity, and must label its reasons. `related`
+  compares a bounded text window (minimum and maximum characters) and drops zero-evidence
+  candidates. All modes stay offline, bounded, and dependency-free.
 - **No silent data loss**: `prune()` (manual, via `/memory prune <days>`) is the only deletion
   mechanism; no automatic expiry. Prune is durable via tombstones, and the watermark ledger keeps
   pruned-but-unchanged sources skipped, so a rescan cannot resurrect them. Ingestion-parameter
   changes do not rewrite old rows — the documented remedy (delete `*.db*`, rescan) is the
   intended behavior.
-- **Multi-tier duplication is by design**: parent (tier 2/3) and child blocks both match; do not
-  dedupe results.
+- **Multi-tier duplication is by design, exact duplicates are not**: parent (tier 2/3) and child
+  blocks from the _same source_ both match; never collapse those. Blocks with identical
+  `topic`+`summary` coming from **different** source files (fork/copy artifacts) are merged into
+  one result that lists the alternate sources, so a copied session cannot multiply a memory.
 - **Plain JSON schema**: `memory_search` parameters are a plain JSON schema validated by a small
   runtime guard. Do not add `typebox` or another runtime schema dependency.
 - Config: `~/.pi/pi-billion-memory.json` merged over `DEFAULT_CFG`; allow-list
@@ -228,8 +233,10 @@ The design is deliberately minimal; preserve these properties:
   allow-list entry with an unknown `adapter` must be rejected where the list is read.
 - Allow-list patterns are matched against paths **relative to the source root**: `*` never crosses a
   `/`, `**` is the only segment that does, and symlinks are never followed (the list describes real
-  files). A directory that cannot be read counts as a failed source and is logged; it must not look
-  like an empty source. Any budget cap that skips files must be logged with its limit.
+  files). `excludeDirs` drops exact directory segments; `excludePaths` drops case-insensitive path
+  substrings for every adapter (e.g. test/temp run trees). A directory that cannot be read counts as
+  a failed source and is logged; it must not look like an empty source. Any budget cap that skips
+  files must be logged with its limit.
 - Scan lifecycle: `session_shutdown` closes the store and latches it closed. A scan in flight must
   stop at the next boundary (session-generation check, captured before the first `await`) and must
   never reopen the file-backed store; `getDb()` and `MemoryDb.open()` throw once the store is

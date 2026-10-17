@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional expansion (`expandEnabled`) now also works for billion-context sessions: `memory_expand`
   reads the envelope's own `payload.blockContents` (full/one manifest) instead of the host session
   log. It stays two-step, bounded, redacted and read-only.
+- Identical memories copied across source files (fork/copy artifacts) merge into a single result
+  that lists the alternate sources; blocks from the same source are never collapsed, so multi-tier
+  parent/child pairs survive.
+- `related` compares a bounded text window (minimum 20, maximum 800 characters) and drops
+  candidates with no evidence, keeping the line sparse. A new `excludePaths` config skips
+  test/temp source paths across every adapter.
 
 ### Changed
 
