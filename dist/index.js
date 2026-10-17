@@ -515,13 +515,11 @@ var MAX_DIRECT_BLOCKS = 1e3;
 var EXPAND_MANIFEST_MAX = 300;
 var DEFAULT_RESULT_LIMIT = 6;
 var MAX_RESULT_LIMIT = 20;
-var MAX_TIMELINE_LIMIT = 50;
-var TIMELINE_CANDIDATE_LIMIT = 500;
-var RELATED_CANDIDATE_LIMIT = 200;
-var TIMELINE_GAP_MS = 6 * 60 * 60 * 1e3;
+var RELATED_MAX_TOKENS = 40;
 var RELATED_TEXT_MIN_CHARS = 20;
 var RELATED_TEXT_MAX_CHARS = 800;
-var RELATED_MAX_TOKENS = 40;
+var RELATED_GENERIC_DF = 0.6;
+var RELATED_CANDIDATE_LIMIT = 200;
 var BLOCK_ROW_COLUMNS = "b.id, b.source_file AS sourceFile, b.kind AS kind, b.block_id AS blockId, b.run_id AS runId, b.tier, b.topic, b.ref_start AS refStart, b.ref_end AS refEnd, b.compressed_tokens AS tokens, b.created_at AS createdAt, b.summary, b.active AS active, b.direct_block_ids AS directBlockIds, b.duration_ms AS durationMs, b.generation AS generation, b.survived_count AS survivedCount, b.compress_call_id AS compressCallId, s.project, s.cwd";
 var LOG_MAX_BYTES = 1e6;
 var TRIGRAM_MIN_LEN = 3;
@@ -1398,6 +1396,19 @@ var MemoryDb = class {
     ).get(...params).c;
   }
   /**
+   * Read-only detail for the catalog: one stored block (topic + already-redacted summary) plus its
+   * metadata. Never reads raw session messages; that stays the opt-in `memory_expand` path.
+   * @param {string} blockId block id as shown by memory_search/timeline
+   * @param {string|null} source optional substring match on the source file name or project
+   * @returns {{found:boolean,total:number,row:object|null}} newest row and the duplicate count
+   */
+  getBlock(blockId, source = null) {
+    this.open();
+    const rows = this.findBlocks(blockId, source, 2);
+    if (!rows.length) return { found: false, total: 0, row: null };
+    return { found: true, total: this.countBlocks(blockId, source), row: rows[0] };
+  }
+  /**
    * Token-matching WHERE/FROM shared by the blocks search and the timeline/related candidate
    * queries. Returns null for an empty query (callers decide what "no filter" means).
    */
@@ -1489,19 +1500,14 @@ var MemoryDb = class {
     return this.db.prepare(`EXPLAIN QUERY PLAN ${built.sql}`).all(...built.params);
   }
   /**
-   * Timeline view: the same token filter as search(), ordered by the timeline key (exact time when
-   * present, otherwise a source-local estimate from the numeric block id) instead of relevance.
-   * `exact` marks rows that carry a real `created_at`; an estimated time is used for ordering only
-   * and never displayed. Rows with neither time nor order are counted in `unknown` and only
-   * returned when `verbose` is set.
+   * Timeline view: the complete catalog of matches, ordered by the timeline key (exact time when
+   * present, otherwise a source-local estimate from the numeric block id). `exact` marks rows with a
+   * real `created_at`; an estimated time is for ordering only and rendered as `--:--`. Rows with
+   * neither a time nor an order still appear (in the `unplaced` section). `limit` is an explicit
+   * caller cap, never a silent truncation.
    */
   timeline(query, opts = {}) {
     this.open();
-    const limit = Math.max(
-      1,
-      Math.min(MAX_TIMELINE_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT)
-    );
-    const verbose = opts.verbose === true;
     const built = this._buildFilter(query, opts.project || null);
     const from = built ? built.from : "FROM blocks b JOIN sources s ON s.source_file = b.source_file";
     let where = built ? built.where : "1=1";
@@ -1510,13 +1516,11 @@ var MemoryDb = class {
       where += " AND s.project = ?";
       params.push(opts.project);
     }
-    params.push(TIMELINE_CANDIDATE_LIMIT);
     const sql = `
       SELECT ${BLOCK_ROW_COLUMNS}, NULL AS rank
       ${from}
       WHERE ${where}
       ORDER BY b.created_at DESC, b.id DESC
-      LIMIT ?
     `;
     let rows = [];
     try {
@@ -1547,16 +1551,11 @@ var MemoryDb = class {
       hi = anchor.createdAt + windowMs;
     }
     const entries = [];
-    let unknown = 0;
     for (const r of rows) {
       if (sameSourceOnly && r.sourceFile !== sameSourceOnly) continue;
       const key = timelineKey(r, anchorsBySource);
       if (key.rank === 0 && key.time !== null && (lo !== null || hi !== null)) {
         if (lo !== null && key.time < lo || hi !== null && key.time > hi) continue;
-      }
-      if (key.rank === 2) {
-        unknown++;
-        if (!verbose) continue;
       }
       entries.push({
         ...r,
@@ -1576,13 +1575,15 @@ var MemoryDb = class {
       if (as !== bs) return as - bs;
       return (a.id ?? 0) - (b.id ?? 0);
     });
+    const merged = mergeDuplicateRows(entries);
+    const explicit = Number.isInteger(opts.limit) && opts.limit > 0 ? opts.limit : null;
+    const listed = explicit ? merged.slice(-explicit) : merged;
     return {
       mode: "timeline",
-      // Candidates are fetched newest-first; keep the most recent `limit` in ascending order.
-      rows: mergeDuplicateRows(entries).slice(-limit),
-      unknown,
+      rows: listed,
+      listed: merged.length,
       total: rows.length,
-      verbose
+      hiddenByLimit: explicit ? Math.max(0, merged.length - listed.length) : 0
     };
   }
   /**
@@ -1597,16 +1598,24 @@ var MemoryDb = class {
       Math.min(MAX_RESULT_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT)
     );
     let seed = null;
+    const queryTokens = significantTokens(query || "", 60);
+    if (queryTokens.length === 0) {
+      return { mode: "related", rows: [], note: "related needs a query: the search words anchor the relation" };
+    }
     if (opts.block) {
       const found = this.findBlocks(String(opts.block), opts.source || null, 1);
       seed = found[0] || null;
-    } else if (query) {
+    } else {
       const s = this.search(query, { project: opts.project || null, limit: 1 });
       seed = s.rows[0] || null;
     }
     if (!seed) return { mode: "related", rows: [], note: "seed not found" };
-    if (relatedText(seed).trim().length < RELATED_TEXT_MIN_CHARS) {
-      return { mode: "related", rows: [], note: "seed summary is too short for a reliable relation" };
+    const seedEvidence = evidenceSentence(seed, queryTokens);
+    if (!seedEvidence) {
+      return { mode: "related", rows: [], note: "the seed has no sentence containing the query words" };
+    }
+    if (seedEvidence.length < RELATED_TEXT_MIN_CHARS) {
+      return { mode: "related", rows: [], note: "seed evidence sentence is too short for a reliable relation" };
     }
     const candidates = /* @__PURE__ */ new Map();
     const baseSql = `SELECT ${BLOCK_ROW_COLUMNS} FROM blocks b JOIN sources s ON s.source_file = b.source_file WHERE b.id != ? AND ${seed.project ? "s.project = ?" : "b.source_file = ?"} ORDER BY b.created_at DESC, b.id DESC LIMIT ?`;
@@ -1616,8 +1625,7 @@ var MemoryDb = class {
     } catch (e) {
       logLine(`related candidates error: ${withoutPaths(e.message)}`);
     }
-    const seedTokens = significantTokens(relatedText(seed));
-    const filter = seedTokens.length ? this._buildFilter(seedTokens.slice(0, 6).join(" "), opts.project || null) : null;
+    const filter = this._buildFilter(queryTokens.slice(0, 6).join(" "), opts.project || null);
     if (filter) {
       const sql = `SELECT ${BLOCK_ROW_COLUMNS} ${filter.from} WHERE b.id != ? AND ${filter.where} ORDER BY b.created_at DESC LIMIT ?`;
       try {
@@ -1627,14 +1635,38 @@ var MemoryDb = class {
         logLine(`related token error: ${withoutPaths(e.message)}`);
       }
     }
-    const scored = [...candidates.values()].filter((r) => relatedText(r).trim().length >= RELATED_TEXT_MIN_CHARS).map((r) => {
-      const { score, reasons } = relatedScore(seed, r);
+    const withEvidence = [];
+    for (const r of candidates.values()) {
+      const evidence = evidenceSentence(r, queryTokens);
+      if (!evidence || evidence.length < RELATED_TEXT_MIN_CHARS) continue;
+      withEvidence.push({ ...r, evidence });
+    }
+    const df = /* @__PURE__ */ new Map();
+    for (const r of withEvidence) {
+      for (const t of new Set(contentTokens(r.evidence))) df.set(t, (df.get(t) || 0) + 1);
+    }
+    const N = withEvidence.length || 1;
+    const seedTokens = new Set(contentTokens(seedEvidence));
+    const scored = withEvidence.map((r) => {
+      const struct = structuralScore(seed, r);
+      let score = struct.score;
+      const reasons = [...struct.reasons];
+      const shared = [];
+      for (const t of new Set(contentTokens(r.evidence))) {
+        if (!seedTokens.has(t)) continue;
+        const freq = (df.get(t) || 0) / N;
+        if (freq > RELATED_GENERIC_DF) continue;
+        score += Math.log(1 + N / (1 + (df.get(t) || 0)));
+        shared.push(t);
+      }
+      if (shared.length) reasons.push(`same-sentence:${shared.slice(0, 4).join(",")}`);
       return { ...r, score, reasons };
-    }).filter((r) => r.score > 0).sort((a, b) => b.score - a.score || (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id - b.id);
+    }).filter((r) => r.score > 0 && r.reasons.length > 0).sort((a, b) => b.score - a.score || (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id - b.id);
     return {
       mode: "related",
       rows: mergeDuplicateRows(scored).slice(0, limit),
-      seed: { blockId: seed.blockId, project: seed.project, sourceFile: seed.sourceFile }
+      seed: { blockId: seed.blockId, project: seed.project, sourceFile: seed.sourceFile },
+      seedEvidence
     };
   }
   stats() {
@@ -1976,8 +2008,210 @@ function significantTokens(text, max = RELATED_MAX_TOKENS) {
   }
   return [...out];
 }
-function relatedText(row) {
-  return `${row?.topic || ""} ${row?.summary || ""}`.slice(0, RELATED_TEXT_MAX_CHARS);
+var STOPWORDS = /* @__PURE__ */ new Set([
+  "a",
+  "an",
+  "the",
+  "and",
+  "or",
+  "but",
+  "if",
+  "then",
+  "else",
+  "for",
+  "of",
+  "to",
+  "in",
+  "on",
+  "at",
+  "by",
+  "with",
+  "from",
+  "as",
+  "is",
+  "are",
+  "was",
+  "were",
+  "be",
+  "been",
+  "being",
+  "do",
+  "does",
+  "did",
+  "not",
+  "no",
+  "yes",
+  "it",
+  "its",
+  "this",
+  "that",
+  "these",
+  "those",
+  "you",
+  "your",
+  "we",
+  "our",
+  "they",
+  "their",
+  "he",
+  "she",
+  "his",
+  "her",
+  "him",
+  "them",
+  "us",
+  "i",
+  "me",
+  "my",
+  "so",
+  "than",
+  "too",
+  "very",
+  "can",
+  "could",
+  "should",
+  "would",
+  "will",
+  "shall",
+  "may",
+  "might",
+  "must",
+  "have",
+  "has",
+  "had",
+  "here",
+  "there",
+  "when",
+  "where",
+  "which",
+  "who",
+  "whom",
+  "what",
+  "how",
+  "why",
+  "all",
+  "any",
+  "each",
+  "some",
+  "such",
+  "into",
+  "over",
+  "under",
+  "again",
+  "more",
+  "most",
+  "other",
+  "new",
+  "via",
+  "etc",
+  "per",
+  "vs",
+  "\u7684",
+  "\u4E86",
+  "\u5728",
+  "\u548C",
+  "\u662F",
+  "\u4E0E",
+  "\u53CA",
+  "\u6216",
+  "\u5BF9",
+  "\u88AB",
+  "\u628A",
+  "\u5C31",
+  "\u90FD",
+  "\u800C",
+  "\u4E5F",
+  "\u8FD8",
+  "\u4E4B",
+  "\u5176",
+  "\u7B49",
+  "\u6211",
+  "\u4F60",
+  "\u4ED6",
+  "\u5979",
+  "\u5B83",
+  "\u4EEC",
+  "\u8FD9",
+  "\u90A3",
+  "\u6709",
+  "\u65E0",
+  "\u4E3A",
+  "\u4EE5",
+  "\u4E8E",
+  "\u4ECE",
+  "\u5230",
+  "\u4F1A",
+  "\u8981",
+  "\u4E0D",
+  "\u6CA1",
+  "\u5F88",
+  "\u66F4",
+  "\u6700",
+  "\u5E76",
+  "\u4E14",
+  "\u4F46",
+  "\u82E5",
+  "\u5219",
+  "\u5373",
+  "\u53EF",
+  "\u80FD",
+  "\u9700",
+  "\u5E94",
+  "\u8BE5",
+  "\u4E0A",
+  "\u4E0B",
+  "\u4E2D",
+  "\u5185",
+  "\u5916",
+  "\u524D",
+  "\u540E",
+  "\u65F6",
+  "\u4E2A",
+  "\u4E9B",
+  "\u79CD"
+]);
+function contentTokens(text) {
+  return significantTokens(text, 60).filter((t) => !STOPWORDS.has(t.toLowerCase()));
+}
+function splitSentences(text) {
+  return String(text || "").split(/[。！？!?.;\n]+/).map((s) => s.trim()).filter(Boolean);
+}
+function evidenceSentence(row, queryTokens) {
+  const sentences = splitSentences(`${row?.topic || ""} ${row?.summary || ""}`);
+  const hits = [];
+  for (const s of sentences) {
+    const capped = s.slice(0, RELATED_TEXT_MAX_CHARS);
+    const low = capped.toLowerCase();
+    if (queryTokens.some((t) => low.includes(t.toLowerCase()))) hits.push(capped);
+  }
+  return hits.join(" ").slice(0, RELATED_TEXT_MAX_CHARS);
+}
+function structuralScore(seed, row) {
+  const reasons = [];
+  let score = 0;
+  const seedDirect = parseDirectBlockIds(seed.directBlockIds);
+  const rowDirect = parseDirectBlockIds(row.directBlockIds);
+  if (seedDirect.includes(String(row.blockId)) || rowDirect.includes(String(seed.blockId))) {
+    score += 5;
+    reasons.push("lineage");
+  }
+  if (seed.runId && row.runId && seed.runId === row.runId) {
+    score += 2;
+    reasons.push("same-run");
+  }
+  if (seed.sourceFile === row.sourceFile) {
+    const a = blockSeqNum(seed.blockId);
+    const b = blockSeqNum(row.blockId);
+    if (a !== null && b !== null && Math.abs(a - b) <= 1) {
+      score += 1.5;
+      reasons.push("neighbor");
+    }
+  }
+  if (seed.project && row.project === seed.project) {
+    score += 0.5;
+    reasons.push("project-window");
+  }
+  return { score, reasons };
 }
 function mergeDuplicateRows(rows) {
   const groups = /* @__PURE__ */ new Map();
@@ -2027,43 +2261,6 @@ function timelineKey(row, anchorsBySource) {
   if (a) return { time: a.createdAt + (prev ? seq - a.seq : a.seq - seq), rank: 0, estimated: true };
   return { time: null, rank: 1, estimated: true };
 }
-function relatedScore(seed, row) {
-  const reasons = [];
-  let score = 0;
-  const seedDirect = parseDirectBlockIds(seed.directBlockIds);
-  const rowDirect = parseDirectBlockIds(row.directBlockIds);
-  if (seedDirect.includes(String(row.blockId)) || rowDirect.includes(String(seed.blockId))) {
-    score += 5;
-    reasons.push("lineage");
-  }
-  if (seed.runId && row.runId && seed.runId === row.runId) {
-    score += 2;
-    reasons.push("same-run");
-  }
-  if (seed.sourceFile === row.sourceFile) {
-    const a = blockSeqNum(seed.blockId);
-    const b = blockSeqNum(row.blockId);
-    if (a !== null && b !== null && Math.abs(a - b) <= 1) {
-      score += 1.5;
-      reasons.push("neighbor");
-    }
-  }
-  const seedTokens = new Set(significantTokens(relatedText(seed)));
-  const shared = [];
-  for (const t of significantTokens(relatedText(row))) {
-    if (seedTokens.has(t)) shared.push(t);
-  }
-  if (shared.length) {
-    score += shared.reduce((n, t) => n + (t.length >= 4 ? 1.5 : 1), 0);
-    reasons.push(`shared-token:${shared.slice(0, 3).join(",")}`);
-  }
-  if (seed.project && row.project === seed.project && Number.isInteger(seed.createdAt) && Number.isInteger(row.createdAt)) {
-    const days = Math.abs(seed.createdAt - row.createdAt) / 864e5;
-    score += 2 * Math.exp(-days / 7);
-    reasons.push("project-window");
-  }
-  return { score, reasons };
-}
 function formatResults(res) {
   const rows = res.rows;
   if (rows.length === 0) {
@@ -2091,35 +2288,39 @@ function formatTimeline(res) {
   const rows = res.rows || [];
   if (res.note) return `No timeline: ${res.note}.`;
   if (!rows.length) {
-    return "No timeline entries. Try: 1) a broader query; 2) another project; 3) a wider time window (from/to or windowMinutes). Entries need either a recorded timestamp or an orderable block id.";
+    return "No timeline entries. Try: 1) a broader query; 2) another project; 3) a wider time window (from/to or windowMinutes).";
   }
-  let prevTime = null;
-  const parts = rows.map((r, i) => {
-    const hasTime = r.exact === true && Number.isInteger(r.timelineTime);
-    const time = hasTime ? fmtTs(r.timelineTime) : "time missing";
-    let gap = "";
-    if (hasTime && prevTime !== null && r.timelineTime - prevTime > TIMELINE_GAP_MS) gap = "\xB7 \xB7 \xB7 gap \xB7 \xB7 \xB7\n";
-    if (hasTime) prevTime = r.timelineTime;
-    const est = !hasTime && r.orderRank === 0 ? " (order estimated)" : "";
-    const active = r.active === 0 ? " \xB7 inactive" : "";
-    const topic = r.topic ? `Topic: ${r.topic}
-` : "";
-    let summary = r.summary || "";
-    if (summary.length > PREVIEW_CHARS) summary = summary.slice(0, PREVIEW_CHARS) + "\u2026";
-    summary = summary.replace(/\n{3,}/g, "\n\n").trim();
-    return `${gap}[${i + 1}] ${time}${est} \xB7 project ${r.project || "?"} \xB7 ${r.blockId || ""} \xB7 tier${r.tier ?? "?"}${active}
-Source: ${sourceLabel(r)}
-${duplicateNote(r)}${topic}${summary}`;
-  });
-  const scope = res.total && res.total > rows.length ? `${rows.length} of ${res.total}` : `${rows.length}`;
-  let out = `Memory timeline: ${scope} entr${rows.length === 1 ? "y" : "ies"}:
-` + parts.join("\n\n---\n\n");
-  if (res.unknown > 0) {
-    out += `
-
-Unable to place: ${res.unknown} block(s) have neither a usable timestamp nor an order.` + (res.verbose ? "" : " Re-run with verbose:true to list them.");
+  const oneLine = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const line = (r, time) => `${time} \xB7 ${r.project || "?"} \xB7 ${r.blockId || "?"} \xB7 tier${r.tier ?? "?"} \xB7 ${oneLine(r.topic) || "(no topic)"}${r.duplicateCount ? ` (+${r.duplicateCount})` : ""}`;
+  const lines = [];
+  const scope = res.listed && res.listed > rows.length ? `${rows.length} of ${res.listed}` : `${rows.length}`;
+  lines.push(`Memory timeline (${scope} entr${rows.length === 1 ? "y" : "ies"}):`);
+  let currentDate = "";
+  for (const r of rows) {
+    if (r.orderRank >= 1) continue;
+    const date = Number.isInteger(r.timelineTime) ? new Date(r.timelineTime).toISOString().slice(0, 10) : "(no date)";
+    if (date !== currentDate) {
+      lines.push(`## ${date}`);
+      currentDate = date;
+    }
+    const time = r.exact && Number.isInteger(r.timelineTime) ? new Date(r.timelineTime).toISOString().slice(11, 16) : "--:--";
+    lines.push(line(r, time));
   }
-  return out;
+  const unplaced = rows.filter((r) => r.orderRank >= 1);
+  if (unplaced.length) {
+    lines.push("## unplaced (no exact time and no order)");
+    for (const r of unplaced) lines.push(line(r, "--:--"));
+  }
+  if (rows.length > 300) {
+    lines.push("");
+    lines.push(
+      `(${rows.length} entries listed in full; narrow with project/from/to to reduce the size \u2014 entries are never truncated)`
+    );
+  }
+  if (res.hiddenByLimit > 0) {
+    lines.push(`(an explicit limit hid ${res.hiddenByLimit} entries; drop the limit for the full catalog)`);
+  }
+  return lines.join("\n");
 }
 function formatRelated(res) {
   const rows = res.rows || [];
@@ -2128,18 +2329,25 @@ function formatRelated(res) {
   const seed = res.seed ? ` (seed ${res.seed.blockId}${res.seed.project ? ` in ${res.seed.project}` : ""})` : "";
   const parts = rows.map((r, i) => {
     const time = fmtTs(r.createdAt) || "time missing";
-    const topic = r.topic ? `Topic: ${r.topic}
-` : "";
-    let summary = r.summary || "";
-    if (summary.length > PREVIEW_CHARS) summary = summary.slice(0, PREVIEW_CHARS) + "\u2026";
-    summary = summary.replace(/\n{3,}/g, "\n\n").trim();
+    const evidence = String(r.evidence || "").replace(/\n{2,}/g, "\n").trim();
     return `[${i + 1}] score ${(r.score ?? 0).toFixed(2)} \xB7 ${time} \xB7 project ${r.project || "?"} \xB7 ${r.blockId || ""} \xB7 tier${r.tier ?? "?"}
 Why: ${(r.reasons || []).join(", ") || "related"}
 Source: ${sourceLabel(r)}
-${duplicateNote(r)}${topic}${summary}`;
+${duplicateNote(r)}Topic: ${r.topic || "(no topic)"}
+Evidence: ${evidence}`;
   });
   return `Related blocks${seed}: ${rows.length}:
 ` + parts.join("\n\n---\n\n");
+}
+function formatBlockDetail(row) {
+  const lines = [
+    `Block ${row.blockId}${row.tier != null ? ` (tier ${row.tier})` : ""} \xB7 project ${row.project || "unknown"}${row.createdAt ? ` \xB7 ${fmtTs(row.createdAt)}` : " \xB7 time unknown"} \xB7 ${fmtTokens(row.tokens) || "?"} tok compressed`,
+    `Source: ${sourceLabel(row)}`
+  ];
+  if (row.topic) lines.push(`Topic: ${row.topic}`);
+  lines.push("");
+  lines.push(row.summary || "(no stored summary)");
+  return lines.join("\n");
 }
 function formatExpansion(row, sessionFile, res, mode) {
   const lines = [
@@ -2201,7 +2409,7 @@ var MEMORY_SEARCH_PARAMETERS = {
     mode: {
       type: "string",
       enum: ["blocks", "timeline", "related"],
-      description: "'blocks' (default) relevance search; 'timeline' orders matches by time/order instead of relevance; 'related' finds blocks related to an anchor or query hit"
+      description: "'blocks' (default) relevance search; 'timeline' returns the complete memory catalog (one line per memory, date-grouped, never truncated); 'related' finds blocks whose sentence containing the query words is related to the seed"
     },
     block: {
       type: "string",
@@ -2217,12 +2425,22 @@ var MEMORY_SEARCH_PARAMETERS = {
       type: "number",
       description: "Timeline window around the anchor block, in minutes (requires 'block')"
     },
-    reasons: { type: "boolean", description: "Include relation reason labels for mode 'related' (always on for now)" },
-    verbose: {
-      type: "boolean",
-      description: "Timeline: also list blocks that have neither a timestamp nor an order"
-    }
+    reasons: { type: "boolean", description: "Include relation reason labels for mode 'related' (always on for now)" }
   }
+};
+var MEMORY_GET_PARAMETERS = {
+  type: "object",
+  properties: {
+    block: {
+      type: "string",
+      description: "Block id from a memory_search or timeline line, e.g. 'b2'"
+    },
+    source: {
+      type: "string",
+      description: "Optional disambiguator when the same block id exists in several sources (substring of the 'Source:' label or the project)"
+    }
+  },
+  required: ["block"]
 };
 var MEMORY_EXPAND_PARAMETERS = {
   type: "object",
@@ -2279,8 +2497,7 @@ function readMemorySearchParams(raw) {
     from: int(value.from),
     to: int(value.to),
     windowMinutes: int(value.windowMinutes),
-    reasons: value.reasons !== false,
-    verbose: value.verbose === true
+    reasons: value.reasons !== false
   };
 }
 async function factory(pi) {
@@ -2362,7 +2579,8 @@ async function factory(pi) {
     promptGuidelines: [
       "Use memory_search when the user asks about past work, conclusions, decisions, or context from earlier sessions or from earlier in this session after compression.",
       "For Chinese queries shorter than 3 characters, memory_search falls back to substring matching automatically \u2014 still pass the query as-is.",
-      "For a chronological view of a topic use mode 'timeline' (optionally with a 'block' anchor and windowMinutes); for 'what is related to this block' use mode 'related' with 'block'."
+      "Use mode 'timeline' for a chronological catalog of matches (one line per memory, full, never truncated); follow a line with memory_get to read that block's stored summary.",
+      "Use mode 'related' with a query (the search words) to find blocks whose sentence containing those words is related; pass 'block' to anchor on a specific block."
     ],
     parameters: paramsSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -2378,8 +2596,7 @@ async function factory(pi) {
             source: p.source,
             from: p.from,
             to: p.to,
-            windowMinutes: p.windowMinutes,
-            verbose: p.verbose
+            windowMinutes: p.windowMinutes
           });
           return {
             content: [{ type: "text", text: formatTimeline(res2) }],
@@ -2419,6 +2636,62 @@ async function factory(pi) {
             }
           ],
           details: { mode: "error", hits: 0, dbPath: fileBase(cfg.dbPath) }
+        };
+      }
+    }
+  });
+  pi.registerTool({
+    name: "memory_get",
+    label: "Memory Get",
+    description: "Open one memory line from a memory_search or timeline result and read its stored summary by block id. Read-only and always available: it returns the already-redacted stored topic+summary, never raw session messages (use the opt-in memory_expand for originals).",
+    promptSnippet: "Open one memory line (block id) and read its stored summary",
+    promptGuidelines: [
+      "After a timeline/catalog line, call memory_get with its block id to read the stored summary; pass 'source' when the id exists in several sources."
+    ],
+    parameters: MEMORY_GET_PARAMETERS,
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      try {
+        const value = params && typeof params === "object" ? params : {};
+        const block = typeof value.block === "string" ? value.block.trim() : "";
+        const source = typeof value.source === "string" && value.source.trim() ? value.source.trim() : null;
+        if (!block) {
+          return {
+            content: [{ type: "text", text: "memory_get: 'block' is required." }],
+            details: { mode: "error", hits: 0 }
+          };
+        }
+        const res = getDb().getBlock(block, source);
+        if (!res.found) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `memory_get: no stored block '${block}'${source ? ` matching '${source}'` : ""}.`
+              }
+            ],
+            details: { mode: "missing", hits: 0 }
+          };
+        }
+        if (res.total > 1) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `memory_get: ${res.total} blocks share the id '${block}'. Pass 'source' to pick one. Newest: ${formatBlockDetail(res.row)}`
+              }
+            ],
+            details: { mode: "ambiguous", hits: res.total }
+          };
+        }
+        return {
+          content: [{ type: "text", text: formatBlockDetail(res.row) }],
+          details: { mode: "block", hits: 1, dbPath: fileBase(cfg.dbPath) }
+        };
+      } catch (e) {
+        logLine(`memory_get error: ${withoutPaths(e.stack || e.message)}`);
+        return {
+          content: [{ type: "text", text: `memory_get failed: ${withoutPaths(e.message) || "unknown error"}` }],
+          details: { mode: "error", hits: 0 }
         };
       }
     }

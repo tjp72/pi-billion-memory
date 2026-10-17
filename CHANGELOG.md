@@ -19,19 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `direct_block_ids` (compression lineage), `duration_ms`, `generation`, `survived_count`, and
   `compress_call_id`; `sources` also records `format_version`/`producer`. A force rescan refreshes
   these fields in place without touching stored summaries.
-- `memory_search` gains a `mode`: `timeline` orders the same matches by time and order (exact times
-  shown, estimated positions marked, entries without a time or order reported separately), and
-  `related` follows compression lineage/run/source-neighbor/shared-term evidence with reason labels.
-  The default `blocks` behavior is unchanged.
+- `memory_search` gains a `mode`: `timeline` returns the complete memory catalog (one line per
+  memory — time, project, block id, tier, topic — date-grouped, never truncated, unplaced rows
+  included), and `related` compares the sentence containing the query words in each block (with
+  conservative stopwords and a data-driven IDF gate against generic-token noise) and shows that
+  evidence sentence. The default `blocks` behavior is unchanged. A new read-only `memory_get` tool
+  opens a catalog/search line and returns the stored, already-redacted summary (never raw messages).
 - Optional expansion (`expandEnabled`) now also works for billion-context sessions: `memory_expand`
   reads the envelope's own `payload.blockContents` (full/one manifest) instead of the host session
   log. It stays two-step, bounded, redacted and read-only.
 - Identical memories copied across source files (fork/copy artifacts) merge into a single result
   that lists the alternate sources; blocks from the same source are never collapsed, so multi-tier
   parent/child pairs survive.
-- `related` compares a bounded text window (minimum 20, maximum 800 characters) and drops
-  candidates with no evidence, keeping the line sparse. A new `excludePaths` config skips
-  test/temp source paths across every adapter.
+- `related` compares a bounded text window (minimum 20, maximum 800 characters) at sentence level,
+  drops candidates with no query-word sentence or no evidence, and never deletes content words;
+  generic tokens are demoted by the IDF gate. A new `excludePaths` config skips test/temp source
+  paths across every adapter.
 
 ### Changed
 

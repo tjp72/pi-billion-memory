@@ -104,13 +104,8 @@ const MAX_DIRECT_BLOCKS = 1000;
 const EXPAND_MANIFEST_MAX = 300;
 const DEFAULT_RESULT_LIMIT = 6;
 const MAX_RESULT_LIMIT = 20;
-/** Timeline result cap (higher than blocks mode because a timeline is read in order). */
-const MAX_TIMELINE_LIMIT = 50;
-/** Candidate rows fetched before ordering a timeline or scoring related blocks. */
-const TIMELINE_CANDIDATE_LIMIT = 500;
-const RELATED_CANDIDATE_LIMIT = 200;
-/** A gap larger than this between consecutive timed entries is rendered as a gap marker. */
-const TIMELINE_GAP_MS = 6 * 60 * 60 * 1000;
+/** Max significant tokens taken from one side of a related comparison. */
+const RELATED_MAX_TOKENS = 40;
 /**
  * Related-line scoring window. Text shorter than the minimum carries too little signal to relate
  * on; text longer than the maximum is truncated before token extraction. Both bounds apply to the
@@ -118,8 +113,10 @@ const TIMELINE_GAP_MS = 6 * 60 * 60 * 1000;
  */
 const RELATED_TEXT_MIN_CHARS = 20;
 const RELATED_TEXT_MAX_CHARS = 800;
-/** Max significant tokens taken from one side of a related comparison. */
-const RELATED_MAX_TOKENS = 40;
+/** A token present in more than this fraction of candidate evidence sentences is generic here. */
+const RELATED_GENERIC_DF = 0.6;
+/** Candidate rows fetched before scoring related blocks. */
+const RELATED_CANDIDATE_LIMIT = 200;
 /** Shared column list for the timeline/related candidate queries (blocks search keeps its own). */
 const BLOCK_ROW_COLUMNS =
   "b.id, b.source_file AS sourceFile, b.kind AS kind, b.block_id AS blockId, b.run_id AS runId, b.tier, b.topic, " +
@@ -1295,6 +1292,20 @@ export class MemoryDb {
   }
 
   /**
+   * Read-only detail for the catalog: one stored block (topic + already-redacted summary) plus its
+   * metadata. Never reads raw session messages; that stays the opt-in `memory_expand` path.
+   * @param {string} blockId block id as shown by memory_search/timeline
+   * @param {string|null} source optional substring match on the source file name or project
+   * @returns {{found:boolean,total:number,row:object|null}} newest row and the duplicate count
+   */
+  getBlock(blockId, source = null) {
+    this.open();
+    const rows = this.findBlocks(blockId, source, 2);
+    if (!rows.length) return { found: false, total: 0, row: null };
+    return { found: true, total: this.countBlocks(blockId, source), row: rows[0] };
+  }
+
+  /**
    * Token-matching WHERE/FROM shared by the blocks search and the timeline/related candidate
    * queries. Returns null for an empty query (callers decide what "no filter" means).
    */
@@ -1401,19 +1412,14 @@ export class MemoryDb {
   }
 
   /**
-   * Timeline view: the same token filter as search(), ordered by the timeline key (exact time when
-   * present, otherwise a source-local estimate from the numeric block id) instead of relevance.
-   * `exact` marks rows that carry a real `created_at`; an estimated time is used for ordering only
-   * and never displayed. Rows with neither time nor order are counted in `unknown` and only
-   * returned when `verbose` is set.
+   * Timeline view: the complete catalog of matches, ordered by the timeline key (exact time when
+   * present, otherwise a source-local estimate from the numeric block id). `exact` marks rows with a
+   * real `created_at`; an estimated time is for ordering only and rendered as `--:--`. Rows with
+   * neither a time nor an order still appear (in the `unplaced` section). `limit` is an explicit
+   * caller cap, never a silent truncation.
    */
   timeline(query, opts: any = {}) {
     this.open();
-    const limit = Math.max(
-      1,
-      Math.min(MAX_TIMELINE_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT),
-    );
-    const verbose = opts.verbose === true;
     const built = this._buildFilter(query, opts.project || null);
     const from = built ? built.from : "FROM blocks b JOIN sources s ON s.source_file = b.source_file";
     let where = built ? built.where : "1=1";
@@ -1422,13 +1428,11 @@ export class MemoryDb {
       where += " AND s.project = ?";
       params.push(opts.project);
     }
-    params.push(TIMELINE_CANDIDATE_LIMIT);
     const sql = `
       SELECT ${BLOCK_ROW_COLUMNS}, NULL AS rank
       ${from}
       WHERE ${where}
       ORDER BY b.created_at DESC, b.id DESC
-      LIMIT ?
     `;
     let rows = [];
     try {
@@ -1459,16 +1463,11 @@ export class MemoryDb {
       hi = anchor.createdAt + windowMs;
     }
     const entries = [];
-    let unknown = 0;
     for (const r of rows) {
       if (sameSourceOnly && r.sourceFile !== sameSourceOnly) continue;
       const key = timelineKey(r, anchorsBySource);
       if (key.rank === 0 && key.time !== null && (lo !== null || hi !== null)) {
         if ((lo !== null && key.time < lo) || (hi !== null && key.time > hi)) continue;
-      }
-      if (key.rank === 2) {
-        unknown++;
-        if (!verbose) continue;
       }
       entries.push({
         ...r,
@@ -1488,13 +1487,17 @@ export class MemoryDb {
       if (as !== bs) return as - bs;
       return (a.id ?? 0) - (b.id ?? 0);
     });
+    const merged = mergeDuplicateRows(entries);
+    // Full catalog by default: `limit` is only an explicit, caller-chosen cap (never a silent
+    // truncation), and rows are already in ascending timeline order.
+    const explicit = Number.isInteger(opts.limit) && opts.limit > 0 ? opts.limit : null;
+    const listed = explicit ? merged.slice(-explicit) : merged;
     return {
       mode: "timeline",
-      // Candidates are fetched newest-first; keep the most recent `limit` in ascending order.
-      rows: mergeDuplicateRows(entries).slice(-limit),
-      unknown,
+      rows: listed,
+      listed: merged.length,
       total: rows.length,
-      verbose,
+      hiddenByLimit: explicit ? Math.max(0, merged.length - listed.length) : 0,
     };
   }
 
@@ -1510,16 +1513,24 @@ export class MemoryDb {
       Math.min(MAX_RESULT_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT),
     );
     let seed = null;
+    const queryTokens = significantTokens(query || "", 60);
+    if (queryTokens.length === 0) {
+      return { mode: "related", rows: [], note: "related needs a query: the search words anchor the relation" };
+    }
     if (opts.block) {
       const found = this.findBlocks(String(opts.block), opts.source || null, 1);
       seed = found[0] || null;
-    } else if (query) {
+    } else {
       const s = this.search(query, { project: opts.project || null, limit: 1 });
       seed = s.rows[0] || null;
     }
     if (!seed) return { mode: "related", rows: [], note: "seed not found" };
-    if (relatedText(seed).trim().length < RELATED_TEXT_MIN_CHARS) {
-      return { mode: "related", rows: [], note: "seed summary is too short for a reliable relation" };
+    const seedEvidence = evidenceSentence(seed, queryTokens);
+    if (!seedEvidence) {
+      return { mode: "related", rows: [], note: "the seed has no sentence containing the query words" };
+    }
+    if (seedEvidence.length < RELATED_TEXT_MIN_CHARS) {
+      return { mode: "related", rows: [], note: "seed evidence sentence is too short for a reliable relation" };
     }
     const candidates = new Map();
     const baseSql =
@@ -1535,8 +1546,7 @@ export class MemoryDb {
     } catch (e) {
       logLine(`related candidates error: ${withoutPaths(e.message)}`);
     }
-    const seedTokens = significantTokens(relatedText(seed));
-    const filter = seedTokens.length ? this._buildFilter(seedTokens.slice(0, 6).join(" "), opts.project || null) : null;
+    const filter = this._buildFilter(queryTokens.slice(0, 6).join(" "), opts.project || null);
     if (filter) {
       const sql = `SELECT ${BLOCK_ROW_COLUMNS} ${filter.from} WHERE b.id != ? AND ${filter.where} ORDER BY b.created_at DESC LIMIT ?`;
       try {
@@ -1546,18 +1556,44 @@ export class MemoryDb {
         logLine(`related token error: ${withoutPaths(e.message)}`);
       }
     }
-    const scored = [...candidates.values()]
-      .filter((r) => relatedText(r).trim().length >= RELATED_TEXT_MIN_CHARS)
+    // Sentence-level evidence only: a candidate must contain a sentence with the query words.
+    const withEvidence = [];
+    for (const r of candidates.values()) {
+      const evidence = evidenceSentence(r, queryTokens);
+      if (!evidence || evidence.length < RELATED_TEXT_MIN_CHARS) continue;
+      withEvidence.push({ ...r, evidence });
+    }
+    // Data-driven generic-token suppression: a token present in most candidate evidence sentences
+    // is noise for this query and is ignored for scoring (never deleted from the shown sentence).
+    const df = new Map();
+    for (const r of withEvidence) {
+      for (const t of new Set(contentTokens(r.evidence))) df.set(t, (df.get(t) || 0) + 1);
+    }
+    const N = withEvidence.length || 1;
+    const seedTokens = new Set(contentTokens(seedEvidence));
+    const scored = withEvidence
       .map((r) => {
-        const { score, reasons } = relatedScore(seed, r);
+        const struct = structuralScore(seed, r);
+        let score = struct.score;
+        const reasons = [...struct.reasons];
+        const shared = [];
+        for (const t of new Set(contentTokens(r.evidence))) {
+          if (!seedTokens.has(t)) continue;
+          const freq = (df.get(t) || 0) / N;
+          if (freq > RELATED_GENERIC_DF) continue; // generic for this query: no evidence weight
+          score += Math.log(1 + N / (1 + (df.get(t) || 0)));
+          shared.push(t);
+        }
+        if (shared.length) reasons.push(`same-sentence:${shared.slice(0, 4).join(",")}`);
         return { ...r, score, reasons };
       })
-      .filter((r) => r.score > 0)
+      .filter((r) => r.score > 0 && r.reasons.length > 0)
       .sort((a, b) => b.score - a.score || (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id - b.id);
     return {
       mode: "related",
       rows: mergeDuplicateRows(scored).slice(0, limit),
       seed: { blockId: seed.blockId, project: seed.project, sourceFile: seed.sourceFile },
+      seedEvidence,
     };
   }
 
@@ -2001,8 +2037,8 @@ function parseDirectBlockIds(raw) {
 }
 
 /** Significant tokens of a summary/topic for related-line matching (>=3 chars, deduped, capped). */
-function significantTokens(text, max = RELATED_MAX_TOKENS) {
-  const out = new Set();
+function significantTokens(text: string, max = RELATED_MAX_TOKENS): string[] {
+  const out = new Set<string>();
   const s = String(text || "");
   for (const m of s.matchAll(/[A-Za-z0-9_]{3,}/g)) {
     out.add(m[0].toLowerCase());
@@ -2016,9 +2052,237 @@ function significantTokens(text, max = RELATED_MAX_TOKENS) {
   return [...out];
 }
 
-/** The bounded text used to compare two blocks for relatedness (topic + head of the summary). */
-function relatedText(row) {
-  return `${row?.topic || ""} ${row?.summary || ""}`.slice(0, RELATED_TEXT_MAX_CHARS);
+/**
+ * Conservative stopword set. Only function words and a few pure filler tokens are listed; real
+ * content words (even short code-ish ones like `git`, `test`, `run`) are deliberately NOT removed,
+ * because deleting those would harm actual content. Ubiquitous-for-this-query tokens are instead
+ * demoted by the data-driven DF gate, never deleted from the evidence sentence.
+ */
+const STOPWORDS = new Set([
+  "a",
+  "an",
+  "the",
+  "and",
+  "or",
+  "but",
+  "if",
+  "then",
+  "else",
+  "for",
+  "of",
+  "to",
+  "in",
+  "on",
+  "at",
+  "by",
+  "with",
+  "from",
+  "as",
+  "is",
+  "are",
+  "was",
+  "were",
+  "be",
+  "been",
+  "being",
+  "do",
+  "does",
+  "did",
+  "not",
+  "no",
+  "yes",
+  "it",
+  "its",
+  "this",
+  "that",
+  "these",
+  "those",
+  "you",
+  "your",
+  "we",
+  "our",
+  "they",
+  "their",
+  "he",
+  "she",
+  "his",
+  "her",
+  "him",
+  "them",
+  "us",
+  "i",
+  "me",
+  "my",
+  "so",
+  "than",
+  "too",
+  "very",
+  "can",
+  "could",
+  "should",
+  "would",
+  "will",
+  "shall",
+  "may",
+  "might",
+  "must",
+  "have",
+  "has",
+  "had",
+  "here",
+  "there",
+  "when",
+  "where",
+  "which",
+  "who",
+  "whom",
+  "what",
+  "how",
+  "why",
+  "all",
+  "any",
+  "each",
+  "some",
+  "such",
+  "into",
+  "over",
+  "under",
+  "again",
+  "more",
+  "most",
+  "other",
+  "new",
+  "via",
+  "etc",
+  "per",
+  "vs",
+  "的",
+  "了",
+  "在",
+  "和",
+  "是",
+  "与",
+  "及",
+  "或",
+  "对",
+  "被",
+  "把",
+  "就",
+  "都",
+  "而",
+  "也",
+  "还",
+  "之",
+  "其",
+  "等",
+  "我",
+  "你",
+  "他",
+  "她",
+  "它",
+  "们",
+  "这",
+  "那",
+  "有",
+  "无",
+  "为",
+  "以",
+  "于",
+  "从",
+  "到",
+  "会",
+  "要",
+  "不",
+  "没",
+  "很",
+  "更",
+  "最",
+  "并",
+  "且",
+  "但",
+  "若",
+  "则",
+  "即",
+  "可",
+  "能",
+  "需",
+  "应",
+  "该",
+  "上",
+  "下",
+  "中",
+  "内",
+  "外",
+  "前",
+  "后",
+  "时",
+  "个",
+  "些",
+  "种",
+]);
+
+/** Tokens used for related evidence: significant tokens minus stopwords. */
+function contentTokens(text) {
+  return significantTokens(text, 60).filter((t) => !STOPWORDS.has(t.toLowerCase()));
+}
+
+/** Split text into sentences on ASCII/CJK sentence punctuation and newlines. */
+function splitSentences(text) {
+  return String(text || "")
+    .split(/[。！？!?.;\n]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * The evidence sentence(s) of a block: sentences containing at least one query word. This is the
+ * unit of relatedness — "the sentence with the LLM search term", not the whole summary or a bag of
+ * words. Returns "" when no sentence carries a query word; the result is capped to the max window.
+ */
+function evidenceSentence(row, queryTokens) {
+  const sentences = splitSentences(`${row?.topic || ""} ${row?.summary || ""}`);
+  const hits = [];
+  for (const s of sentences) {
+    // Cap first, then match: a query word buried past the window must not count (the far tail is
+    // not shown as evidence anyway).
+    const capped = s.slice(0, RELATED_TEXT_MAX_CHARS);
+    const low = capped.toLowerCase();
+    if (queryTokens.some((t) => low.includes(t.toLowerCase()))) hits.push(capped);
+  }
+  return hits.join(" ").slice(0, RELATED_TEXT_MAX_CHARS);
+}
+
+/**
+ * Structural (query-independent) evidence between a seed and a candidate: compression lineage,
+ * same run, source neighbor, and a weak same-project time prior. Content evidence is scored
+ * separately at sentence level.
+ */
+function structuralScore(seed, row) {
+  const reasons = [];
+  let score = 0;
+  const seedDirect = parseDirectBlockIds(seed.directBlockIds);
+  const rowDirect = parseDirectBlockIds(row.directBlockIds);
+  if (seedDirect.includes(String(row.blockId)) || rowDirect.includes(String(seed.blockId))) {
+    score += 5;
+    reasons.push("lineage");
+  }
+  if (seed.runId && row.runId && seed.runId === row.runId) {
+    score += 2;
+    reasons.push("same-run");
+  }
+  if (seed.sourceFile === row.sourceFile) {
+    const a = blockSeqNum(seed.blockId);
+    const b = blockSeqNum(row.blockId);
+    if (a !== null && b !== null && Math.abs(a - b) <= 1) {
+      score += 1.5;
+      reasons.push("neighbor");
+    }
+  }
+  if (seed.project && row.project === seed.project) {
+    score += 0.5;
+    reasons.push("project-window");
+  }
+  return { score, reasons };
 }
 
 /**
@@ -2083,50 +2347,6 @@ function timelineKey(row, anchorsBySource) {
   return { time: null, rank: 1, estimated: true };
 }
 
-/** Deterministic evidence-based score for the related-line view. */
-function relatedScore(seed, row) {
-  const reasons = [];
-  let score = 0;
-  const seedDirect = parseDirectBlockIds(seed.directBlockIds);
-  const rowDirect = parseDirectBlockIds(row.directBlockIds);
-  if (seedDirect.includes(String(row.blockId)) || rowDirect.includes(String(seed.blockId))) {
-    score += 5;
-    reasons.push("lineage");
-  }
-  if (seed.runId && row.runId && seed.runId === row.runId) {
-    score += 2;
-    reasons.push("same-run");
-  }
-  if (seed.sourceFile === row.sourceFile) {
-    const a = blockSeqNum(seed.blockId);
-    const b = blockSeqNum(row.blockId);
-    if (a !== null && b !== null && Math.abs(a - b) <= 1) {
-      score += 1.5;
-      reasons.push("neighbor");
-    }
-  }
-  const seedTokens = new Set(significantTokens(relatedText(seed)));
-  const shared = [];
-  for (const t of significantTokens(relatedText(row))) {
-    if (seedTokens.has(t)) shared.push(t);
-  }
-  if (shared.length) {
-    score += shared.reduce((n, t) => n + (t.length >= 4 ? 1.5 : 1), 0);
-    reasons.push(`shared-token:${shared.slice(0, 3).join(",")}`);
-  }
-  if (
-    seed.project &&
-    row.project === seed.project &&
-    Number.isInteger(seed.createdAt) &&
-    Number.isInteger(row.createdAt)
-  ) {
-    const days = Math.abs(seed.createdAt - row.createdAt) / 86400000;
-    score += 2 * Math.exp(-days / 7);
-    reasons.push("project-window");
-  }
-  return { score, reasons };
-}
-
 /** @internal */
 export function formatResults(res) {
   const rows = res.rows;
@@ -2164,9 +2384,9 @@ export function formatResults(res) {
 }
 
 /**
- * Render a timeline. Entries without an exact timestamp show `time missing`; their position comes
- * from the source-local order estimate. Rows that could be neither timed nor ordered are reported
- * as a trailing count (and only listed when `verbose` was requested).
+ * Render the memory catalog: one line per memory, date-grouped, never truncated. This is the
+ * timeline body itself (an index / table of contents); a block's summary is fetched separately
+ * with `memory_get`.
  * @internal
  */
 export function formatTimeline(res) {
@@ -2175,39 +2395,49 @@ export function formatTimeline(res) {
   if (!rows.length) {
     return (
       "No timeline entries. Try: 1) a broader query; 2) another project; 3) a wider time window " +
-      "(from/to or windowMinutes). Entries need either a recorded timestamp or an orderable block id."
+      "(from/to or windowMinutes)."
     );
   }
-  let prevTime = null;
-  const parts = rows.map((r, i) => {
-    const hasTime = r.exact === true && Number.isInteger(r.timelineTime);
-    const time = hasTime ? fmtTs(r.timelineTime) : "time missing";
-    let gap = "";
-    if (hasTime && prevTime !== null && r.timelineTime - prevTime > TIMELINE_GAP_MS) gap = "· · · gap · · ·\n";
-    if (hasTime) prevTime = r.timelineTime;
-    const est = !hasTime && r.orderRank === 0 ? " (order estimated)" : "";
-    const active = r.active === 0 ? " · inactive" : "";
-    const topic = r.topic ? `Topic: ${r.topic}\n` : "";
-    let summary = r.summary || "";
-    if (summary.length > PREVIEW_CHARS) summary = summary.slice(0, PREVIEW_CHARS) + "…";
-    summary = summary.replace(/\n{3,}/g, "\n\n").trim();
-    return (
-      `${gap}[${i + 1}] ${time}${est} · project ${r.project || "?"} · ${r.blockId || ""}` +
-      ` · tier${r.tier ?? "?"}${active}\n` +
-      `Source: ${sourceLabel(r)}\n${duplicateNote(r)}${topic}${summary}`
-    );
-  });
-  const scope = res.total && res.total > rows.length ? `${rows.length} of ${res.total}` : `${rows.length}`;
-  let out = `Memory timeline: ${scope} entr${rows.length === 1 ? "y" : "ies"}:\n` + parts.join("\n\n---\n\n");
-  if (res.unknown > 0) {
-    out +=
-      `\n\nUnable to place: ${res.unknown} block(s) have neither a usable timestamp nor an order.` +
-      (res.verbose ? "" : " Re-run with verbose:true to list them.");
+  const oneLine = (s) =>
+    String(s || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  const line = (r, time) =>
+    `${time} · ${r.project || "?"} · ${r.blockId || "?"} · tier${r.tier ?? "?"} · ${oneLine(r.topic) || "(no topic)"}` +
+    `${r.duplicateCount ? ` (+${r.duplicateCount})` : ""}`;
+  const lines = [];
+  const scope = res.listed && res.listed > rows.length ? `${rows.length} of ${res.listed}` : `${rows.length}`;
+  lines.push(`Memory timeline (${scope} entr${rows.length === 1 ? "y" : "ies"}):`);
+  let currentDate = "";
+  for (const r of rows) {
+    if (r.orderRank >= 1) continue; // listed in the unplaced section below
+    const date = Number.isInteger(r.timelineTime) ? new Date(r.timelineTime).toISOString().slice(0, 10) : "(no date)";
+    if (date !== currentDate) {
+      lines.push(`## ${date}`);
+      currentDate = date;
+    }
+    const time =
+      r.exact && Number.isInteger(r.timelineTime) ? new Date(r.timelineTime).toISOString().slice(11, 16) : "--:--";
+    lines.push(line(r, time));
   }
-  return out;
+  const unplaced = rows.filter((r) => r.orderRank >= 1);
+  if (unplaced.length) {
+    lines.push("## unplaced (no exact time and no order)");
+    for (const r of unplaced) lines.push(line(r, "--:--"));
+  }
+  if (rows.length > 300) {
+    lines.push("");
+    lines.push(
+      `(${rows.length} entries listed in full; narrow with project/from/to to reduce the size — entries are never truncated)`,
+    );
+  }
+  if (res.hiddenByLimit > 0) {
+    lines.push(`(an explicit limit hid ${res.hiddenByLimit} entries; drop the limit for the full catalog)`);
+  }
+  return lines.join("\n");
 }
 
-/** Render related-line results with their reason labels. @internal */
+/** Render related-line results with their evidence sentence and reason labels. @internal */
 export function formatRelated(res) {
   const rows = res.rows || [];
   if (res.note) return `No related blocks: ${res.note}.`;
@@ -2215,17 +2445,30 @@ export function formatRelated(res) {
   const seed = res.seed ? ` (seed ${res.seed.blockId}${res.seed.project ? ` in ${res.seed.project}` : ""})` : "";
   const parts = rows.map((r, i) => {
     const time = fmtTs(r.createdAt) || "time missing";
-    const topic = r.topic ? `Topic: ${r.topic}\n` : "";
-    let summary = r.summary || "";
-    if (summary.length > PREVIEW_CHARS) summary = summary.slice(0, PREVIEW_CHARS) + "…";
-    summary = summary.replace(/\n{3,}/g, "\n\n").trim();
+    const evidence = String(r.evidence || "")
+      .replace(/\n{2,}/g, "\n")
+      .trim();
     return (
       `[${i + 1}] score ${(r.score ?? 0).toFixed(2)} · ${time} · project ${r.project || "?"} · ${r.blockId || ""}` +
       ` · tier${r.tier ?? "?"}\nWhy: ${(r.reasons || []).join(", ") || "related"}\n` +
-      `Source: ${sourceLabel(r)}\n${duplicateNote(r)}${topic}${summary}`
+      `Source: ${sourceLabel(r)}\n${duplicateNote(r)}Topic: ${r.topic || "(no topic)"}\nEvidence: ${evidence}`
     );
   });
   return `Related blocks${seed}: ${rows.length}:\n` + parts.join("\n\n---\n\n");
+}
+
+/** Render one stored block for `memory_get` (summary only; no raw session text). @internal */
+export function formatBlockDetail(row) {
+  const lines = [
+    `Block ${row.blockId}${row.tier != null ? ` (tier ${row.tier})` : ""} · project ${row.project || "unknown"}` +
+      `${row.createdAt ? ` · ${fmtTs(row.createdAt)}` : " · time unknown"}` +
+      ` · ${fmtTokens(row.tokens) || "?"} tok compressed`,
+    `Source: ${sourceLabel(row)}`,
+  ];
+  if (row.topic) lines.push(`Topic: ${row.topic}`);
+  lines.push("");
+  lines.push(row.summary || "(no stored summary)");
+  return lines.join("\n");
 }
 function formatExpansion(row, sessionFile, res, mode) {
   const lines = [
@@ -2305,7 +2548,7 @@ const MEMORY_SEARCH_PARAMETERS = {
       type: "string",
       enum: ["blocks", "timeline", "related"],
       description:
-        "'blocks' (default) relevance search; 'timeline' orders matches by time/order instead of relevance; 'related' finds blocks related to an anchor or query hit",
+        "'blocks' (default) relevance search; 'timeline' returns the complete memory catalog (one line per memory, date-grouped, never truncated); 'related' finds blocks whose sentence containing the query words is related to the seed",
     },
     block: {
       type: "string",
@@ -2322,10 +2565,6 @@ const MEMORY_SEARCH_PARAMETERS = {
       description: "Timeline window around the anchor block, in minutes (requires 'block')",
     },
     reasons: { type: "boolean", description: "Include relation reason labels for mode 'related' (always on for now)" },
-    verbose: {
-      type: "boolean",
-      description: "Timeline: also list blocks that have neither a timestamp nor an order",
-    },
   },
 } as const;
 
@@ -2340,8 +2579,23 @@ interface MemorySearchParams {
   to: number | null;
   windowMinutes: number | null;
   reasons: boolean;
-  verbose: boolean;
 }
+
+const MEMORY_GET_PARAMETERS = {
+  type: "object",
+  properties: {
+    block: {
+      type: "string",
+      description: "Block id from a memory_search or timeline line, e.g. 'b2'",
+    },
+    source: {
+      type: "string",
+      description:
+        "Optional disambiguator when the same block id exists in several sources (substring of the 'Source:' label or the project)",
+    },
+  },
+  required: ["block"],
+} as const;
 
 const MEMORY_EXPAND_PARAMETERS = {
   type: "object",
@@ -2417,7 +2671,6 @@ function readMemorySearchParams(raw: unknown): MemorySearchParams {
     to: int(value.to),
     windowMinutes: int(value.windowMinutes),
     reasons: value.reasons !== false,
-    verbose: value.verbose === true,
   };
 }
 
@@ -2533,7 +2786,8 @@ export default async function factory(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use memory_search when the user asks about past work, conclusions, decisions, or context from earlier sessions or from earlier in this session after compression.",
       "For Chinese queries shorter than 3 characters, memory_search falls back to substring matching automatically — still pass the query as-is.",
-      "For a chronological view of a topic use mode 'timeline' (optionally with a 'block' anchor and windowMinutes); for 'what is related to this block' use mode 'related' with 'block'.",
+      "Use mode 'timeline' for a chronological catalog of matches (one line per memory, full, never truncated); follow a line with memory_get to read that block's stored summary.",
+      "Use mode 'related' with a query (the search words) to find blocks whose sentence containing those words is related; pass 'block' to anchor on a specific block.",
     ],
     parameters: paramsSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -2551,7 +2805,6 @@ export default async function factory(pi: ExtensionAPI) {
             from: p.from,
             to: p.to,
             windowMinutes: p.windowMinutes,
-            verbose: p.verbose,
           });
           return {
             content: [{ type: "text", text: formatTimeline(res) }],
@@ -2591,6 +2844,68 @@ export default async function factory(pi: ExtensionAPI) {
             },
           ],
           details: { mode: "error", hits: 0, dbPath: fileBase(cfg.dbPath) },
+        };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_get",
+    label: "Memory Get",
+    description:
+      "Open one memory line from a memory_search or timeline result and read its stored summary by " +
+      "block id. Read-only and always available: it returns the already-redacted stored topic+summary, " +
+      "never raw session messages (use the opt-in memory_expand for originals).",
+    promptSnippet: "Open one memory line (block id) and read its stored summary",
+    promptGuidelines: [
+      "After a timeline/catalog line, call memory_get with its block id to read the stored summary; pass 'source' when the id exists in several sources.",
+    ],
+    parameters: MEMORY_GET_PARAMETERS,
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      try {
+        const value = params && typeof params === "object" ? (params as Record<string, unknown>) : {};
+        const block = typeof value.block === "string" ? value.block.trim() : "";
+        const source = typeof value.source === "string" && value.source.trim() ? value.source.trim() : null;
+        if (!block) {
+          return {
+            content: [{ type: "text", text: "memory_get: 'block' is required." }],
+            details: { mode: "error", hits: 0 },
+          };
+        }
+        const res = getDb().getBlock(block, source);
+        if (!res.found) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `memory_get: no stored block '${block}'${source ? ` matching '${source}'` : ""}.`,
+              },
+            ],
+            details: { mode: "missing", hits: 0 },
+          };
+        }
+        if (res.total > 1) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `memory_get: ${res.total} blocks share the id '${block}'. Pass 'source' to pick one. ` +
+                  `Newest: ${formatBlockDetail(res.row)}`,
+              },
+            ],
+            details: { mode: "ambiguous", hits: res.total },
+          };
+        }
+        return {
+          content: [{ type: "text", text: formatBlockDetail(res.row) }],
+          details: { mode: "block", hits: 1, dbPath: fileBase(cfg.dbPath) },
+        };
+      } catch (e) {
+        logLine(`memory_get error: ${withoutPaths(e.stack || e.message)}`);
+        return {
+          content: [{ type: "text", text: `memory_get failed: ${withoutPaths(e.message) || "unknown error"}` }],
+          details: { mode: "error", hits: 0 },
         };
       }
     },

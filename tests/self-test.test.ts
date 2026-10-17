@@ -628,30 +628,49 @@ check("timeline fixture ingests", tlIng.ok && tlIng.inserted === 4);
 
 const tl = db.timeline("timeLineMarker", { project: "Timeline" });
 check(
-  "timeline mixes exact and estimated entries in order",
-  tl.rows.length === 3 && tl.rows[0].blockId === "b10" && tl.rows[1].blockId === "b11" && tl.rows[2].blockId === "b12",
+  "timeline lists every match (orderable first, unplaceable last)",
+  tl.rows.length === 4 &&
+    tl.rows[0].blockId === "b10" &&
+    tl.rows[1].blockId === "b11" &&
+    tl.rows[2].blockId === "b12" &&
+    tl.rows[3].blockId === "bX",
 );
 check(
   "timeline marks the untimed entry as estimated (no exact time)",
   tl.rows[2].exact === false && tl.rows[2].estimated === true,
 );
+const tlText = internals.formatTimeline(tl);
 check(
-  "timeline reports the unplaceable block and hides it by default",
-  tl.unknown === 1 && !internals.formatTimeline(tl).includes("timeLineMarker omega"),
+  "the catalog is one line per memory and never hides an unplaceable block",
+  tlText.includes("## unplaced") && tlText.includes("· bX ·") && !tlText.includes("timeLineMarker beta"),
 );
-const tlVerbose = db.timeline("timeLineMarker", { project: "Timeline", verbose: true });
 check(
-  "verbose timeline appends the unplaceable block last",
-  tlVerbose.rows.length === 4 && tlVerbose.rows[3].blockId === "bX",
+  "the catalog shows one line per entry with the block id and topic",
+  tlText.split("\n").filter((l) => /^\d\d:\d\d · /.test(l)).length === 2 &&
+    tlText.split("\n").filter((l) => l.startsWith("--:-- · ")).length === 2,
 );
-check("timeline formatter labels the missing time", internals.formatTimeline(tl).includes("time missing"));
+check(
+  "an explicit limit is reported instead of silently truncating",
+  db.timeline("timeLineMarker", { project: "Timeline", limit: 2 }).hiddenByLimit === 2,
+);
 
-const rel = db.related("", { block: "b10", project: "Timeline" });
+const rel = db.related("timeLineMarker", { block: "b10", project: "Timeline" });
 check(
   "related ranks the lineage child first and reports the reason",
   rel.rows.length >= 1 && rel.rows[0].blockId === "b11" && rel.rows[0].reasons.includes("lineage"),
 );
-check("related formatter renders the reason line", internals.formatRelated(rel).includes("Why:"));
+check(
+  "related shows the evidence sentence rather than the whole summary",
+  typeof rel.rows[0].evidence === "string" && rel.rows[0].evidence.includes("timeLineMarker"),
+);
+check(
+  "related formatter renders the reason and evidence lines",
+  internals.formatRelated(rel).includes("Why:") && internals.formatRelated(rel).includes("Evidence:"),
+);
+check(
+  "related without a query is refused (relevance is anchored by the search words)",
+  db.related("", { block: "b10" }).note.includes("needs a query"),
+);
 
 // --- JSONL read reduction: allow-list hints + streaming early exit ------------------
 const hint = internals.sanitizeSource({
@@ -896,16 +915,29 @@ writeSidecar(relSess, [
   },
 ]);
 await db.ingestSidecarFile(relSess, "/home/dev/RelProj");
-const relMinMax = db.related("", { block: "bS", project: "RelProj" });
+const relMinMax = db.related("relatedMinMaxSeedMarker", { block: "bS", project: "RelProj" });
 check(
   "related drops candidates below the minimum length and beyond the maximum window",
   relMinMax.rows.every((r) => r.blockId !== "bShort" && r.blockId !== "bLong"),
 );
-const relShortSeed = db.related("", { block: "bShort", project: "RelProj" });
+const relShortSeed = db.related("short", { block: "bShort", project: "RelProj" });
 check(
-  "a too-short seed is refused for related",
-  relShortSeed.note === "seed summary is too short for a reliable relation",
+  "a too-short seed evidence is refused for related",
+  relShortSeed.note === "seed evidence sentence is too short for a reliable relation",
 );
+
+// --- memory_get: read one stored summary (no raw messages) ---------------------------
+const got = db.getBlock("bS", "RelProj");
+check(
+  "memory_get returns the stored summary, not raw session text",
+  got.found && got.total === 1 && got.row.summary.includes("relatedMinMaxSeedMarker"),
+);
+const gotText = internals.formatBlockDetail(got.row);
+check(
+  "memory_get formatter renders the block header and summary",
+  gotText.includes("Block bS") && gotText.includes("relatedMinMaxSeedMarker"),
+);
+check("memory_get reports a missing block", db.getBlock("nope", null).found === false);
 
 // --- platform-neutral basename in model output --------------------------------------
 const winRow = {

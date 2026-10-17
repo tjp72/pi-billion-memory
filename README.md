@@ -71,12 +71,15 @@ affiliated with, endorsed by, or a fork of**
   AND-ed `LIKE` against `summary OR topic` for shorter queries; a mixed mode
   combines both. No LLM translation or keyword generation.
 - **Memory-line modes**: `memory_search` takes a `mode`. `blocks` (default)
-  ranks by relevance; `timeline` keeps the same match filter but orders by time
-  and order — exact times are shown, positions estimated from a source's timed
-  anchors are marked, and blocks with neither a timestamp nor an order are
-  reported separately instead of being interleaved; `related` returns blocks
-  connected to an anchor by compression lineage, run, source neighbor, or shared
-  terms, each with its reason labels.
+  ranks by relevance; `timeline` returns the **complete catalog** (one line per
+  memory: time, project, block id, tier, topic — date-grouped, never truncated);
+  `related` compares the **sentence containing the query words** in each block
+  (stopwords and data-driven IDF suppress generic-token noise; compression
+  lineage/run/neighbor are structural evidence) and shows that evidence
+  sentence. Follow a catalog line with `memory_get` to read the stored summary.
+- **Read one memory**: `memory_get` opens a catalog/search line by block id and
+  returns the stored (already-redacted) topic + summary; it never reads raw
+  session messages.
 - **Exact-duplicate merge**: a memory copied across source files (fork/copy
   artifacts) is shown once and lists its alternate sources; blocks from the same
   source (multi-tier parent/child) are never collapsed.

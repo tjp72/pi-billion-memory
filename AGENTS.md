@@ -101,22 +101,23 @@ Coverage that must be preserved and extended, never removed:
   pointers the sidecar no longer lists; the 0.4.x -> 0.5.0 migration adds `msg_ids` and resets the
   watermark ledger exactly once, including for a source row that had no ledger row yet;
 
-- **memory_search modes**: `timeline` mixes exact and estimated entries in order, marks estimated
-  rows (blank time), counts and hides unplaceable rows unless `verbose`, and never displays an
-  estimated timestamp; `related` ranks lineage first, enforces the min/max text window, drops
-  zero-evidence candidates, and labels its reasons; cross-source exact duplicates merge into one
-  result while same-source parent/child blocks do not; `excludePaths` keeps matching sources out of
-  the store; the default `blocks` result semantics and the pure-LIKE query plan are unchanged.
+- **memory_search modes**: `timeline` lists every match (orderable first, unplaced last), one line
+  per memory with no summary text, reports an explicit `limit` instead of silently truncating, and
+  never hides an unplaceable row; `related` refuses a missing query, uses sentence-level evidence,
+  rejects below-minimum/over-window evidence, and keeps the pure-LIKE query plan unchanged;
+  cross-source exact duplicates merge into one result while same-source parent/child blocks do not;
+  `excludePaths` keeps matching sources out of the store.
+- **memory_get**: returns a stored summary and reports a missing/ambiguous block.
 
 Fixture conventions: sessions live under encoded-dir names like `--home-dev-ProjA--` with a
 matching neutral cwd (`/home/dev/ProjA` -> project `ProjA`). Keep it that way — no real paths.
 Additional gates:
 
 - `npm run e2e` loads the built `dist/index.js`, asserts the default export is a function,
-  checks that the factory registers the three session events, `memory_search`, and `/memory` —
-  and that it does **not** register `memory_expand` under the default config — then re-imports the
-  bundle with `expandEnabled: true` to prove the expansion tool appears only when opted in, and
-  opens the SQLite store through `node:sqlite` in an isolated temporary home.
+  checks that the factory registers the three session events, `memory_search`, `memory_get`, and
+  `/memory` — and that it does **not** register `memory_expand` under the default config — then
+  re-imports the bundle with `expandEnabled: true` to prove the expansion tool appears only when
+  opted in, and opens the SQLite store through `node:sqlite` in an isolated temporary home.
 - `npm run verify:dist` rebuilds and fails if the committed `dist/` differs from a fresh build.
   `dist/` is committed because pi's git installer runs `npm install --omit=dev` and never runs a
   build (see §4).
@@ -182,14 +183,16 @@ The design is deliberately minimal; preserve these properties:
   satisfy the ordering); never route queries through an LLM for translation or keyword
   generation.
 - **memory_search modes**: `blocks` (default) keeps the existing relevance semantics. `timeline`
-  reuses the same match filter but orders by a timeline key: an exact `created_at` is shown, an
-  entry without one is placed by its source's timed anchors and marked estimated, and an entry
-  with neither a timestamp nor an orderable block id is reported separately (only listed with
-  `verbose`). Never fabricate or display an estimated wall-clock time. `related` scores other
-  blocks against a seed by compression lineage (`direct_block_ids`), same `run_id`, source
-  neighbor, shared tokens, and project-time proximity, and must label its reasons. `related`
-  compares a bounded text window (minimum and maximum characters) and drops zero-evidence
-  candidates. All modes stay offline, bounded, and dependency-free.
+  returns the complete catalog: one line per memory (time, project, block id, tier, topic), date
+  grouped, never truncated, with unplaceable rows in a trailing `unplaced` section; `limit` is an
+  explicit caller cap and any hiding must be reported, never silent. Never fabricate or display an
+  estimated wall-clock time (show `--:--`). `related` needs a query and compares the sentence that
+  contains the query words (bounded min/max); it removes only function-word stopwords, demotes
+  generic tokens with a data-driven IDF gate (never deleting content words), keeps compression
+  lineage (`direct_block_ids`)/`run_id`/neighbor as structural evidence, drops zero-evidence
+  candidates, and shows the evidence sentence. All modes stay offline, bounded, and dependency-free.
+- **memory_get**: read-only, always registered; returns one stored block's topic+summary by id
+  (never raw session messages) with the same ambiguity handling as expansion.
 - **No silent data loss**: `prune()` (manual, via `/memory prune <days>`) is the only deletion
   mechanism; no automatic expiry. Prune is durable via tombstones, and the watermark ledger keeps
   pruned-but-unchanged sources skipped, so a rescan cannot resurrect them. Ingestion-parameter
