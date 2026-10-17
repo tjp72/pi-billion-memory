@@ -7,17 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- Model-facing output (`memory_search` results, `related` evidence, `memory_get`, and the timeline
-  topic) is re-passed through the secret filter as defense-in-depth, so a row ingested before the
-  current filter cannot surface a value that would be redacted today. Stored rows are not rewritten
-  (delete `*.db*` and rescan to scrub durably).
-- Hardening for untrusted input: upstream metadata (project label, `producer`,
-  `compress_call_id`, lineage ids) is length-capped and `generation` accepts only `young`/`old`;
-  the query is length/token capped; the full timeline catalog refuses (with a hint) above 20000
-  rows instead of silently truncating or exhausting memory.
-
 ## [0.6.0] - 2026-10-18
 
 ### Added
@@ -64,6 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back to a tail window when the references sit near the end of a long file; the byte budget is
   unchanged. `pi-sidecar` allow-list entries also accept optional `project`/`cwd` hints that skip
   the lazy session-header read.
+- Model-facing output (`memory_search` results, `related` evidence, `memory_get`, and the timeline
+  topic) is re-passed through the secret filter as defense-in-depth, so a row ingested before the
+  current filter cannot surface a value that would be redacted today. Stored rows are not rewritten
+  (delete `*.db*` and rescan to scrub durably).
+- Hardening for untrusted input: upstream metadata (project label, `producer`,
+  `compress_call_id`, lineage ids) is length-capped and `generation` accepts only `young`/`old`;
+  the query is length/token capped; the full timeline catalog refuses (with a hint) above 20000
+  rows instead of silently truncating or exhausting memory.
 
 ## [0.5.2] - 2026-09-10
 
