@@ -1654,14 +1654,14 @@ var MemoryDb = class {
       const shared = [];
       for (const t of new Set(contentTokens(r.evidence))) {
         if (!seedTokens.has(t)) continue;
-        const freq = (df.get(t) || 0) / N;
-        if (freq > RELATED_GENERIC_DF) continue;
-        score += Math.log(1 + N / (1 + (df.get(t) || 0)));
+        const dfT = df.get(t) || 0;
+        if (dfT >= 2 && dfT / N > RELATED_GENERIC_DF) continue;
+        score += Math.log(1 + N / (1 + dfT));
         shared.push(t);
       }
       if (shared.length) reasons.push(`same-sentence:${shared.slice(0, 4).join(",")}`);
       return { ...r, score, reasons };
-    }).filter((r) => r.score > 0 && r.reasons.length > 0).sort((a, b) => b.score - a.score || (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id - b.id);
+    }).filter((r) => r.score > 0 && r.reasons.some((x) => x !== "project-window")).sort((a, b) => b.score - a.score || (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id - b.id);
     return {
       mode: "related",
       rows: mergeDuplicateRows(scored).slice(0, limit),
@@ -1995,7 +1995,7 @@ function parseDirectBlockIds(raw) {
     return [];
   }
 }
-function significantTokens(text, max = RELATED_MAX_TOKENS) {
+function significantTokens(text, max = RELATED_MAX_TOKENS, cjkBigrams = false) {
   const out = /* @__PURE__ */ new Set();
   const s = String(text || "");
   for (const m of s.matchAll(/[A-Za-z0-9_]{3,}/g)) {
@@ -2003,10 +2003,20 @@ function significantTokens(text, max = RELATED_MAX_TOKENS) {
     if (out.size >= max) return [...out];
   }
   for (const m of s.matchAll(/[\u4e00-\u9fff]{2,}/g)) {
-    out.add(m[0]);
+    const run = m[0];
+    out.add(run);
+    if (cjkBigrams && run.length > 2) {
+      for (let i = 0; i + 2 <= run.length; i++) {
+        out.add(run.slice(i, i + 2));
+        if (out.size >= max) break;
+      }
+    }
     if (out.size >= max) break;
   }
   return [...out];
+}
+function contentTokens(text) {
+  return significantTokens(text, 60, true).filter((t) => !STOPWORDS.has(t.toLowerCase()));
 }
 var STOPWORDS = /* @__PURE__ */ new Set([
   "a",
@@ -2170,9 +2180,6 @@ var STOPWORDS = /* @__PURE__ */ new Set([
   "\u4E9B",
   "\u79CD"
 ]);
-function contentTokens(text) {
-  return significantTokens(text, 60).filter((t) => !STOPWORDS.has(t.toLowerCase()));
-}
 function splitSentences(text) {
   return String(text || "").split(/[。！？!?.;\n]+/).map((s) => s.trim()).filter(Boolean);
 }

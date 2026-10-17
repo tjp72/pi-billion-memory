@@ -1579,15 +1579,17 @@ export class MemoryDb {
         const shared = [];
         for (const t of new Set(contentTokens(r.evidence))) {
           if (!seedTokens.has(t)) continue;
-          const freq = (df.get(t) || 0) / N;
-          if (freq > RELATED_GENERIC_DF) continue; // generic for this query: no evidence weight
-          score += Math.log(1 + N / (1 + (df.get(t) || 0)));
+          const dfT = df.get(t) || 0;
+          // Generic only when the token is genuinely common across candidates; with one or two
+          // candidates a shared token is real evidence, not noise.
+          if (dfT >= 2 && dfT / N > RELATED_GENERIC_DF) continue;
+          score += Math.log(1 + N / (1 + dfT));
           shared.push(t);
         }
         if (shared.length) reasons.push(`same-sentence:${shared.slice(0, 4).join(",")}`);
         return { ...r, score, reasons };
       })
-      .filter((r) => r.score > 0 && r.reasons.length > 0)
+      .filter((r) => r.score > 0 && r.reasons.some((x) => x !== "project-window"))
       .sort((a, b) => b.score - a.score || (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id - b.id);
     return {
       mode: "related",
@@ -2037,19 +2039,32 @@ function parseDirectBlockIds(raw) {
 }
 
 /** Significant tokens of a summary/topic for related-line matching (>=3 chars, deduped, capped). */
-function significantTokens(text: string, max = RELATED_MAX_TOKENS): string[] {
+function significantTokens(text: string, max = RELATED_MAX_TOKENS, cjkBigrams = false): string[] {
   const out = new Set<string>();
   const s = String(text || "");
   for (const m of s.matchAll(/[A-Za-z0-9_]{3,}/g)) {
     out.add(m[0].toLowerCase());
     if (out.size >= max) return [...out];
   }
-  // CJK runs stay whole; they are already distinct enough at 2+ chars.
+  // CJK runs stay whole; they are already distinct enough at 2+ chars. For evidence matching the
+  // 2-char shingles are added too, so a word inside a longer run still lines up across blocks.
   for (const m of s.matchAll(/[\u4e00-\u9fff]{2,}/g)) {
-    out.add(m[0]);
+    const run = m[0];
+    out.add(run);
+    if (cjkBigrams && run.length > 2) {
+      for (let i = 0; i + 2 <= run.length; i++) {
+        out.add(run.slice(i, i + 2));
+        if (out.size >= max) break;
+      }
+    }
     if (out.size >= max) break;
   }
   return [...out];
+}
+
+/** Tokens used for related evidence: significant tokens (with CJK shingles) minus stopwords. */
+function contentTokens(text) {
+  return significantTokens(text, 60, true).filter((t) => !STOPWORDS.has(t.toLowerCase()));
 }
 
 /**
@@ -2220,11 +2235,6 @@ const STOPWORDS = new Set([
   "些",
   "种",
 ]);
-
-/** Tokens used for related evidence: significant tokens minus stopwords. */
-function contentTokens(text) {
-  return significantTokens(text, 60).filter((t) => !STOPWORDS.has(t.toLowerCase()));
-}
 
 /** Split text into sentences on ASCII/CJK sentence punctuation and newlines. */
 function splitSentences(text) {

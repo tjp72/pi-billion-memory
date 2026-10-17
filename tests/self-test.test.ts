@@ -939,6 +939,39 @@ check(
 );
 check("memory_get reports a missing block", db.getBlock("nope", null).found === false);
 
+// --- CJK 2-char words relate through shingles ---------------------------------------
+const bigSess = path.join(tmp, "--home-dev-BigramProj--", "big.jsonl");
+writeSidecar(bigSess, [
+  {
+    blockId: "bSeed",
+    runId: "rBig",
+    tier: 1,
+    topic: "沙箱建立",
+    summary: "测试沙箱环境建立完成并且完成验收记录归档",
+    compressedTokens: 1,
+    createdAt: T2,
+    startRef: "m00001",
+    endRef: "m00002",
+  },
+  {
+    blockId: "bCand",
+    runId: "rBig2",
+    tier: 1,
+    topic: "运行沙箱测试",
+    summary: "运行沙箱测试并记录结果以及后续修复步骤文档",
+    compressedTokens: 1,
+    createdAt: T2 + 1000,
+    startRef: "m00003",
+    endRef: "m00004",
+  },
+]);
+await db.ingestSidecarFile(bigSess, "/home/dev/BigramProj");
+const bigRel = db.related("沙箱", { block: "bSeed", project: "BigramProj" });
+check(
+  "CJK words inside longer runs relate through 2-char shingles",
+  bigRel.rows.some((r) => r.blockId === "bCand" && r.reasons.some((x) => x.startsWith("same-sentence:"))),
+);
+
 // --- platform-neutral basename in model output --------------------------------------
 const winRow = {
   sourceFile: "C:\\Users\\x\\sessions\\--F--git--\\s.jsonl.acp.json",
