@@ -454,6 +454,10 @@ export function sanitizeSource(raw) {
     enabled: raw.enabled !== false,
   };
   if (typeof raw.opencodeDb === "string" && raw.opencodeDb) out.opencodeDb = expandHome(raw.opencodeDb);
+  // Optional hints so a source can skip the lazy session-header read entirely: `project` sets the
+  // label, `cwd` (expanded like every configured path) also gives project = basename(cwd).
+  if (typeof raw.project === "string" && raw.project.trim()) out.project = raw.project.trim();
+  if (typeof raw.cwd === "string" && raw.cwd) out.cwd = expandHome(raw.cwd);
   return out;
 }
 
@@ -1855,7 +1859,8 @@ async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) 
     let meta;
     if (source.adapter === "pi-sidecar") {
       // cwd is resolved lazily inside ingestSourceFile (explicit → stored → header → API map).
-      meta = { kind: "pi", cwd: null, project: null };
+      // An allow-list `project`/`cwd` hint short-circuits that and avoids the header read.
+      meta = { kind: "pi", cwd: source.cwd ?? null, project: source.project ?? null };
     } else if (source.adapter === "opencode-acp") {
       const info = opencodeMap?.get(file);
       meta = { kind: "opencode", cwd: info?.cwd ?? null, project: info?.project ?? null };

@@ -229,20 +229,120 @@ export async function readCapped(file: string, maxBytes: number): Promise<ReadRe
 }
 
 /**
+ * Read only until every wanted message id has been seen, then stop. Falls back to a tail window
+ * when the wanted ids live near the end of a long file, so expand never reads the whole session
+ * just to resolve a few references. The total bytes read stay within `maxBytes` (head + tail share
+ * the budget).
+ */
+async function readSelectedMessages(file: string, maxBytes: number, wanted: Set<string>): Promise<SessionRead> {
+  const { promises: fsp } = await import("node:fs");
+  const messages = new Map<string, any>();
+  const cap = Math.max(0, Math.floor(maxBytes));
+  const found = new Set<string>();
+  const CHUNK = 1024 * 1024;
+  let handle;
+  try {
+    handle = await fsp.open(file, "r");
+  } catch (e) {
+    if (e && ["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EISDIR"].includes(e.code)) {
+      return { messages, bytesRead: 0, totalBytes: 0, truncated: false, missing: true };
+    }
+    throw e;
+  }
+  try {
+    const { size } = await handle.stat();
+    let pos = 0;
+    let bytesRead = 0;
+    let leftover = "";
+    const ingestLine = (rawLine: string) => {
+      const raw = rawLine.trim();
+      if (!raw) return;
+      let line: any;
+      try {
+        line = JSON.parse(raw);
+      } catch {
+        return; // tolerate a partially written or non-JSON line
+      }
+      if (!line || typeof line !== "object") return;
+      if (line.type !== "message" && line.type !== "custom_message") return;
+      if (typeof line.id !== "string" || !line.id) return;
+      messages.set(line.id, line);
+      if (wanted.has(line.id)) found.add(line.id);
+    };
+    const consume = (chunk: string) => {
+      leftover += chunk;
+      let at = leftover.indexOf("\n");
+      while (at >= 0) {
+        ingestLine(leftover.slice(0, at));
+        leftover = leftover.slice(at + 1);
+        at = leftover.indexOf("\n");
+      }
+    };
+    // Head pass: stop the moment every wanted id is indexed. When the file is larger than the
+    // budget, only half is spent on the head so a tail window still fits (references often come
+    // from the newest part of a long session).
+    const headLimit = size > cap ? Math.max(1, Math.floor(cap / 2)) : cap;
+    while (pos < size && bytesRead < headLimit && found.size < wanted.size) {
+      const want = Math.min(CHUNK, headLimit - bytesRead, size - pos);
+      const buffer = Buffer.allocUnsafe(want);
+      const { bytesRead: n } = await handle.read(buffer, 0, want, pos);
+      if (n <= 0) break;
+      pos += n;
+      bytesRead += n;
+      consume(buffer.subarray(0, n).toString("utf8"));
+    }
+    // Tail pass: the remaining ids may sit near the end of a file whose head is bigger than the
+    // budget. Read the last window we can still afford instead of the skipped middle.
+    if (found.size < wanted.size && pos < size && bytesRead < cap) {
+      const tailLen = Math.min(cap - bytesRead, size - pos);
+      const tailStart = size - tailLen;
+      const buffer = Buffer.allocUnsafe(tailLen);
+      const { bytesRead: n } = await handle.read(buffer, 0, tailLen, tailStart);
+      if (n > 0) {
+        bytesRead += n;
+        pos += n;
+        let text = buffer.subarray(0, n).toString("utf8");
+        // Drop the leading fragment unless the tail starts at a line boundary.
+        const nl = text.indexOf("\n");
+        if (tailStart > 0 && nl >= 0) text = text.slice(nl + 1);
+        consume(text);
+      }
+    }
+    // Complete-line semantics: an unread trailing fragment may simply be a missing entry, not a
+    // truncation. Report truncation only when there is unread data and some wanted id is unresolved.
+    const { size: after } = await handle.stat();
+    const truncated = found.size < wanted.size && (bytesRead >= cap || pos < after);
+    return { messages, bytesRead, totalBytes: after, truncated, missing: false };
+  } finally {
+    try {
+      await handle.close();
+    } catch {
+      // Never let a close failure mask the real read error.
+    }
+  }
+}
+
+/**
  * Read a session `.jsonl` up to `maxReadBytes` and index its message entries by id.
  *
  * The read is physically byte-capped (see {@link readCapped}): expansion must not become a way to
  * stream a whole session file into memory. When the cap cuts the file mid-line the trailing
  * fragment is dropped, so a truncated read can only lose messages, never corrupt them. A session
  * file that has been deleted, rotated, renamed, or cannot be opened is not an error: every
- * reference in it is reported as missing instead of failing the call.
+ * reference in it is reported as missing instead of failing the call. When `wantedIds` is given
+ * (and no test `readFile` seam is used) the reader stops as soon as those ids are found.
  * @internal
  */
 export async function readSessionMessages(
   sessionFile: string,
   maxReadBytes: number,
   readFile: (file: string, maxBytes: number) => Promise<ReadResult> = readCapped,
+  wantedIds: Set<string> | null = null,
 ): Promise<SessionRead> {
+  const wanted = wantedIds instanceof Set ? wantedIds : new Set<string>(wantedIds || []);
+  if (readFile === readCapped && wanted.size > 0) {
+    return readSelectedMessages(sessionFile, maxReadBytes, wanted);
+  }
   const messages = new Map<string, any>();
   const cap = Math.max(0, Math.floor(maxReadBytes));
   let read: ReadResult;
@@ -366,7 +466,12 @@ export async function expandBlock(opts: ExpandOptions): Promise<ExpandResult> {
   if (opts.mode === "full" && select.length === 0) {
     throw new Error('mode "full" requires a non-empty select (run mode "list" first and pick indices)');
   }
-  const read = await readSessionMessages(opts.sessionFile, opts.maxReadBytes, opts.readFile);
+  const wantedBase = new Set<string>();
+  for (const ref of opts.msgIds) {
+    const { base } = splitMessageId(ref);
+    if (base && !isSyntheticRef(base)) wantedBase.add(base);
+  }
+  const read = await readSessionMessages(opts.sessionFile, opts.maxReadBytes, opts.readFile, wantedBase);
   const entries: ExpandEntry[] = [];
   const renderedByIndex = new Map<number, RenderedMessage>();
 

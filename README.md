@@ -286,6 +286,11 @@ extension uses these two built-in defaults:
 - `opencodeDb` is optional but recommended for opencode sources: it lets the
   adapter resolve each state file to its real working directory (project name)
   via a read-only lookup.
+- `project` and `cwd` are optional hints for `pi-sidecar` sources. Setting them
+  lets the adapter skip the lazy session-header read entirely; otherwise it
+  reads only the session file's first line (and only when the source is new or
+  changed). `project` sets the label; `cwd` supports `~` and also derives the
+  label from its basename.
 
 Example: index a billion-context proxy session directory (WorkBuddy/codebuddy):
 
@@ -300,7 +305,8 @@ Example: index a billion-context proxy session directory (WorkBuddy/codebuddy):
 ```
 
 - `bili-session` reads blocks under `payload.state.blocks` from each matched
-  `<host>_<hash>.json` file; the project name is the `<host>` segment.
+  `<host>_<hash>.json` file; the project name is the envelope's own
+  `upstreamOrigin`/`protocol` when present, otherwise the `<host>` segment.
 
 Example: scan only a pi sessions subtree plus one extra sidecar root:
 

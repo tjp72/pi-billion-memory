@@ -653,6 +653,69 @@ check(
 );
 check("related formatter renders the reason line", internals.formatRelated(rel).includes("Why:"));
 
+// --- JSONL read reduction: allow-list hints + streaming early exit ------------------
+const hint = internals.sanitizeSource({
+  id: "hint",
+  adapter: "pi-sidecar",
+  root: "/home/dev/HintRoot",
+  pattern: "**/*.jsonl.acp.json",
+  project: "HintProj",
+  cwd: "~/hint-proj",
+});
+check(
+  "allow-list project/cwd hints are parsed and ~ is expanded",
+  hint.project === "HintProj" && hint.cwd === path.join(os.homedir(), "hint-proj"),
+);
+
+const streamFile = path.join(tmp, "stream.jsonl");
+const streamLines = [
+  JSON.stringify({
+    type: "message",
+    id: "m00001",
+    message: { role: "user", content: [{ type: "text", text: "streamWantedMarker" }] },
+  }),
+];
+for (let i = 0; i < 5000; i++) {
+  streamLines.push(
+    JSON.stringify({
+      type: "message",
+      id: `pad${i}`,
+      message: { role: "assistant", content: [{ type: "text", text: "p".repeat(500) }] },
+    }),
+  );
+}
+fs.writeFileSync(streamFile, streamLines.join("\n") + "\n");
+const streamRead = await internals.readSessionMessages(streamFile, 10 * 1024 * 1024, undefined, new Set(["m00001"]));
+check(
+  "streaming read stops once the wanted id is found",
+  streamRead.messages.has("m00001") && streamRead.bytesRead < streamRead.totalBytes && streamRead.truncated === false,
+);
+
+const tailFile = path.join(tmp, "tail.jsonl");
+const tailLines = [];
+for (let i = 0; i < 5000; i++) {
+  tailLines.push(
+    JSON.stringify({
+      type: "message",
+      id: `head${i}`,
+      message: { role: "assistant", content: [{ type: "text", text: "h".repeat(500) }] },
+    }),
+  );
+}
+tailLines.push(
+  JSON.stringify({
+    type: "message",
+    id: "mTail",
+    message: { role: "user", content: [{ type: "text", text: "tailWantedMarker" }] },
+  }),
+);
+fs.writeFileSync(tailFile, tailLines.join("\n") + "\n");
+const tailRead = await internals.readSessionMessages(tailFile, 200000, undefined, new Set(["mTail"]));
+check(
+  "a wanted id near the end is found through the tail window within the byte budget",
+  tailRead.messages.has("mTail") && tailRead.bytesRead <= 200000 && tailRead.truncated === false,
+);
+
 // --- Durable prune: tombstones + watermark ledger ---------------------------------
 const pruneDb = new internals.MemoryDb(path.join(tmp, "prune.db"));
 const pruneSess = path.join(tmp, "--home-dev-Prune--", "prune.jsonl");

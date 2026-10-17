@@ -247,6 +247,9 @@ bili sessions (<host>_<hash>.json)┘                              (SQLite + FTS
 - `pattern` 支持递归 `**/*.jsonl.acp.json` 形式或扁平 `ses_*.json` 形式；
 - `opencodeDb` 对 opencode 源可选但推荐：用于只读解析每个 state 文件对应的
   工作目录（项目名）。
+- `project` 与 `cwd` 是 `pi-sidecar` 源的可选提示：设置后适配器可完全跳过惰性
+  session header 读取；否则只在该源新增/变化时读取 session 文件第一行。
+  `project` 直接作为项目名；`cwd` 支持 `~`，并用其 basename 作为项目名。
 
 例如索引一个 billion-context 代理 session 目录（WorkBuddy/codebuddy）：
 
@@ -261,7 +264,7 @@ bili sessions (<host>_<hash>.json)┘                              (SQLite + FTS
 ```
 
 - `bili-session` 从每个匹配的 `<host>_<hash>.json` 文件读取 `payload.state.blocks`
-  下的块；项目名是 `<host>` 段。
+  下的块；项目名优先取信封自身的 `upstreamOrigin`/`protocol`，否则取 `<host>` 段。
 
 例如只扫描一个 pi sessions 子树和一个额外的 sidecar root：
 

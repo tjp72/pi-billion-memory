@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Auxiliary store files that live next to session files (`.content-store.json`, `*.fb.json`,
   SQLite files) are skipped without being read, so a broad allow-list glob cannot turn them into
   repeating failed sources.
+- Block expansion now reads the session only until the referenced messages are found and falls
+  back to a tail window when the references sit near the end of a long file; the byte budget is
+  unchanged. `pi-sidecar` allow-list entries also accept optional `project`/`cwd` hints that skip
+  the lazy session-header read.
 
 ## [0.5.2] - 2026-09-10
 

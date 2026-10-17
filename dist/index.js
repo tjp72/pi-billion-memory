@@ -114,7 +114,89 @@ async function readCapped(file, maxBytes) {
     }
   }
 }
-async function readSessionMessages(sessionFile, maxReadBytes, readFile = readCapped) {
+async function readSelectedMessages(file, maxBytes, wanted) {
+  const { promises: fsp } = await import('fs');
+  const messages = /* @__PURE__ */ new Map();
+  const cap = Math.max(0, Math.floor(maxBytes));
+  const found = /* @__PURE__ */ new Set();
+  const CHUNK = 1024 * 1024;
+  let handle;
+  try {
+    handle = await fsp.open(file, "r");
+  } catch (e) {
+    if (e && ["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EISDIR"].includes(e.code)) {
+      return { messages, bytesRead: 0, totalBytes: 0, truncated: false, missing: true };
+    }
+    throw e;
+  }
+  try {
+    const { size } = await handle.stat();
+    let pos = 0;
+    let bytesRead = 0;
+    let leftover = "";
+    const ingestLine = (rawLine) => {
+      const raw = rawLine.trim();
+      if (!raw) return;
+      let line;
+      try {
+        line = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      if (!line || typeof line !== "object") return;
+      if (line.type !== "message" && line.type !== "custom_message") return;
+      if (typeof line.id !== "string" || !line.id) return;
+      messages.set(line.id, line);
+      if (wanted.has(line.id)) found.add(line.id);
+    };
+    const consume = (chunk) => {
+      leftover += chunk;
+      let at = leftover.indexOf("\n");
+      while (at >= 0) {
+        ingestLine(leftover.slice(0, at));
+        leftover = leftover.slice(at + 1);
+        at = leftover.indexOf("\n");
+      }
+    };
+    const headLimit = size > cap ? Math.max(1, Math.floor(cap / 2)) : cap;
+    while (pos < size && bytesRead < headLimit && found.size < wanted.size) {
+      const want = Math.min(CHUNK, headLimit - bytesRead, size - pos);
+      const buffer = Buffer.allocUnsafe(want);
+      const { bytesRead: n } = await handle.read(buffer, 0, want, pos);
+      if (n <= 0) break;
+      pos += n;
+      bytesRead += n;
+      consume(buffer.subarray(0, n).toString("utf8"));
+    }
+    if (found.size < wanted.size && pos < size && bytesRead < cap) {
+      const tailLen = Math.min(cap - bytesRead, size - pos);
+      const tailStart = size - tailLen;
+      const buffer = Buffer.allocUnsafe(tailLen);
+      const { bytesRead: n } = await handle.read(buffer, 0, tailLen, tailStart);
+      if (n > 0) {
+        bytesRead += n;
+        pos += n;
+        let text = buffer.subarray(0, n).toString("utf8");
+        const nl = text.indexOf("\n");
+        if (tailStart > 0 && nl >= 0) text = text.slice(nl + 1);
+        consume(text);
+      }
+    }
+    const { size: after } = await handle.stat();
+    const truncated = found.size < wanted.size && (bytesRead >= cap || pos < after);
+    return { messages, bytesRead, totalBytes: after, truncated, missing: false };
+  } finally {
+    try {
+      await handle.close();
+    } catch {
+    }
+  }
+}
+async function readSessionMessages(sessionFile, maxReadBytes, readFile = readCapped, wantedIds = null) {
+  const wanted = wantedIds instanceof Set ? wantedIds : new Set(wantedIds || []);
+  if (readFile === readCapped && wanted.size > 0) {
+    return readSelectedMessages(sessionFile, maxReadBytes, wanted);
+  }
   const messages = /* @__PURE__ */ new Map();
   const cap = Math.max(0, Math.floor(maxReadBytes));
   let read;
@@ -160,7 +242,12 @@ async function expandBlock(opts) {
   if (opts.mode === "full" && select.length === 0) {
     throw new Error('mode "full" requires a non-empty select (run mode "list" first and pick indices)');
   }
-  const read = await readSessionMessages(opts.sessionFile, opts.maxReadBytes, opts.readFile);
+  const wantedBase = /* @__PURE__ */ new Set();
+  for (const ref of opts.msgIds) {
+    const { base: base2 } = splitMessageId(ref);
+    if (base2 && !isSyntheticRef(base2)) wantedBase.add(base2);
+  }
+  const read = await readSessionMessages(opts.sessionFile, opts.maxReadBytes, opts.readFile, wantedBase);
   const entries = [];
   const renderedByIndex = /* @__PURE__ */ new Map();
   let availableChars = 0;
@@ -530,6 +617,8 @@ function sanitizeSource(raw) {
     enabled: raw.enabled !== false
   };
   if (typeof raw.opencodeDb === "string" && raw.opencodeDb) out.opencodeDb = expandHome(raw.opencodeDb);
+  if (typeof raw.project === "string" && raw.project.trim()) out.project = raw.project.trim();
+  if (typeof raw.cwd === "string" && raw.cwd) out.cwd = expandHome(raw.cwd);
   return out;
 }
 async function loadSources() {
@@ -1646,7 +1735,7 @@ async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) 
     if (generation !== sessionGeneration) return;
     let meta;
     if (source.adapter === "pi-sidecar") {
-      meta = { kind: "pi", cwd: null, project: null };
+      meta = { kind: "pi", cwd: source.cwd ?? null, project: source.project ?? null };
     } else if (source.adapter === "opencode-acp") {
       const info = opencodeMap?.get(file);
       meta = { kind: "opencode", cwd: info?.cwd ?? null, project: info?.project ?? null };

@@ -71,7 +71,8 @@ Coverage that must be preserved and extended, never removed:
   resurrect pruned blocks, force rescan still skips tombstones, and the watermark ledger backfills
   from older `sources` rows;
 - **lazy pi cwd resolution**: a new/changed source reads only the session header; an unchanged
-  source reads nothing; a stored cwd is reused on incremental scans and refreshed on force;
+  source reads nothing; a stored cwd is reused on incremental scans and refreshed on force; an
+  allow-list `project`/`cwd` hint skips the header read entirely;
 - schema drift: a missing `blocks`/`blocksById` payload is rejected without advancing the
   watermark and a later valid payload is ingested;
 - allow-list read errors are fail-closed (ENOENT -> defaults, other errors -> no sources);
@@ -90,8 +91,10 @@ Coverage that must be preserved and extended, never removed:
   conversation text; `full` mode renders only an explicit `select` and **throws** when that
   selection is empty, a narrow selection is **not** reported as truncation while a per-entry trim
   is, and the rendered text never exceeds `maxChars`; `maxChars`/`maxMessages` caps and the
-  injected redactor are honored; `readCapped` stops the physical read at `expandMaxReadBytes`,
-  and missing session files degrade to `missing` refs instead of throwing; `custom_message`
+  injected redactor are honored; `readCapped` stops the physical read at `expandMaxReadBytes`, a
+  wanted id is found without reading the whole file (streaming early exit) and a wanted id near the
+  end is reached through a bounded tail window, and missing session files degrade to `missing` refs
+  instead of throwing; `custom_message`
   (extension-injected) lines expand as user text and generated `acp_summary_*` refs are labelled
   `synthetic`; pointer backfill refreshes existing rows without re-inserting them and clears
   pointers the sidecar no longer lists; the 0.4.x -> 0.5.0 migration adds `msg_ids` and resets the
