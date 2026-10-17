@@ -1568,7 +1568,8 @@ var MemoryDb = class {
     });
     return {
       mode: "timeline",
-      rows: mergeDuplicateRows(entries).slice(0, limit),
+      // Candidates are fetched newest-first; keep the most recent `limit` in ascending order.
+      rows: mergeDuplicateRows(entries).slice(-limit),
       unknown,
       total: rows.length,
       verbose

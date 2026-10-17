@@ -1472,7 +1472,8 @@ export class MemoryDb {
     });
     return {
       mode: "timeline",
-      rows: mergeDuplicateRows(entries).slice(0, limit),
+      // Candidates are fetched newest-first; keep the most recent `limit` in ascending order.
+      rows: mergeDuplicateRows(entries).slice(-limit),
       unknown,
       total: rows.length,
       verbose,
@@ -2008,7 +2009,7 @@ function relatedText(row) {
  * parent/child pairs survive. `rows` must already be in display order; the first row of a group is
  * kept and the rest only contribute their source labels.
  */
-function mergeDuplicateRows(rows) {
+export function mergeDuplicateRows(rows) {
   const groups = new Map();
   const keyOf = (r) => `${r.kind}\u0000${r.topic || ""}\u0000${r.summary || ""}`;
   for (const r of rows) {
