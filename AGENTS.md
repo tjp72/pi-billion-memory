@@ -97,9 +97,13 @@ Coverage that must be preserved and extended, never removed:
   pointers the sidecar no longer lists; the 0.4.x -> 0.5.0 migration adds `msg_ids` and resets the
   watermark ledger exactly once, including for a source row that had no ledger row yet;
 
+- **memory_search modes**: `timeline` mixes exact and estimated entries in order, marks estimated
+  rows (blank time), counts and hides unplaceable rows unless `verbose`, and never displays an
+  estimated timestamp; `related` ranks lineage first and labels its reasons; the default `blocks`
+  result semantics and the pure-LIKE query plan are unchanged.
+
 Fixture conventions: sessions live under encoded-dir names like `--home-dev-ProjA--` with a
 matching neutral cwd (`/home/dev/ProjA` -> project `ProjA`). Keep it that way — no real paths.
-
 Additional gates:
 
 - `npm run e2e` loads the built `dist/index.js`, asserts the default export is a function,
@@ -170,6 +174,14 @@ The design is deliberately minimal; preserve these properties:
   for short ones. Pure-LIKE queries must not join `blocks_fts` (so `idx_blocks_created` can
   satisfy the ordering); never route queries through an LLM for translation or keyword
   generation.
+- **memory_search modes**: `blocks` (default) keeps the existing relevance semantics. `timeline`
+  reuses the same match filter but orders by a timeline key: an exact `created_at` is shown, an
+  entry without one is placed by its source's timed anchors and marked estimated, and an entry
+  with neither a timestamp nor an orderable block id is reported separately (only listed with
+  `verbose`). Never fabricate or display an estimated wall-clock time. `related` scores other
+  blocks against a seed by compression lineage (`direct_block_ids`), same `run_id`, source
+  neighbor, shared tokens, and project-time proximity, and must label its reasons. All modes
+  stay offline, bounded, and dependency-free.
 - **No silent data loss**: `prune()` (manual, via `/memory prune <days>`) is the only deletion
   mechanism; no automatic expiry. Prune is durable via tombstones, and the watermark ledger keeps
   pruned-but-unchanged sources skipped, so a rescan cannot resurrect them. Ingestion-parameter

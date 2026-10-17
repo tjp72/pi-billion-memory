@@ -70,6 +70,13 @@ affiliated with, endorsed by, or a fork of**
 - **Chinese-friendly search**: FTS5 `trigram` for queries of 3+ characters;
   AND-ed `LIKE` against `summary OR topic` for shorter queries; a mixed mode
   combines both. No LLM translation or keyword generation.
+- **Memory-line modes**: `memory_search` takes a `mode`. `blocks` (default)
+  ranks by relevance; `timeline` keeps the same match filter but orders by time
+  and order — exact times are shown, positions estimated from a source's timed
+  anchors are marked, and blocks with neither a timestamp nor an order are
+  reported separately instead of being interleaved; `related` returns blocks
+  connected to an anchor by compression lineage, run, source neighbor, or shared
+  terms, each with its reason labels.
 - **Lazy project resolution**: the pi session header is read only when a source
   file actually needs (re)ingestion, and only its first line is read. An
   unchanged store costs no header reads.

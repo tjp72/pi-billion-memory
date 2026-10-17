@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `direct_block_ids` (compression lineage), `duration_ms`, `generation`, `survived_count`, and
   `compress_call_id`; `sources` also records `format_version`/`producer`. A force rescan refreshes
   these fields in place without touching stored summaries.
+- `memory_search` gains a `mode`: `timeline` orders the same matches by time and order (exact times
+  shown, estimated positions marked, entries without a time or order reported separately), and
+  `related` follows compression lineage/run/source-neighbor/shared-term evidence with reason labels.
+  The default `blocks` behavior is unchanged.
 
 ### Changed
 

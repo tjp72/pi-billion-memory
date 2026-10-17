@@ -572,6 +572,87 @@ check(
   db.db.prepare("SELECT format_version FROM sources WHERE source_file = ?").get(bcV2).format_version === 2,
 );
 
+// --- Memory line: timeline + related (mode extension) -------------------------------
+const tlSess = path.join(tmp, "--home-dev-Timeline--", "tl.jsonl");
+const tlT0 = T2;
+const tlBlocks = [
+  {
+    blockId: "b10",
+    runId: "rt",
+    tier: 1,
+    topic: "tl one",
+    summary: "timeLineMarker alpha",
+    compressedTokens: 1,
+    createdAt: tlT0,
+    startRef: "m00001",
+    endRef: "m00002",
+    active: true,
+  },
+  {
+    blockId: "b11",
+    runId: "rt",
+    tier: 1,
+    topic: "tl two",
+    summary: "timeLineMarker beta",
+    compressedTokens: 1,
+    createdAt: tlT0 + 2 * 3600000,
+    startRef: "m00003",
+    endRef: "m00004",
+    active: true,
+    directBlockIds: ["b10"],
+  },
+  {
+    blockId: "b12",
+    runId: "rt",
+    tier: 1,
+    topic: "tl three",
+    summary: "timeLineMarker gamma",
+    compressedTokens: 1,
+    startRef: "m00005",
+    endRef: "m00006",
+  },
+  {
+    blockId: "bX",
+    runId: "rt",
+    tier: 1,
+    topic: "tl x",
+    summary: "timeLineMarker omega",
+    compressedTokens: 1,
+    startRef: "m00007",
+  },
+];
+fs.mkdirSync(path.dirname(tlSess), { recursive: true });
+fs.writeFileSync(tlSess + ".acp.json", JSON.stringify(mkSidecar(tlBlocks)));
+const tlIng = await db.ingestSidecarFile(tlSess, "/home/dev/Timeline");
+check("timeline fixture ingests", tlIng.ok && tlIng.inserted === 4);
+
+const tl = db.timeline("timeLineMarker", { project: "Timeline" });
+check(
+  "timeline mixes exact and estimated entries in order",
+  tl.rows.length === 3 && tl.rows[0].blockId === "b10" && tl.rows[1].blockId === "b11" && tl.rows[2].blockId === "b12",
+);
+check(
+  "timeline marks the untimed entry as estimated (no exact time)",
+  tl.rows[2].exact === false && tl.rows[2].estimated === true,
+);
+check(
+  "timeline reports the unplaceable block and hides it by default",
+  tl.unknown === 1 && !internals.formatTimeline(tl).includes("timeLineMarker omega"),
+);
+const tlVerbose = db.timeline("timeLineMarker", { project: "Timeline", verbose: true });
+check(
+  "verbose timeline appends the unplaceable block last",
+  tlVerbose.rows.length === 4 && tlVerbose.rows[3].blockId === "bX",
+);
+check("timeline formatter labels the missing time", internals.formatTimeline(tl).includes("time missing"));
+
+const rel = db.related("", { block: "b10", project: "Timeline" });
+check(
+  "related ranks the lineage child first and reports the reason",
+  rel.rows.length >= 1 && rel.rows[0].blockId === "b11" && rel.rows[0].reasons.includes("lineage"),
+);
+check("related formatter renders the reason line", internals.formatRelated(rel).includes("Why:"));
+
 // --- Durable prune: tombstones + watermark ledger ---------------------------------
 const pruneDb = new internals.MemoryDb(path.join(tmp, "prune.db"));
 const pruneSess = path.join(tmp, "--home-dev-Prune--", "prune.jsonl");

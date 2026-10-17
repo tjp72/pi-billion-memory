@@ -99,6 +99,20 @@ const MAX_DIRECT_BLOCKS = 1000;
 const EXPAND_MANIFEST_MAX = 300;
 const DEFAULT_RESULT_LIMIT = 6;
 const MAX_RESULT_LIMIT = 20;
+/** Timeline result cap (higher than blocks mode because a timeline is read in order). */
+const MAX_TIMELINE_LIMIT = 50;
+/** Candidate rows fetched before ordering a timeline or scoring related blocks. */
+const TIMELINE_CANDIDATE_LIMIT = 500;
+const RELATED_CANDIDATE_LIMIT = 200;
+/** A gap larger than this between consecutive timed entries is rendered as a gap marker. */
+const TIMELINE_GAP_MS = 6 * 60 * 60 * 1000;
+/** Shared column list for the timeline/related candidate queries (blocks search keeps its own). */
+const BLOCK_ROW_COLUMNS =
+  "b.id, b.source_file AS sourceFile, b.kind AS kind, b.block_id AS blockId, b.run_id AS runId, b.tier, b.topic, " +
+  "b.ref_start AS refStart, b.ref_end AS refEnd, b.compressed_tokens AS tokens, b.created_at AS createdAt, " +
+  "b.summary, b.active AS active, b.direct_block_ids AS directBlockIds, b.duration_ms AS durationMs, " +
+  "b.generation AS generation, b.survived_count AS survivedCount, b.compress_call_id AS compressCallId, " +
+  "s.project, s.cwd";
 const LOG_MAX_BYTES = 1_000_000;
 const TRIGRAM_MIN_LEN = 3;
 /** TTL for the cached official SessionManager cwd map (fallback only; the header read is primary) */
@@ -1208,7 +1222,7 @@ export class MemoryDb {
     return this.db
       .prepare(
         `SELECT b.id, b.source_file AS sourceFile, b.kind AS kind,
-                b.block_id AS blockId, b.tier, b.topic, b.summary,
+                b.block_id AS blockId, b.run_id AS runId, b.tier, b.topic, b.summary,
                 b.ref_start AS refStart, b.ref_end AS refEnd,
                 b.compressed_tokens AS tokens, b.created_at AS createdAt,
                 b.msg_ids AS msgIds, b.active AS active, b.direct_block_ids AS directBlockIds,
@@ -1243,25 +1257,15 @@ export class MemoryDb {
   }
 
   /**
-   * Build the search SQL shared by search()/explainSearch().
-   * - all tokens >= 3 chars: FTS5 trigram (bm25 ordering);
-   * - mixed: FTS for long tokens + AND-ed LIKE for short tokens;
-   * - all short: LIKE on summary OR topic, deliberately without the blocks_fts join so SQLite
-   *   can use idx_blocks_created (no FTS scan + temp B-tree sort).
-   * @returns {{mode:string, sql:string|null, params:Array<any>, limit:number}}
+   * Token-matching WHERE/FROM shared by the blocks search and the timeline/related candidate
+   * queries. Returns null for an empty query (callers decide what "no filter" means).
    */
-  _buildSearch(query, opts: any = {}) {
-    const limit = Math.max(
-      1,
-      Math.min(MAX_RESULT_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT),
-    );
-    const project = opts.project || null;
+  _buildFilter(query, project = null) {
     const tokens = String(query || "")
       .trim()
       .split(/\s+/)
       .filter(Boolean);
-    if (tokens.length === 0) return { mode: "empty", sql: null, params: [], limit };
-
+    if (tokens.length === 0) return null;
     const escapeLike = (s) => s.replace(/[\\%_]/g, (m) => "\\" + m);
     const ftsTokens = tokens.filter((t) => t.length >= TRIGRAM_MIN_LEN);
     const likeTokens = tokens.filter((t) => t.length < TRIGRAM_MIN_LEN);
@@ -1285,17 +1289,37 @@ export class MemoryDb {
       where += " AND s.project = ?";
       params.push(project);
     }
-    params.push(limit);
     const mode = useFts ? (likeTokens.length ? "mixed" : "fts") : "like";
     const from = useFts
       ? "FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid JOIN sources s ON s.source_file = b.source_file"
       : "FROM blocks b JOIN sources s ON s.source_file = b.source_file";
-    const rank = useFts ? "bm25(blocks_fts)" : "NULL";
+    return { mode, where, params, from, useFts };
+  }
+
+  /**
+   * Build the search SQL shared by search()/explainSearch().
+   * - all tokens >= 3 chars: FTS5 trigram (bm25 ordering);
+   * - mixed: FTS for long tokens + AND-ed LIKE for short tokens;
+   * - all short: LIKE on summary OR topic, deliberately without the blocks_fts join so SQLite
+   *   can use idx_blocks_created (no FTS scan + temp B-tree sort).
+   * @returns {{mode:string, sql:string|null, params:Array<any>, limit:number}}
+   */
+  _buildSearch(query, opts: any = {}) {
+    const limit = Math.max(
+      1,
+      Math.min(MAX_RESULT_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT),
+    );
+    const built = this._buildFilter(query, opts.project || null);
+    if (!built) return { mode: "empty", sql: null, params: [], limit };
+    const params = [...built.params, limit];
+    const rank = built.useFts ? "bm25(blocks_fts)" : "NULL";
     // Pure LIKE keeps ORDER BY created_at only so idx_blocks_created satisfies the ordering.
-    const order = useFts ? "ORDER BY bm25(blocks_fts), b.created_at DESC, b.id DESC" : "ORDER BY b.created_at DESC";
+    const order = built.useFts
+      ? "ORDER BY bm25(blocks_fts), b.created_at DESC, b.id DESC"
+      : "ORDER BY b.created_at DESC";
     const sql = `
       SELECT b.id, b.source_file AS sourceFile, b.kind AS kind,
-             b.block_id AS blockId, b.tier, b.topic,
+             b.block_id AS blockId, b.run_id AS runId, b.tier, b.topic,
              b.ref_start AS refStart, b.ref_end AS refEnd,
              b.compressed_tokens AS tokens, b.created_at AS createdAt,
              b.summary, b.active AS active, b.direct_block_ids AS directBlockIds,
@@ -1303,12 +1327,12 @@ export class MemoryDb {
              b.survived_count AS survivedCount, b.compress_call_id AS compressCallId,
              s.project, s.cwd,
              ${rank} AS rank
-      ${from}
-      WHERE ${where}
+      ${built.from}
+      WHERE ${built.where}
       ${order}
       LIMIT ?
     `;
-    return { mode, sql, params, limit };
+    return { mode: built.mode, sql, params, limit };
   }
 
   /**
@@ -1336,6 +1360,155 @@ export class MemoryDb {
     const built = this._buildSearch(query, opts);
     if (built.mode === "empty") return [];
     return this.db.prepare(`EXPLAIN QUERY PLAN ${built.sql}`).all(...built.params);
+  }
+
+  /**
+   * Timeline view: the same token filter as search(), ordered by the timeline key (exact time when
+   * present, otherwise a source-local estimate from the numeric block id) instead of relevance.
+   * `exact` marks rows that carry a real `created_at`; an estimated time is used for ordering only
+   * and never displayed. Rows with neither time nor order are counted in `unknown` and only
+   * returned when `verbose` is set.
+   */
+  timeline(query, opts: any = {}) {
+    this.open();
+    const limit = Math.max(
+      1,
+      Math.min(MAX_TIMELINE_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT),
+    );
+    const verbose = opts.verbose === true;
+    const built = this._buildFilter(query, opts.project || null);
+    const from = built ? built.from : "FROM blocks b JOIN sources s ON s.source_file = b.source_file";
+    let where = built ? built.where : "1=1";
+    const params = built ? [...built.params] : [];
+    if (!built && opts.project) {
+      where += " AND s.project = ?";
+      params.push(opts.project);
+    }
+    params.push(TIMELINE_CANDIDATE_LIMIT);
+    const sql = `
+      SELECT ${BLOCK_ROW_COLUMNS}, NULL AS rank
+      ${from}
+      WHERE ${where}
+      ORDER BY b.created_at DESC, b.id DESC
+      LIMIT ?
+    `;
+    let rows = [];
+    try {
+      rows = this.db.prepare(sql).all(...params);
+    } catch (e) {
+      logLine(`timeline error: ${withoutPaths(e.message)}`);
+      rows = [];
+    }
+    let anchor = null;
+    if (opts.block) {
+      const found = this.findBlocks(String(opts.block), opts.source || null, 1);
+      if (!found.length) return { mode: "timeline", rows: [], unknown: 0, total: 0, note: "anchor not found" };
+      anchor = found[0];
+    }
+    const anchorsBySource = new Map();
+    for (const r of rows) {
+      if (!Number.isInteger(r.createdAt)) continue;
+      const list = anchorsBySource.get(r.sourceFile) || [];
+      list.push({ seq: blockSeqNum(r.blockId), createdAt: r.createdAt });
+      anchorsBySource.set(r.sourceFile, list);
+    }
+    const windowMs = Number.isInteger(opts.windowMinutes) ? opts.windowMinutes * 60000 : null;
+    let lo = Number.isInteger(opts.from) ? opts.from : null;
+    let hi = Number.isInteger(opts.to) ? opts.to : null;
+    const sameSourceOnly = anchor && windowMs !== null ? anchor.sourceFile : null;
+    if (anchor && windowMs !== null && Number.isInteger(anchor.createdAt)) {
+      lo = anchor.createdAt - windowMs;
+      hi = anchor.createdAt + windowMs;
+    }
+    const entries = [];
+    let unknown = 0;
+    for (const r of rows) {
+      if (sameSourceOnly && r.sourceFile !== sameSourceOnly) continue;
+      const key = timelineKey(r, anchorsBySource);
+      if (key.rank === 0 && key.time !== null && (lo !== null || hi !== null)) {
+        if ((lo !== null && key.time < lo) || (hi !== null && key.time > hi)) continue;
+      }
+      if (key.rank === 2) {
+        unknown++;
+        if (!verbose) continue;
+      }
+      entries.push({
+        ...r,
+        timelineTime: key.time,
+        estimated: key.estimated,
+        exact: Number.isInteger(r.createdAt),
+        orderRank: key.rank,
+      });
+    }
+    entries.sort((a, b) => {
+      if (a.orderRank !== b.orderRank) return a.orderRank - b.orderRank;
+      const at = a.timelineTime ?? 0;
+      const bt = b.timelineTime ?? 0;
+      if (at !== bt) return at - bt;
+      const as = blockSeqNum(a.blockId) ?? 0;
+      const bs = blockSeqNum(b.blockId) ?? 0;
+      if (as !== bs) return as - bs;
+      return (a.id ?? 0) - (b.id ?? 0);
+    });
+    return { mode: "timeline", rows: entries.slice(0, limit), unknown, total: rows.length, verbose };
+  }
+
+  /**
+   * Related-line view: score other blocks against a seed block by structural evidence first
+   * (compression lineage, same run, source neighbor) and lexical overlap second. Deterministic,
+   * offline, and bounded by RELATED_CANDIDATE_LIMIT; each row carries its `reasons`.
+   */
+  related(query, opts: any = {}) {
+    this.open();
+    const limit = Math.max(
+      1,
+      Math.min(MAX_RESULT_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT),
+    );
+    let seed = null;
+    if (opts.block) {
+      const found = this.findBlocks(String(opts.block), opts.source || null, 1);
+      seed = found[0] || null;
+    } else if (query) {
+      const s = this.search(query, { project: opts.project || null, limit: 1 });
+      seed = s.rows[0] || null;
+    }
+    if (!seed) return { mode: "related", rows: [], note: "seed not found" };
+    const candidates = new Map();
+    const baseSql =
+      `SELECT ${BLOCK_ROW_COLUMNS} FROM blocks b JOIN sources s ON s.source_file = b.source_file ` +
+      `WHERE b.id != ? AND ${
+        seed.project ? "s.project = ?" : "b.source_file = ?"
+      } ORDER BY b.created_at DESC, b.id DESC LIMIT ?`;
+    try {
+      const baseParams = seed.project
+        ? [seed.id, seed.project, RELATED_CANDIDATE_LIMIT]
+        : [seed.id, seed.sourceFile, RELATED_CANDIDATE_LIMIT];
+      for (const r of this.db.prepare(baseSql).all(...baseParams)) candidates.set(r.id, r);
+    } catch (e) {
+      logLine(`related candidates error: ${withoutPaths(e.message)}`);
+    }
+    const seedTokens = significantTokens(`${seed.topic || ""} ${seed.summary || ""}`);
+    const filter = seedTokens.length ? this._buildFilter(seedTokens.slice(0, 6).join(" "), opts.project || null) : null;
+    if (filter) {
+      const sql = `SELECT ${BLOCK_ROW_COLUMNS} ${filter.from} WHERE b.id != ? AND ${filter.where} ORDER BY b.created_at DESC LIMIT ?`;
+      try {
+        for (const r of this.db.prepare(sql).all(seed.id, ...filter.params, RELATED_CANDIDATE_LIMIT))
+          candidates.set(r.id, r);
+      } catch (e) {
+        logLine(`related token error: ${withoutPaths(e.message)}`);
+      }
+    }
+    const scored = [...candidates.values()]
+      .map((r) => {
+        const { score, reasons } = relatedScore(seed, r);
+        return { ...r, score, reasons };
+      })
+      .sort((a, b) => b.score - a.score || (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id - b.id);
+    return {
+      mode: "related",
+      rows: scored.slice(0, limit),
+      seed: { blockId: seed.blockId, project: seed.project, sourceFile: seed.sourceFile },
+    };
   }
 
   stats() {
@@ -1745,6 +1918,106 @@ function sourceLabel(row) {
   return `[${kind}] ${base}`;
 }
 
+/** Numeric suffix of a block id ("b12" -> 12, "12" -> 12), or null when there is none. */
+function blockSeqNum(blockId) {
+  const m = /\d+/.exec(String(blockId ?? ""));
+  return m ? parseInt(m[0], 10) : null;
+}
+
+/** Parse the stored lineage JSON without ever throwing on a malformed value. */
+function parseDirectBlockIds(raw) {
+  if (typeof raw !== "string" || !raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Significant tokens of a summary/topic for related-line matching (>=3 chars, deduped). */
+function significantTokens(text) {
+  const out = new Set();
+  const s = String(text || "");
+  for (const m of s.matchAll(/[A-Za-z0-9_]{3,}/g)) out.add(m[0].toLowerCase());
+  // CJK runs stay whole; they are already distinct enough at 2+ chars.
+  for (const m of s.matchAll(/[\u4e00-\u9fff]{2,}/g)) out.add(m[0]);
+  return [...out];
+}
+
+/**
+ * Timeline ordering key. An exact `created_at` wins; a block without one is anchored to the timed
+ * rows of the same source by its numeric block id (interpolated between the nearest anchors, or
+ * offset from the single nearest one). `rank` 0 = placeable, 1 = source-local order only (the
+ * source has no timed row), 2 = neither. Estimated times are for ordering only, never displayed.
+ */
+function timelineKey(row, anchorsBySource) {
+  if (Number.isInteger(row.createdAt)) return { time: row.createdAt, rank: 0, estimated: false };
+  const seq = blockSeqNum(row.blockId);
+  const anchors = (anchorsBySource.get(row.sourceFile) || []).filter((a) => a.seq !== null);
+  if (seq === null || anchors.length === 0) return { time: null, rank: seq === null ? 2 : 1, estimated: true };
+  let prev = null;
+  let next = null;
+  for (const a of anchors) {
+    if (a.seq <= seq && (!prev || a.seq > prev.seq)) prev = a;
+    if (a.seq >= seq && (!next || a.seq < next.seq)) next = a;
+  }
+  if (prev && next && next.seq !== prev.seq) {
+    return {
+      time: prev.createdAt + ((seq - prev.seq) / (next.seq - prev.seq)) * (next.createdAt - prev.createdAt),
+      rank: 0,
+      estimated: true,
+    };
+  }
+  const a = prev || next;
+  if (a) return { time: a.createdAt + (prev ? seq - a.seq : a.seq - seq), rank: 0, estimated: true };
+  return { time: null, rank: 1, estimated: true };
+}
+
+/** Deterministic evidence-based score for the related-line view. */
+function relatedScore(seed, row) {
+  const reasons = [];
+  let score = 0;
+  const seedDirect = parseDirectBlockIds(seed.directBlockIds);
+  const rowDirect = parseDirectBlockIds(row.directBlockIds);
+  if (seedDirect.includes(String(row.blockId)) || rowDirect.includes(String(seed.blockId))) {
+    score += 5;
+    reasons.push("lineage");
+  }
+  if (seed.runId && row.runId && seed.runId === row.runId) {
+    score += 2;
+    reasons.push("same-run");
+  }
+  if (seed.sourceFile === row.sourceFile) {
+    const a = blockSeqNum(seed.blockId);
+    const b = blockSeqNum(row.blockId);
+    if (a !== null && b !== null && Math.abs(a - b) <= 1) {
+      score += 1.5;
+      reasons.push("neighbor");
+    }
+  }
+  const seedTokens = new Set(significantTokens(`${seed.topic || ""} ${seed.summary || ""}`));
+  const shared = [];
+  for (const t of significantTokens(`${row.topic || ""} ${row.summary || ""}`)) {
+    if (seedTokens.has(t)) shared.push(t);
+  }
+  if (shared.length) {
+    score += shared.reduce((n, t) => n + (t.length >= 4 ? 1.5 : 1), 0);
+    reasons.push(`shared-token:${shared.slice(0, 3).join(",")}`);
+  }
+  if (
+    seed.project &&
+    row.project === seed.project &&
+    Number.isInteger(seed.createdAt) &&
+    Number.isInteger(row.createdAt)
+  ) {
+    const days = Math.abs(seed.createdAt - row.createdAt) / 86400000;
+    score += 2 * Math.exp(-days / 7);
+    reasons.push("project-window");
+  }
+  return { score, reasons };
+}
+
 /** @internal */
 export function formatResults(res) {
   const rows = res.rows;
@@ -1782,9 +2055,69 @@ export function formatResults(res) {
 }
 
 /**
- * Render one expansion result for the model. `list` mode never emits conversation text; it only
- * reports what is available so the caller has to make an explicit, bounded second call.
+ * Render a timeline. Entries without an exact timestamp show `time missing`; their position comes
+ * from the source-local order estimate. Rows that could be neither timed nor ordered are reported
+ * as a trailing count (and only listed when `verbose` was requested).
+ * @internal
  */
+export function formatTimeline(res) {
+  const rows = res.rows || [];
+  if (res.note) return `No timeline: ${res.note}.`;
+  if (!rows.length) {
+    return (
+      "No timeline entries. Try: 1) a broader query; 2) another project; 3) a wider time window " +
+      "(from/to or windowMinutes). Entries need either a recorded timestamp or an orderable block id."
+    );
+  }
+  let prevTime = null;
+  const parts = rows.map((r, i) => {
+    const hasTime = r.exact === true && Number.isInteger(r.timelineTime);
+    const time = hasTime ? fmtTs(r.timelineTime) : "time missing";
+    let gap = "";
+    if (hasTime && prevTime !== null && r.timelineTime - prevTime > TIMELINE_GAP_MS) gap = "· · · gap · · ·\n";
+    if (hasTime) prevTime = r.timelineTime;
+    const est = !hasTime && r.orderRank === 0 ? " (order estimated)" : "";
+    const active = r.active === 0 ? " · inactive" : "";
+    const topic = r.topic ? `Topic: ${r.topic}\n` : "";
+    let summary = r.summary || "";
+    if (summary.length > PREVIEW_CHARS) summary = summary.slice(0, PREVIEW_CHARS) + "…";
+    summary = summary.replace(/\n{3,}/g, "\n\n").trim();
+    return (
+      `${gap}[${i + 1}] ${time}${est} · project ${r.project || "?"} · ${r.blockId || ""}` +
+      ` · tier${r.tier ?? "?"}${active}\n` +
+      `Source: ${sourceLabel(r)}\n${topic}${summary}`
+    );
+  });
+  const scope = res.total && res.total > rows.length ? `${rows.length} of ${res.total}` : `${rows.length}`;
+  let out = `Memory timeline: ${scope} entr${rows.length === 1 ? "y" : "ies"}:\n` + parts.join("\n\n---\n\n");
+  if (res.unknown > 0) {
+    out +=
+      `\n\nUnable to place: ${res.unknown} block(s) have neither a usable timestamp nor an order.` +
+      (res.verbose ? "" : " Re-run with verbose:true to list them.");
+  }
+  return out;
+}
+
+/** Render related-line results with their reason labels. @internal */
+export function formatRelated(res) {
+  const rows = res.rows || [];
+  if (res.note) return `No related blocks: ${res.note}.`;
+  if (!rows.length) return "No related blocks found for that seed.";
+  const seed = res.seed ? ` (seed ${res.seed.blockId}${res.seed.project ? ` in ${res.seed.project}` : ""})` : "";
+  const parts = rows.map((r, i) => {
+    const time = fmtTs(r.createdAt) || "time missing";
+    const topic = r.topic ? `Topic: ${r.topic}\n` : "";
+    let summary = r.summary || "";
+    if (summary.length > PREVIEW_CHARS) summary = summary.slice(0, PREVIEW_CHARS) + "…";
+    summary = summary.replace(/\n{3,}/g, "\n\n").trim();
+    return (
+      `[${i + 1}] score ${(r.score ?? 0).toFixed(2)} · ${time} · project ${r.project || "?"} · ${r.blockId || ""}` +
+      ` · tier${r.tier ?? "?"}\nWhy: ${(r.reasons || []).join(", ") || "related"}\n` +
+      `Source: ${sourceLabel(r)}\n${topic}${summary}`
+    );
+  });
+  return `Related blocks${seed}: ${rows.length}:\n` + parts.join("\n\n---\n\n");
+}
 function formatExpansion(row, sessionFile, res, mode) {
   const lines = [
     `Block ${row.blockId}${row.tier != null ? ` (tier ${row.tier})` : ""} · project ${row.project || "unknown"}` +
@@ -1857,16 +2190,48 @@ const MEMORY_SEARCH_PARAMETERS = {
     },
     limit: {
       type: "number",
-      description: "Max number of results, default 6, max 20",
+      description: "Max number of results, default 6, max 20 (timeline: max 50)",
+    },
+    mode: {
+      type: "string",
+      enum: ["blocks", "timeline", "related"],
+      description:
+        "'blocks' (default) relevance search; 'timeline' orders matches by time/order instead of relevance; 'related' finds blocks related to an anchor or query hit",
+    },
+    block: {
+      type: "string",
+      description: "Anchor block id for mode 'timeline' or 'related', e.g. 'b2' (from a previous result)",
+    },
+    source: {
+      type: "string",
+      description: "Disambiguate an anchor block id that exists in several sources (substring of the Source label)",
+    },
+    from: { type: "number", description: "Timeline window start as epoch milliseconds" },
+    to: { type: "number", description: "Timeline window end as epoch milliseconds" },
+    windowMinutes: {
+      type: "number",
+      description: "Timeline window around the anchor block, in minutes (requires 'block')",
+    },
+    reasons: { type: "boolean", description: "Include relation reason labels for mode 'related' (always on for now)" },
+    verbose: {
+      type: "boolean",
+      description: "Timeline: also list blocks that have neither a timestamp nor an order",
     },
   },
-  required: ["query"],
 } as const;
 
 interface MemorySearchParams {
   query: string;
   project: string | null;
   limit: number;
+  mode: "blocks" | "timeline" | "related";
+  block: string | null;
+  source: string | null;
+  from: number | null;
+  to: number | null;
+  windowMinutes: number | null;
+  reasons: boolean;
+  verbose: boolean;
 }
 
 const MEMORY_EXPAND_PARAMETERS = {
@@ -1928,7 +2293,23 @@ function readMemorySearchParams(raw: unknown): MemorySearchParams {
   const query = typeof value.query === "string" ? value.query : "";
   const project = typeof value.project === "string" && value.project.trim().length > 0 ? value.project.trim() : null;
   const limit = typeof value.limit === "number" && Number.isInteger(value.limit) ? value.limit : DEFAULT_RESULT_LIMIT;
-  return { query, project, limit };
+  const mode = value.mode === "timeline" ? "timeline" : value.mode === "related" ? "related" : "blocks";
+  const block = typeof value.block === "string" && value.block.trim() ? value.block.trim() : null;
+  const source = typeof value.source === "string" && value.source.trim() ? value.source.trim() : null;
+  const int = (v: unknown) => (typeof v === "number" && Number.isInteger(v) ? v : null);
+  return {
+    query,
+    project,
+    limit,
+    mode,
+    block,
+    source,
+    from: int(value.from),
+    to: int(value.to),
+    windowMinutes: int(value.windowMinutes),
+    reasons: value.reasons !== false,
+    verbose: value.verbose === true,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -2032,7 +2413,10 @@ export default async function factory(pi: ExtensionAPI) {
     description:
       "Search pi's long-term memory store: block summaries produced by ACP compression from " +
       "allow-listed sources (pi billion-context-pi sidecars, opencode-acp state files, and billion-context sessions) across all " +
-      "allowed projects. Use when the user asks about past work, conclusions, decisions, technical " +
+      "allowed projects. Modes: 'blocks' (default) relevance search; 'timeline' orders the same matches by " +
+      "time and order (missing times stay blank, unplaceable blocks are reported separately); 'related' " +
+      "finds blocks related to an anchor block or query hit (compression lineage, same run, neighbors, shared terms). " +
+      "Use when the user asks about past work, conclusions, decisions, technical " +
       "pitfalls, code locations, project context, or content compressed earlier in this session. " +
       "Query with Chinese or English keywords / phrases; results are relevance-ranked and annotated " +
       "with source kind, project, file, block and time.",
@@ -2040,14 +2424,49 @@ export default async function factory(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use memory_search when the user asks about past work, conclusions, decisions, or context from earlier sessions or from earlier in this session after compression.",
       "For Chinese queries shorter than 3 characters, memory_search falls back to substring matching automatically — still pass the query as-is.",
+      "For a chronological view of a topic use mode 'timeline' (optionally with a 'block' anchor and windowMinutes); for 'what is related to this block' use mode 'related' with 'block'.",
     ],
     parameters: paramsSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       try {
         // Light allow-list scan (mtime watermark) before every search so latest compressions are included
         await scanSources();
-        const { query, project, limit } = readMemorySearchParams(params);
-        const res = getDb().search(query, { project, limit });
+        const p = readMemorySearchParams(params);
+        const db = getDb();
+        if (p.mode === "timeline") {
+          const res = db.timeline(p.query, {
+            project: p.project,
+            limit: p.limit,
+            block: p.block,
+            source: p.source,
+            from: p.from,
+            to: p.to,
+            windowMinutes: p.windowMinutes,
+            verbose: p.verbose,
+          });
+          return {
+            content: [{ type: "text", text: formatTimeline(res) }],
+            details: {
+              mode: "timeline",
+              hits: res.rows.length,
+              unknown: res.unknown,
+              dbPath: path.basename(cfg.dbPath),
+            },
+          };
+        }
+        if (p.mode === "related") {
+          const res = db.related(p.query, {
+            project: p.project,
+            limit: p.limit,
+            block: p.block,
+            source: p.source,
+          });
+          return {
+            content: [{ type: "text", text: formatRelated(res) }],
+            details: { mode: "related", hits: res.rows.length, dbPath: path.basename(cfg.dbPath) },
+          };
+        }
+        const res = db.search(p.query, { project: p.project, limit: p.limit });
         const text = formatResults(res);
         return {
           content: [{ type: "text", text }],
