@@ -341,6 +341,135 @@ async function expandBlock(opts) {
   base.truncated = capTrimmed || skipped > 0 || returned < requestedCount;
   return base;
 }
+function blockView(v) {
+  if (!v || typeof v !== "object") return null;
+  const view = v;
+  if (typeof view.text !== "string") return null;
+  return { text: view.text, count: Number.isInteger(view.count) ? view.count : 1 };
+}
+async function expandStoredBlock(opts) {
+  const cap = Math.max(0, Math.floor(opts.maxReadBytes));
+  const empty = (missing) => ({
+    entries: [],
+    text: null,
+    truncated: false,
+    availableChars: 0,
+    returnedChars: 0,
+    skippedMessages: 0,
+    readTruncated: false,
+    bytesRead: 0,
+    totalBytes: 0,
+    sessionMissing: missing
+  });
+  let read;
+  try {
+    read = await (opts.readFile ?? readCapped)(opts.file, cap);
+  } catch (e) {
+    if (e && ["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EISDIR"].includes(e.code)) return empty(true);
+    throw e;
+  }
+  const readTruncated = read.buffer.length < read.totalBytes;
+  let data = null;
+  try {
+    data = JSON.parse(read.buffer.toString("utf8"));
+  } catch {
+  }
+  const content = data?.payload?.blockContents?.[opts.blockId];
+  const full = blockView(content?.full);
+  const one = blockView(content?.one);
+  const entries = [];
+  const bodies = /* @__PURE__ */ new Map();
+  let index = 0;
+  const push = (label, view) => {
+    index++;
+    if (view) {
+      entries.push({
+        index,
+        ref: label,
+        messageId: label,
+        callId: null,
+        role: "block",
+        chars: view.text.length,
+        found: true
+      });
+      bodies.set(index, view.text);
+    } else {
+      entries.push({ index, ref: label, messageId: label, callId: null, role: null, chars: 0, found: false });
+    }
+  };
+  push("full", full);
+  if (one) push("one", one);
+  const availableChars = entries.reduce((n, e) => n + e.chars, 0);
+  const base = {
+    entries,
+    text: null,
+    truncated: false,
+    availableChars,
+    returnedChars: 0,
+    skippedMessages: 0,
+    readTruncated,
+    bytesRead: read.buffer.length,
+    totalBytes: read.totalBytes,
+    sessionMissing: false
+  };
+  if (opts.mode === "list") return base;
+  const select = Array.isArray(opts.select) ? opts.select.filter((n) => Number.isInteger(n) && n > 0) : [];
+  if (select.length === 0) {
+    throw new Error('mode "full" requires a non-empty select (run mode "list" first and pick indices)');
+  }
+  const wanted = new Set(select);
+  const maxChars = Math.max(0, Math.floor(opts.maxChars));
+  const maxMessages = Math.max(1, Math.floor(opts.maxMessages));
+  const chunks = [];
+  let used = 0;
+  let returned = 0;
+  let skipped = 0;
+  let capTrimmed = false;
+  for (const entry of entries) {
+    if (!wanted.has(entry.index)) continue;
+    if (!entry.found) {
+      skipped++;
+      continue;
+    }
+    if (returned >= maxMessages) {
+      skipped++;
+      continue;
+    }
+    let body = bodies.get(entry.index) ?? "";
+    if (opts.redact) body = opts.redact(body).text;
+    const header = `### [${entry.index}] block ${entry.ref} \xB7 ${body.length} chars
+`;
+    const sep2 = chunks.length ? 2 : 0;
+    const room = maxChars - used - sep2;
+    if (room <= 0) {
+      skipped++;
+      continue;
+    }
+    if (header.length + body.length <= room) {
+      chunks.push(`${header}${body}`);
+      used += sep2 + header.length + body.length;
+      returned++;
+      continue;
+    }
+    const marker = `
+[entry truncated at ${maxChars} chars]`;
+    const bodyRoom = room - header.length - marker.length;
+    if (bodyRoom > 0) {
+      chunks.push(`${header}${body.slice(0, bodyRoom)}${marker}`);
+      used += sep2 + header.length + bodyRoom + marker.length;
+    } else {
+      chunks.push(body.slice(0, room));
+      used += sep2 + room;
+    }
+    returned++;
+    capTrimmed = true;
+  }
+  base.text = chunks.join("\n\n");
+  base.returnedChars = base.text.length;
+  base.skippedMessages = skipped;
+  base.truncated = capTrimmed || skipped > 0;
+  return base;
+}
 
 // src/extension.ts
 var HOME = os.homedir();
@@ -2269,6 +2398,33 @@ ${list}`
             };
           }
           const row = rows[0];
+          if (row.kind === "bili") {
+            const res2 = await expandStoredBlock({
+              file: row.sourceFile,
+              blockId: row.blockId,
+              mode: p.mode,
+              select: p.select,
+              maxChars: Math.min(cfg.expandMaxChars, p.chars ?? cfg.expandMaxChars),
+              maxMessages: Math.min(cfg.expandMaxMessages, p.limit ?? cfg.expandMaxMessages),
+              maxReadBytes: cfg.expandMaxReadBytes,
+              redact: redactSecrets
+            });
+            log(
+              `expand ${row.blockId} stored mode=${p.mode} entries=${res2.entries.length} returned=${res2.returnedChars}`
+            );
+            return {
+              content: [{ type: "text", text: formatExpansion(row, row.sourceFile, res2, p.mode) }],
+              details: {
+                mode: p.mode,
+                block: row.blockId,
+                entries: res2.entries.length,
+                found: res2.entries.filter((e) => e.found).length,
+                chars: res2.returnedChars,
+                truncated: res2.truncated,
+                source: "block-contents"
+              }
+            };
+          }
           if (!String(row.sourceFile).endsWith(".acp.json")) {
             return {
               content: [

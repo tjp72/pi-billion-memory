@@ -82,8 +82,10 @@ affiliated with, endorsed by, or a fork of**
   unchanged store costs no header reads.
 - **Optional block expansion**: with `expandEnabled`, `memory_expand` resolves a
   block's recorded message pointers back to the original session messages on
-  demand. It is two-step (manifest first, then an explicit selection), bounded,
-  filtered like ingestion, and never written to the store.
+  demand. For billion-context sessions it instead reads the envelope's own
+  `payload.blockContents`, so it never touches the host session log. It is
+  two-step (manifest first, then an explicit selection), bounded, filtered like
+  ingestion, and never written to the store.
 - **No context hook**: the extension never participates in pi's `context`
   event; it only indexes and searches compression summaries.
 

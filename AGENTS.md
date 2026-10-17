@@ -94,7 +94,8 @@ Coverage that must be preserved and extended, never removed:
   injected redactor are honored; `readCapped` stops the physical read at `expandMaxReadBytes`, a
   wanted id is found without reading the whole file (streaming early exit) and a wanted id near the
   end is reached through a bounded tail window, and missing session files degrade to `missing` refs
-  instead of throwing; `custom_message`
+  instead of throwing; a billion-context session block expands from its envelope's own
+  `payload.blockContents` (full/one manifest), never the host session log; `custom_message`
   (extension-injected) lines expand as user text and generated `acp_summary_*` refs are labelled
   `synthetic`; pointer backfill refreshes existing rows without re-inserting them and clears
   pointers the sidecar no longer lists; the 0.4.x -> 0.5.0 migration adds `msg_ids` and resets the
@@ -148,7 +149,8 @@ The design is deliberately minimal; preserve these properties:
   parsed; `opencode.db` is opened read-only/`query_only` only to map session IDs to working
   directories. The single exception is opt-in expansion: when `expandEnabled` is true and
   `memory_expand` is called, `src/expand.ts` may read the specific message lines a stored block
-  references — never a scan, never a cache, never a write.
+  references — never a scan, never a cache, never a write. For a billion-context source it reads
+  the block's own `payload.blockContents` from the session envelope instead of message lines.
 - **Secret redaction before storage**: `redactSecrets()` runs on every normalized block's
   `topic` and `summary` inside `ingestSourceFile()` before the `blocks` insert; it is not
   optional. Log a hit count (never the secret) and continue ingesting the redacted block.

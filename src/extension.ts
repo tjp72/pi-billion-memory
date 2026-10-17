@@ -50,7 +50,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { expandBlock, isSyntheticRef, parseMsgIds } from "./expand.js";
+import { expandBlock, expandStoredBlock, isSyntheticRef, parseMsgIds } from "./expand.js";
 
 // ---------------------------------------------------------------------------
 // Constants / config / logging
@@ -2556,6 +2556,35 @@ export default async function factory(pi: ExtensionAPI) {
             };
           }
           const row = rows[0];
+          if (row.kind === "bili") {
+            // billion-context keeps each block's originals in its own envelope, so expansion never
+            // touches the host session log for these sources.
+            const res = await expandStoredBlock({
+              file: row.sourceFile,
+              blockId: row.blockId,
+              mode: p.mode,
+              select: p.select,
+              maxChars: Math.min(cfg.expandMaxChars, p.chars ?? cfg.expandMaxChars),
+              maxMessages: Math.min(cfg.expandMaxMessages, p.limit ?? cfg.expandMaxMessages),
+              maxReadBytes: cfg.expandMaxReadBytes,
+              redact: redactSecrets,
+            });
+            log(
+              `expand ${row.blockId} stored mode=${p.mode} entries=${res.entries.length} returned=${res.returnedChars}`,
+            );
+            return {
+              content: [{ type: "text", text: formatExpansion(row, row.sourceFile, res, p.mode) }],
+              details: {
+                mode: p.mode,
+                block: row.blockId,
+                entries: res.entries.length,
+                found: res.entries.filter((e) => e.found).length,
+                chars: res.returnedChars,
+                truncated: res.truncated,
+                source: "block-contents",
+              },
+            };
+          }
           if (!String(row.sourceFile).endsWith(".acp.json")) {
             return {
               content: [

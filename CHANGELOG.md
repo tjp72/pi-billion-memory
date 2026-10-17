@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shown, estimated positions marked, entries without a time or order reported separately), and
   `related` follows compression lineage/run/source-neighbor/shared-term evidence with reason labels.
   The default `blocks` behavior is unchanged.
+- Optional expansion (`expandEnabled`) now also works for billion-context sessions: `memory_expand`
+  reads the envelope's own `payload.blockContents` (full/one manifest) instead of the host session
+  log. It stays two-step, bounded, redacted and read-only.
 
 ### Changed
 

@@ -2,6 +2,7 @@
 export { default } from "./extension.js";
 import {
   expandBlock,
+  expandStoredBlock,
   isSyntheticRef,
   parseMsgIds,
   readCapped,
@@ -34,7 +35,16 @@ import {
   getPiHeaderReadCount,
 } from "./extension.js";
 
-export { expandBlock, isSyntheticRef, parseMsgIds, readCapped, readSessionMessages, renderMessage, splitMessageId };
+export {
+  expandBlock,
+  expandStoredBlock,
+  isSyntheticRef,
+  parseMsgIds,
+  readCapped,
+  readSessionMessages,
+  renderMessage,
+  splitMessageId,
+};
 
 export const internals = {
   MemoryDb,
@@ -60,6 +70,7 @@ export const internals = {
   _resetPiHeaderReadCount: resetPiHeaderReadCount,
   _piHeaderReadCount: getPiHeaderReadCount,
   expandBlock,
+  expandStoredBlock,
   isSyntheticRef,
   parseMsgIds,
   readCapped,

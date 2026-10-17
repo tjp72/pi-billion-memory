@@ -716,6 +716,71 @@ check(
   tailRead.messages.has("mTail") && tailRead.bytesRead <= 200000 && tailRead.truncated === false,
 );
 
+// --- billion-context blockContents expansion (opt-in stored source) -----------------
+const bcExpandFile = path.join(biliRoot, "expand_bc.json");
+fs.writeFileSync(
+  bcExpandFile,
+  JSON.stringify({
+    version: 3,
+    id: "pfa-expand",
+    payload: {
+      state: {
+        blocks: [
+          {
+            blockId: "bE",
+            runId: "rE",
+            tier: 1,
+            topic: "exp",
+            summary: "bcExpandMarker",
+            compressedTokens: 3,
+            createdAt: T2,
+          },
+        ],
+      },
+      blockContents: {
+        bE: {
+          full: { text: "bcExpandFullMarker original text", count: 2 },
+          one: { text: "bcExpandOneMarker first message", count: 1 },
+        },
+      },
+    },
+  }),
+);
+const storedList = await internals.expandStoredBlock({
+  file: bcExpandFile,
+  blockId: "bE",
+  mode: "list",
+  maxChars: 1000,
+  maxMessages: 10,
+  maxReadBytes: 1_000_000,
+});
+check(
+  "stored block list exposes the full/one manifest without text",
+  storedList.text === null && storedList.entries.length === 2 && storedList.entries.every((e) => e.found === true),
+);
+const storedFull = await internals.expandStoredBlock({
+  file: bcExpandFile,
+  blockId: "bE",
+  mode: "full",
+  select: [1],
+  maxChars: 1000,
+  maxMessages: 10,
+  maxReadBytes: 1_000_000,
+});
+check(
+  "stored block full renders only the selected entry",
+  storedFull.text.includes("bcExpandFullMarker") && !storedFull.text.includes("bcExpandOneMarker"),
+);
+const storedMissing = await internals.expandStoredBlock({
+  file: path.join(biliRoot, "nope.json"),
+  blockId: "bE",
+  mode: "list",
+  maxChars: 100,
+  maxMessages: 1,
+  maxReadBytes: 1000,
+});
+check("stored block expansion degrades to sessionMissing", storedMissing.sessionMissing === true);
+
 // --- Durable prune: tombstones + watermark ledger ---------------------------------
 const pruneDb = new internals.MemoryDb(path.join(tmp, "prune.db"));
 const pruneSess = path.join(tmp, "--home-dev-Prune--", "prune.jsonl");
