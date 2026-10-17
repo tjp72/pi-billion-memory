@@ -536,7 +536,7 @@ function noteUnsupportedFormat(key, message) {
   logLine(message);
 }
 function isAuxiliarySourceFile(file) {
-  const base = path.basename(String(file)).toLowerCase();
+  const base = fileBase(file).toLowerCase();
   return base.endsWith(".content-store.json") || base.endsWith(".fb.json") || base.endsWith(".db") || base.endsWith(".db-wal") || base.endsWith(".db-shm");
 }
 function unsupportedSidecarSchema(data) {
@@ -738,6 +738,16 @@ function blockFilter(blockId, source) {
 }
 function withoutPaths(text) {
   return String(text).replace(/file:\/\/\/[^\s'"]+/g, "file://<path>").replace(/(?<![\w:/\\])(?:[A-Za-z]:[\\/]|\\\\|\/\/)[^\s'"]+(?: [^\s'"]*[\\/][^\s'"]*)*/g, "<path>").replace(/(?<![\w.:/\\])~?\/(?:[^\s'":,)]*\/)*[^\s'":,)]+(?: [^\s'":,)]*\/[^\s'":,)]*)*/g, "<path>");
+}
+function fileBase(p) {
+  const s = String(p || "");
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+function parentBase(p) {
+  const s = String(p || "").replace(/[\\/]+$/, "");
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return i > 0 ? fileBase(s.slice(0, i)) : "";
 }
 var SOURCE_ADAPTERS = /* @__PURE__ */ new Set(["pi-sidecar", "opencode-acp", "bili-session"]);
 function sanitizeSource(raw) {
@@ -953,7 +963,7 @@ function toInt(v) {
   return Number.isInteger(n) ? n : null;
 }
 function biliHost(sourceFile) {
-  const base = path.basename(sourceFile, ".json");
+  const base = fileBase(sourceFile).replace(/\.json$/, "");
   const idx = base.lastIndexOf("_");
   return idx > 0 ? base.slice(0, idx) : base || "unknown";
 }
@@ -1149,7 +1159,7 @@ var MemoryDb = class {
       {
         kind: "pi",
         cwd: cwd || null,
-        project: cwd ? path.basename(cwd) : null
+        project: cwd ? fileBase(cwd) : null
       },
       force,
       async (sf) => piSessionHeaderCwd(sf)
@@ -1202,13 +1212,13 @@ var MemoryDb = class {
           const resolved = await resolveCwd(sessionFile);
           if (typeof resolved === "string" && resolved) cwd = resolved;
         } catch (e) {
-          log(`cwd resolve failed ${path.basename(sessionFile)}: ${e.message}`);
+          log(`cwd resolve failed ${fileBase(sessionFile)}: ${e.message}`);
         }
       }
     }
     if (!project) {
-      if (cwd) project = path.basename(cwd);
-      else if (kind === "pi") project = path.basename(path.dirname(sourceFile));
+      if (cwd) project = fileBase(cwd);
+      else if (kind === "pi") project = parentBase(sourceFile);
       else if (kind === "bili") project = biliHost(sourceFile);
       else project = "unknown";
     }
@@ -1222,7 +1232,7 @@ var MemoryDb = class {
     if (unsupported !== null) {
       noteUnsupportedFormat(
         `${kind}:${sourceFile}:${String(unsupported)}`,
-        `unsupported ${kind} format version ${String(unsupported)}; skipped ${path.basename(sourceFile)}`
+        `unsupported ${kind} format version ${String(unsupported)}; skipped ${fileBase(sourceFile)}`
       );
       return { ok: true, parsed: false, skipped: true, total: 0, inserted: 0, mtimeMs, size };
     }
@@ -1340,9 +1350,9 @@ var MemoryDb = class {
       return { ok: false, parsed: true, total: blocks.length, inserted: 0, mtimeMs, size, error: e.message };
     }
     if (redactedHits > 0) {
-      logLine(`redacted ${redactedHits} potential secret(s) before storing ${path.basename(sourceFile)}`);
+      logLine(`redacted ${redactedHits} potential secret(s) before storing ${fileBase(sourceFile)}`);
     }
-    log(`ingest ${path.basename(sourceFile)} kind=${kind} project=${project} blocks=${blocks.length} new=${inserted}`);
+    log(`ingest ${fileBase(sourceFile)} kind=${kind} project=${project} blocks=${blocks.length} new=${inserted}`);
     return { ok: true, parsed: true, total: blocks.length, inserted, refreshed, redacted: redactedHits, mtimeMs, size };
   }
   /**
@@ -1795,13 +1805,13 @@ async function loadOpencodeSessionMap(source, files) {
     }
     const stmt = odb.prepare("SELECT id, directory, path, project_id FROM session WHERE id = ?");
     for (const file of files) {
-      const base = path.basename(file);
+      const base = fileBase(file);
       if (!base.startsWith("ses_") || !base.endsWith(".json")) continue;
       const sessionId = base.slice(0, -5);
       const row = stmt.get(sessionId);
       if (!row) continue;
       const cwd = row.directory || row.path || null;
-      const project = row.directory ? path.basename(row.directory) : row.path ? path.basename(row.path) : typeof row.project_id === "string" ? row.project_id : null;
+      const project = row.directory ? fileBase(row.directory) : row.path ? fileBase(row.path) : typeof row.project_id === "string" ? row.project_id : null;
       if (cwd || project) map.set(file, { cwd: cwd || null, project: project || null });
     }
   } catch (e) {
@@ -1932,7 +1942,7 @@ function fmtTokens(n) {
 }
 function sourceLabel(row) {
   const kind = row.kind === "opencode" || row.kind === "bili" ? row.kind : "pi";
-  let base = path.basename(row.sourceFile || "");
+  let base = fileBase(row.sourceFile);
   if (kind === "pi" && base.endsWith(".acp.json")) base = base.slice(0, -".acp.json".length);
   return `[${kind}] ${base}`;
 }
@@ -2137,7 +2147,7 @@ function formatExpansion(row, sessionFile, res, mode) {
     `Source: ${sourceLabel(row)}`,
     // Basename only: the absolute path carries the OS user name and the encoded project directory,
     // and expansion never needs it (the `source` filter takes the session file name or project).
-    `Session: ${path.basename(sessionFile)}`
+    `Session: ${fileBase(sessionFile)}`
   ];
   const kb = (n) => `${Math.round(n / 1024)} KB`;
   lines.push(
@@ -2283,7 +2293,7 @@ async function factory(pi) {
     logLine(
       cfg.debug ? `session_start file=${sessionFile || "(ephemeral)"} cwd=${ctx.cwd ?? ""}` : (
         // Logs are what users paste into issues: without debug, keep names, not full paths.
-        `session_start file=${sessionFile ? path.basename(sessionFile) : "(ephemeral)"} cwd=${ctx.cwd ? path.basename(ctx.cwd) : ""}`
+        `session_start file=${sessionFile ? fileBase(sessionFile) : "(ephemeral)"} cwd=${ctx.cwd ? fileBase(ctx.cwd) : ""}`
       )
     );
     if (!cfg.scanOnStartup) {
@@ -2300,7 +2310,7 @@ async function factory(pi) {
       await scanCurrentSession(sessionFile, true, ctx.cwd);
       if (generation !== sessionGeneration) return;
       const st = getDb().stats();
-      logLine(`db ready: ${path.basename(st.dbPath)} sources=${st.sources} blocks=${st.blocks}`);
+      logLine(`db ready: ${fileBase(st.dbPath)} sources=${st.sources} blocks=${st.blocks}`);
     }).catch((e) => logLine(`session_start scan error: ${withoutPaths(e.stack || e.message)}`));
     backgroundScan = run;
     void run.finally(() => {
@@ -2377,7 +2387,7 @@ async function factory(pi) {
               mode: "timeline",
               hits: res2.rows.length,
               unknown: res2.unknown,
-              dbPath: path.basename(cfg.dbPath)
+              dbPath: fileBase(cfg.dbPath)
             }
           };
         }
@@ -2390,14 +2400,14 @@ async function factory(pi) {
           });
           return {
             content: [{ type: "text", text: formatRelated(res2) }],
-            details: { mode: "related", hits: res2.rows.length, dbPath: path.basename(cfg.dbPath) }
+            details: { mode: "related", hits: res2.rows.length, dbPath: fileBase(cfg.dbPath) }
           };
         }
         const res = db2.search(p.query, { project: p.project, limit: p.limit });
         const text = formatResults(res);
         return {
           content: [{ type: "text", text }],
-          details: { mode: res.mode, hits: res.rows.length, dbPath: path.basename(cfg.dbPath) }
+          details: { mode: res.mode, hits: res.rows.length, dbPath: fileBase(cfg.dbPath) }
         };
       } catch (e) {
         logLine(`memory_search error: ${withoutPaths(e.stack || e.message)}`);
@@ -2408,7 +2418,7 @@ async function factory(pi) {
               text: `memory_search failed: ${withoutPaths(e.message) || "unknown error"} (the extension log has the full trace)`
             }
           ],
-          details: { mode: "error", hits: 0, dbPath: path.basename(cfg.dbPath) }
+          details: { mode: "error", hits: 0, dbPath: fileBase(cfg.dbPath) }
         };
       }
     }
@@ -2450,7 +2460,7 @@ async function factory(pi) {
           }
           if (rows.length > 1) {
             const list = rows.map(
-              (r) => `- ${r.blockId} \xB7 project ${r.project || "?"} \xB7 ${fmtTs(r.createdAt) || "time unknown"} \xB7 ${path.basename(r.sourceFile)}`
+              (r) => `- ${r.blockId} \xB7 project ${r.project || "?"} \xB7 ${fmtTs(r.createdAt) || "time unknown"} \xB7 ${fileBase(r.sourceFile)}`
             ).join("\n");
             return {
               content: [

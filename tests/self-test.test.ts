@@ -907,6 +907,25 @@ check(
   relShortSeed.note === "seed summary is too short for a reliable relation",
 );
 
+// --- platform-neutral basename in model output --------------------------------------
+const winRow = {
+  sourceFile: "C:\\Users\\x\\sessions\\--F--git--\\s.jsonl.acp.json",
+  kind: "pi",
+  blockId: "b1",
+  tier: 1,
+  tokens: 1,
+  createdAt: T2,
+  summary: "winbaseMarker",
+  project: "git",
+  refStart: null,
+  refEnd: null,
+};
+const winOut = internals.formatResults({ mode: "fts", rows: [winRow] });
+check(
+  "source label reduces a Windows path to its file name",
+  winOut.includes("[pi] s.jsonl") && !winOut.includes("C:\\Users"),
+);
+
 // --- excludePaths config --------------------------------------------------------------
 const cfgEx = internals.sanitizeCfg({ excludePaths: ["Temp", " probe "] });
 check(

@@ -158,7 +158,7 @@ function noteUnsupportedFormat(key: string, message: string) {
  * matches every JSON file cannot turn them into repeating failed sources.
  */
 function isAuxiliarySourceFile(file: string): boolean {
-  const base = path.basename(String(file)).toLowerCase();
+  const base = fileBase(file).toLowerCase();
   return (
     base.endsWith(".content-store.json") ||
     base.endsWith(".fb.json") ||
@@ -446,6 +446,24 @@ export function withoutPaths(text: string): string {
       // POSIX paths, same space rule ("/home/alice/My Docs/notes.txt").
       .replace(/(?<![\w.:/\\])~?\/(?:[^\s'":,)]*\/)*[^\s'":,)]+(?: [^\s'":,)]*\/[^\s'":,)]*)*/g, "<path>")
   );
+}
+
+/**
+ * Platform-neutral basename: splits on both `/` and `\`, so a source path produced on Windows
+ * (host data) is still reduced to its file name when the extension runs under WSL/Linux. Model
+ * output and logs must never print an absolute local path.
+ */
+function fileBase(p) {
+  const s = String(p || "");
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+
+/** Platform-neutral parent directory basename (for the pi project fallback). */
+function parentBase(p) {
+  const s = String(p || "").replace(/[\\/]+$/, "");
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return i > 0 ? fileBase(s.slice(0, i)) : "";
 }
 
 /** Adapter ids the scanner understands; anything else is rejected where the allow-list is read. */
@@ -745,7 +763,7 @@ function toInt(v: any) {
  * not record a working directory, so the upstream host is the best available "project" name.
  */
 function biliHost(sourceFile) {
-  const base = path.basename(sourceFile, ".json");
+  const base = fileBase(sourceFile).replace(/\.json$/, "");
   const idx = base.lastIndexOf("_");
   return idx > 0 ? base.slice(0, idx) : base || "unknown";
 }
@@ -987,7 +1005,7 @@ export class MemoryDb {
       {
         kind: "pi",
         cwd: cwd || null,
-        project: cwd ? path.basename(cwd) : null,
+        project: cwd ? fileBase(cwd) : null,
       },
       force,
       async (sf) => piSessionHeaderCwd(sf),
@@ -1047,13 +1065,13 @@ export class MemoryDb {
           const resolved = await resolveCwd(sessionFile);
           if (typeof resolved === "string" && resolved) cwd = resolved;
         } catch (e) {
-          log(`cwd resolve failed ${path.basename(sessionFile)}: ${e.message}`);
+          log(`cwd resolve failed ${fileBase(sessionFile)}: ${e.message}`);
         }
       }
     }
     if (!project) {
-      if (cwd) project = path.basename(cwd);
-      else if (kind === "pi") project = path.basename(path.dirname(sourceFile));
+      if (cwd) project = fileBase(cwd);
+      else if (kind === "pi") project = parentBase(sourceFile);
       else if (kind === "bili") project = biliHost(sourceFile);
       else project = "unknown";
     }
@@ -1069,7 +1087,7 @@ export class MemoryDb {
     if (unsupported !== null) {
       noteUnsupportedFormat(
         `${kind}:${sourceFile}:${String(unsupported)}`,
-        `unsupported ${kind} format version ${String(unsupported)}; skipped ${path.basename(sourceFile)}`,
+        `unsupported ${kind} format version ${String(unsupported)}; skipped ${fileBase(sourceFile)}`,
       );
       return { ok: true, parsed: false, skipped: true, total: 0, inserted: 0, mtimeMs, size };
     }
@@ -1222,9 +1240,9 @@ export class MemoryDb {
       return { ok: false, parsed: true, total: blocks.length, inserted: 0, mtimeMs, size, error: e.message };
     }
     if (redactedHits > 0) {
-      logLine(`redacted ${redactedHits} potential secret(s) before storing ${path.basename(sourceFile)}`);
+      logLine(`redacted ${redactedHits} potential secret(s) before storing ${fileBase(sourceFile)}`);
     }
-    log(`ingest ${path.basename(sourceFile)} kind=${kind} project=${project} blocks=${blocks.length} new=${inserted}`);
+    log(`ingest ${fileBase(sourceFile)} kind=${kind} project=${project} blocks=${blocks.length} new=${inserted}`);
     return { ok: true, parsed: true, total: blocks.length, inserted, refreshed, redacted: redactedHits, mtimeMs, size };
   }
 
@@ -1760,16 +1778,16 @@ export async function loadOpencodeSessionMap(source, files) {
     }
     const stmt = odb.prepare("SELECT id, directory, path, project_id FROM session WHERE id = ?");
     for (const file of files) {
-      const base = path.basename(file);
+      const base = fileBase(file);
       if (!base.startsWith("ses_") || !base.endsWith(".json")) continue;
       const sessionId = base.slice(0, -5); // state file name is <sessionId>.json; session.id includes the "ses_" prefix
       const row = stmt.get(sessionId);
       if (!row) continue;
       const cwd = row.directory || row.path || null;
       const project = row.directory
-        ? path.basename(row.directory)
+        ? fileBase(row.directory)
         : row.path
-          ? path.basename(row.path)
+          ? fileBase(row.path)
           : typeof row.project_id === "string"
             ? row.project_id
             : null;
@@ -1955,7 +1973,7 @@ function fmtTokens(n) {
 
 function sourceLabel(row) {
   const kind = row.kind === "opencode" || row.kind === "bili" ? row.kind : "pi";
-  let base = path.basename(row.sourceFile || "");
+  let base = fileBase(row.sourceFile);
   if (kind === "pi" && base.endsWith(".acp.json")) base = base.slice(0, -".acp.json".length);
   return `[${kind}] ${base}`;
 }
@@ -2217,7 +2235,7 @@ function formatExpansion(row, sessionFile, res, mode) {
     `Source: ${sourceLabel(row)}`,
     // Basename only: the absolute path carries the OS user name and the encoded project directory,
     // and expansion never needs it (the `source` filter takes the session file name or project).
-    `Session: ${path.basename(sessionFile)}`,
+    `Session: ${fileBase(sessionFile)}`,
   ];
   const kb = (n) => `${Math.round(n / 1024)} KB`;
   lines.push(
@@ -2419,8 +2437,8 @@ export default async function factory(pi: ExtensionAPI) {
       cfg.debug
         ? `session_start file=${sessionFile || "(ephemeral)"} cwd=${ctx.cwd ?? ""}`
         : // Logs are what users paste into issues: without debug, keep names, not full paths.
-          `session_start file=${sessionFile ? path.basename(sessionFile) : "(ephemeral)"} ` +
-            `cwd=${ctx.cwd ? path.basename(ctx.cwd) : ""}`,
+          `session_start file=${sessionFile ? fileBase(sessionFile) : "(ephemeral)"} ` +
+            `cwd=${ctx.cwd ? fileBase(ctx.cwd) : ""}`,
     );
     if (!cfg.scanOnStartup) {
       // Startup full scan disabled: force-scan only the current session so it is visible immediately;
@@ -2443,7 +2461,7 @@ export default async function factory(pi: ExtensionAPI) {
         await scanCurrentSession(sessionFile, true, ctx.cwd); // force-scan the current session so it is visible right away
         if (generation !== sessionGeneration) return;
         const st = getDb().stats();
-        logLine(`db ready: ${path.basename(st.dbPath)} sources=${st.sources} blocks=${st.blocks}`);
+        logLine(`db ready: ${fileBase(st.dbPath)} sources=${st.sources} blocks=${st.blocks}`);
       })
       .catch((e) => logLine(`session_start scan error: ${withoutPaths(e.stack || e.message)}`));
     backgroundScan = run;
@@ -2541,7 +2559,7 @@ export default async function factory(pi: ExtensionAPI) {
               mode: "timeline",
               hits: res.rows.length,
               unknown: res.unknown,
-              dbPath: path.basename(cfg.dbPath),
+              dbPath: fileBase(cfg.dbPath),
             },
           };
         }
@@ -2554,14 +2572,14 @@ export default async function factory(pi: ExtensionAPI) {
           });
           return {
             content: [{ type: "text", text: formatRelated(res) }],
-            details: { mode: "related", hits: res.rows.length, dbPath: path.basename(cfg.dbPath) },
+            details: { mode: "related", hits: res.rows.length, dbPath: fileBase(cfg.dbPath) },
           };
         }
         const res = db.search(p.query, { project: p.project, limit: p.limit });
         const text = formatResults(res);
         return {
           content: [{ type: "text", text }],
-          details: { mode: res.mode, hits: res.rows.length, dbPath: path.basename(cfg.dbPath) },
+          details: { mode: res.mode, hits: res.rows.length, dbPath: fileBase(cfg.dbPath) },
         };
       } catch (e) {
         logLine(`memory_search error: ${withoutPaths(e.stack || e.message)}`);
@@ -2572,7 +2590,7 @@ export default async function factory(pi: ExtensionAPI) {
               text: `memory_search failed: ${withoutPaths(e.message) || "unknown error"} (the extension log has the full trace)`,
             },
           ],
-          details: { mode: "error", hits: 0, dbPath: path.basename(cfg.dbPath) },
+          details: { mode: "error", hits: 0, dbPath: fileBase(cfg.dbPath) },
         };
       }
     },
@@ -2628,7 +2646,7 @@ export default async function factory(pi: ExtensionAPI) {
               .map(
                 (r) =>
                   `- ${r.blockId} · project ${r.project || "?"} · ${fmtTs(r.createdAt) || "time unknown"}` +
-                  ` · ${path.basename(r.sourceFile)}`,
+                  ` · ${fileBase(r.sourceFile)}`,
               )
               .join("\n");
             return {
