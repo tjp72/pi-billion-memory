@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Upgraded the pi compatibility test target from `@earendil-works/pi-coding-agent` 0.85.1 to
   1.3.0; the extension continues to use only public extension APIs. This also picks up `undici`
   8.10.2 and its security fixes.
+- Adapters now honor upstream format versions: billion-context-pi sidecars carry `schemaVersion`
+  (missing = v1) and billion-context session envelopes carry `version` (1-3). An unknown **newer**
+  version is skipped and logged once, never rewritten, and never advances the watermark.
+- Auxiliary store files that live next to session files (`.content-store.json`, `*.fb.json`,
+  SQLite files) are skipped without being read, so a broad allow-list glob cannot turn them into
+  repeating failed sources.
 
 ## [0.5.2] - 2026-09-10
 

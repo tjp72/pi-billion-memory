@@ -203,6 +203,10 @@ The design is deliberately minimal; preserve these properties:
 - Upstream compression formats are internal implementations that can change. Adapters must be
   defensive: detect/ignore malformed or mid-write files (parse failure leaves the watermark
   untouched), never crash the scan, and remain easy to update when a source format changes.
+  Honor upstream version stamps — the billion-context-pi sidecar's `schemaVersion` (missing = v1)
+  and the billion-context session envelope's `version` (v1-v3 supported) — by skipping an unknown
+  newer version once and never rewriting it. Skip auxiliary store files that share the session
+  directories (`.content-store.json`, `*.fb.json`, SQLite) without reading them.
   A source that throws must degrade to a `failed` count, never abort the rest of the scan, and an
   allow-list entry with an unknown `adapter` must be rejected where the list is read.
 - Allow-list patterns are matched against paths **relative to the source root**: `*` never crosses a

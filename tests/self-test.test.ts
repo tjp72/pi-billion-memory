@@ -438,6 +438,63 @@ check("source label formatting includes bili kind", internals.formatResults(qBil
 const qOutside = db.search("outsideMarker");
 check("files outside the allow-list are never ingested", qOutside.rows.length === 0);
 
+// --- Upstream format contract: version gating + auxiliary-file skip (#368) --------
+const newerPi = path.join(whiteDir, "newer-schema.jsonl");
+fs.writeFileSync(
+  newerPi + ".acp.json",
+  JSON.stringify({
+    ...mkSidecar([{ ...b3, blockId: "bNewer", topic: "newer", summary: "newerSchemaMarker" }]),
+    schemaVersion: 99,
+    producer: "billion-context-pi@test",
+  }),
+);
+const bcNewer = path.join(biliRoot, "example.test_newer.json");
+fs.writeFileSync(
+  bcNewer,
+  JSON.stringify({
+    version: 4,
+    id: "pfa-newer",
+    payload: {
+      state: {
+        blocks: [
+          {
+            blockId: "b1",
+            runId: "r1",
+            tier: 1,
+            topic: "t",
+            summary: "bcNewerMarker",
+            compressedTokens: 1,
+            createdAt: T2,
+          },
+        ],
+      },
+    },
+  }),
+);
+fs.writeFileSync(
+  path.join(biliRoot, "abc123.content-store.json"),
+  JSON.stringify({ version: 1, byHash: {}, byRef: {} }),
+);
+fs.writeFileSync(
+  path.join(biliRoot, "deadbeef.fb.json"),
+  JSON.stringify({ id: "x", payload: { state: { blocks: [{ blockId: "b1", summary: "fbMarker" }] } } }),
+);
+
+const scanV = await internals.scanSources(false);
+check(
+  "unsupported newer sidecar schemaVersion is skipped, not ingested",
+  db.search("newerSchemaMarker").rows.length === 0,
+);
+check("unsupported newer bc envelope version is skipped, not ingested", db.search("bcNewerMarker").rows.length === 0);
+check(
+  "auxiliary store files are neither ingested nor counted as failed",
+  db.search("fbMarker").rows.length === 0 && scanV.failed === 0,
+);
+check(
+  "a repeated scan keeps skipped formats out of the failure tally",
+  (await internals.scanSources(false)).failed === 0,
+);
+
 // --- Durable prune: tombstones + watermark ledger ---------------------------------
 const pruneDb = new internals.MemoryDb(path.join(tmp, "prune.db"));
 const pruneSess = path.join(tmp, "--home-dev-Prune--", "prune.jsonl");

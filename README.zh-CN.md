@@ -32,9 +32,13 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
 - 本扩展**不会 hook pi 的 `context` 事件**，只注册 `memory_search` 工具和
   `/memory` 命令，因此可以和 billion-context-pi 同时运行，不会参与上下文压缩的
   顺序竞争，也不会覆盖压缩结果。
-- sidecar 格式是 billion-context-pi 的内部实现，可能变化。本扩展针对
-  billion-context-pi `0.1.65` 的 sidecar 格式做过测试；如果上游格式变化，
-  可能需要更新适配器。
+- sidecar 格式是 billion-context-pi 公开的下游契约：每次保存都写
+  `schemaVersion` + `producer`，未知的块字段只做加法，文件原子替换
+  （`billion-context-pi` 的 `src/contract.ts` 与 `bcp-block-v1.json`）；
+  缺失 `schemaVersion` 视为 v1。本扩展会读取版本号，遇到**未知的更新版本会跳过**
+  （只记一次日志、绝不改写），因此上游格式升级不会写坏或误吞数据。
+  billion-context（代理/原生）的会话信封（`{version, payload.state.blocks}`）
+  也按版本 1-3 同样读取。
 - billion-context-pi 使用 MIT 许可证；它的名称和 logo 归其作者所有。
   本项目的 MIT 许可证只覆盖本项目代码。
 

@@ -37,9 +37,14 @@ affiliated with, endorsed by, or a fork of**
   `memory_search` tool and the `/memory` command, so it is safe to run
   alongside billion-context-pi. It does not participate in context-compression
   ordering or clobber compressed output.
-- The sidecar format is an implementation detail of billion-context-pi and may
-  change. This extension is tested against the sidecar format produced by
-  billion-context-pi `0.1.65`; a format change may require an adapter update.
+- The sidecar format is a published downstream contract: billion-context-pi
+  writes `schemaVersion` + `producer` on every save, unknown extra block fields
+  are additive, and files are replaced atomically (`billion-context-pi`
+  `src/contract.ts`, schema `bcp-block-v1.json`). A missing `schemaVersion` means
+  v1. This extension reads the version and **skips** an unknown newer version
+  (logging once, never rewriting it), so a future format bump cannot corrupt or
+  mis-ingest the store. billion-context (proxy/native) session envelopes
+  (`{version, payload.state.blocks}`) are read at versions 1-3 the same way.
 - billion-context-pi is MIT-licensed. Its name and logo belong to its authors.
   This project's MIT license covers only this project's code.
 

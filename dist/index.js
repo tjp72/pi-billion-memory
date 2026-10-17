@@ -297,6 +297,34 @@ var LOG_MAX_BYTES = 1e6;
 var TRIGRAM_MIN_LEN = 3;
 var PI_MAP_TTL_MS = 10 * 60 * 1e3;
 var SESSION_HEADER_MAX_BYTES = 1e6;
+var SUPPORTED_SIDECAR_SCHEMA_VERSION = 1;
+var SUPPORTED_BC_ENVELOPE_VERSIONS = /* @__PURE__ */ new Set([1, 2, 3]);
+var unsupportedFormatNotices = /* @__PURE__ */ new Set();
+function noteUnsupportedFormat(key, message) {
+  if (unsupportedFormatNotices.has(key)) return;
+  unsupportedFormatNotices.add(key);
+  logLine(message);
+}
+function isAuxiliarySourceFile(file) {
+  const base = path.basename(String(file)).toLowerCase();
+  return base.endsWith(".content-store.json") || base.endsWith(".fb.json") || base.endsWith(".db") || base.endsWith(".db-wal") || base.endsWith(".db-shm");
+}
+function unsupportedSidecarSchema(data) {
+  if (!data || typeof data !== "object") return null;
+  const raw = data.schemaVersion;
+  if (raw === void 0 || raw === null) return null;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) return raw;
+  return raw > SUPPORTED_SIDECAR_SCHEMA_VERSION ? raw : null;
+}
+function unsupportedBcEnvelope(data) {
+  if (!data || typeof data !== "object") return null;
+  const payload = data.payload;
+  if (!payload || typeof payload !== "object") return null;
+  const raw = data.version;
+  if (raw === void 0 || raw === null) return null;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) return raw;
+  return SUPPORTED_BC_ENVELOPE_VERSIONS.has(raw) ? null : raw;
+}
 function sanitizeCfg(over) {
   const out = {};
   if (!over || typeof over !== "object") return out;
@@ -869,6 +897,9 @@ var MemoryDb = class {
     }
     const mtimeMs = st.mtimeMs;
     const size = st.size;
+    if (isAuxiliarySourceFile(sourceFile)) {
+      return { ok: true, parsed: false, skipped: true, total: 0, inserted: 0, mtimeMs, size };
+    }
     const kind = meta?.kind === "opencode" ? "opencode" : meta?.kind === "bili" ? "bili" : "pi";
     let cwd = typeof meta?.cwd === "string" && meta.cwd ? meta.cwd : null;
     let project = typeof meta?.project === "string" && meta.project ? meta.project : null;
@@ -904,6 +935,14 @@ var MemoryDb = class {
       data = JSON.parse(await fs.promises.readFile(sourceFile, "utf8"));
     } catch (e) {
       return { ok: false, parsed: false, total: 0, inserted: 0, mtimeMs, size, error: `parse: ${e.message}` };
+    }
+    const unsupported = kind === "pi" ? unsupportedSidecarSchema(data) : kind === "bili" ? unsupportedBcEnvelope(data) : null;
+    if (unsupported !== null) {
+      noteUnsupportedFormat(
+        `${kind}:${sourceFile}:${String(unsupported)}`,
+        `unsupported ${kind} format version ${String(unsupported)}; skipped ${path.basename(sourceFile)}`
+      );
+      return { ok: true, parsed: false, skipped: true, total: 0, inserted: 0, mtimeMs, size };
     }
     const blocks = kind === "pi" ? normalizePiBlocks(data) : kind === "bili" ? normalizeBiliBlocks(data) : normalizeOpencodeBlocks(data);
     if (blocks === null) {
@@ -1349,6 +1388,7 @@ async function scanSources(force = false) {
 async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) {
   const listing = await listSourceFiles(source);
   let files = listing.files;
+  files = files.filter((f) => !isAuxiliarySourceFile(f));
   if (listing.errors.length) {
     tally.failed += listing.errors.length;
     const first = listing.errors[0];
@@ -1384,7 +1424,7 @@ async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) 
     }
     const r = await d.ingestSourceFile(file, meta, force, source.adapter === "pi-sidecar" ? resolvePiCwd : null);
     if (r.parsed) tally.scanned++;
-    if (!r.ok && r.error && r.error !== "no source file") {
+    if (!r.ok && !r.skipped && r.error && r.error !== "no source file") {
       tally.failed++;
       if (cfg.debug) log(`scan failed ${file}: ${r.error}`);
     }

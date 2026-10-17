@@ -9,8 +9,9 @@
  *              under ~/.pi/agent/sessions/** (default source "pi")
  *   - opencode: opencode-acp state files    ses_*.json (filename = <session.id>.json)
  *              under <home>/.local/share/opencode/storage/plugin/acp (default source "opencode")
- *   - bili:     billion-context proxy session files <host>_<hash>.json (WorkBuddy/codebuddy
- *              proxied sessions) under <home>/.local/share/billion-context/sessions/** (no default)
+ *   - bili:     billion-context session files <host>_<hash>.json (envelope {version,payload} with
+ *              blocks under payload.state.blocks; versions 1-3) or proxy session files
+ *              (WorkBuddy/codebuddy) under <home>/.local/share/billion-context/sessions/** (no default)
  *
  * The allow-list lives in ~/.pi/pi-billion-memory.sources.jsonl (one JSON object per line).
  * Each line points at a root directory + file pattern and selects the adapter that knows how
@@ -102,6 +103,60 @@ const TRIGRAM_MIN_LEN = 3;
 const PI_MAP_TTL_MS = 10 * 60 * 1000;
 /** Hard cap for the session header read; the first line is normally a few KB */
 const SESSION_HEADER_MAX_BYTES = 1_000_000;
+/**
+ * billion-context-pi writes `schemaVersion` on every sidecar save; a missing value means the
+ * pre-contract v1 (#368). An unknown NEWER version means block fields may have changed, so the
+ * file is skipped (never rewritten, watermark not advanced) and reported once.
+ */
+const SUPPORTED_SIDECAR_SCHEMA_VERSION = 1;
+/** billion-context session-envelope versions this extension understands. */
+const SUPPORTED_BC_ENVELOPE_VERSIONS = new Set([1, 2, 3]);
+/** Keys of unsupported-format notices already logged, so repeated scans stay quiet. */
+const unsupportedFormatNotices = new Set<string>();
+
+/** Log an unsupported-format notice once per key; the file itself is never rewritten. */
+function noteUnsupportedFormat(key: string, message: string) {
+  if (unsupportedFormatNotices.has(key)) return;
+  unsupportedFormatNotices.add(key);
+  logLine(message);
+}
+
+/**
+ * Auxiliary files share the compression directories but hold no blocks: billion-context's
+ * content-addressed original store (`<hash>.content-store.json`), the kernel store's fallback slot
+ * (`*.fb.json`), and SQLite sidecars. They are skipped without reading so an allow-list glob that
+ * matches every JSON file cannot turn them into repeating failed sources.
+ */
+function isAuxiliarySourceFile(file: string): boolean {
+  const base = path.basename(String(file)).toLowerCase();
+  return (
+    base.endsWith(".content-store.json") ||
+    base.endsWith(".fb.json") ||
+    base.endsWith(".db") ||
+    base.endsWith(".db-wal") ||
+    base.endsWith(".db-shm")
+  );
+}
+
+/** null when the pi sidecar uses a supported schema version, else the unsupported version. */
+function unsupportedSidecarSchema(data: any) {
+  if (!data || typeof data !== "object") return null;
+  const raw = data.schemaVersion;
+  if (raw === undefined || raw === null) return null; // pre-contract files are v1
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) return raw;
+  return raw > SUPPORTED_SIDECAR_SCHEMA_VERSION ? raw : null;
+}
+
+/** null when the billion-context envelope uses a supported version, else the unsupported version. */
+function unsupportedBcEnvelope(data: any) {
+  if (!data || typeof data !== "object") return null;
+  const payload = data.payload;
+  if (!payload || typeof payload !== "object") return null; // legacy flat shape, not this envelope
+  const raw = data.version;
+  if (raw === undefined || raw === null) return null; // pre-envelope record: read as v1
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) return raw;
+  return SUPPORTED_BC_ENVELOPE_VERSIONS.has(raw) ? null : raw;
+}
 
 /** @internal Test seam: the same sanitizer the config loader uses. */
 export function sanitizeCfg(over) {
@@ -863,6 +918,10 @@ export class MemoryDb {
     }
     const mtimeMs = st.mtimeMs;
     const size = st.size;
+    if (isAuxiliarySourceFile(sourceFile)) {
+      // Content stores and SQLite sidecars live next to session files but hold no blocks.
+      return { ok: true, parsed: false, skipped: true, total: 0, inserted: 0, mtimeMs, size };
+    }
     const kind = meta?.kind === "opencode" ? "opencode" : meta?.kind === "bili" ? "bili" : "pi";
     let cwd = typeof meta?.cwd === "string" && meta.cwd ? meta.cwd : null;
     let project = typeof meta?.project === "string" && meta.project ? meta.project : null;
@@ -904,6 +963,15 @@ export class MemoryDb {
     } catch (e) {
       // Possibly mid-write by another process: leave watermark untouched, retry next scan
       return { ok: false, parsed: false, total: 0, inserted: 0, mtimeMs, size, error: `parse: ${e.message}` };
+    }
+    const unsupported =
+      kind === "pi" ? unsupportedSidecarSchema(data) : kind === "bili" ? unsupportedBcEnvelope(data) : null;
+    if (unsupported !== null) {
+      noteUnsupportedFormat(
+        `${kind}:${sourceFile}:${String(unsupported)}`,
+        `unsupported ${kind} format version ${String(unsupported)}; skipped ${path.basename(sourceFile)}`,
+      );
+      return { ok: true, parsed: false, skipped: true, total: 0, inserted: 0, mtimeMs, size };
     }
     const blocks =
       kind === "pi"
@@ -1471,6 +1539,8 @@ export async function scanSources(force = false) {
 async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) {
   const listing = await listSourceFiles(source);
   let files = listing.files;
+  // Auxiliary store files (content-store, fallback slots, SQLite) are not compression sources.
+  files = files.filter((f) => !isAuxiliarySourceFile(f));
   if (listing.errors.length) {
     // An unreadable or missing root must be visible: treating it as "0 files" hid permission
     // errors and stale allow-list paths from both the log and the failure tally.
@@ -1513,7 +1583,7 @@ async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) 
     }
     const r = await d.ingestSourceFile(file, meta, force, source.adapter === "pi-sidecar" ? resolvePiCwd : null);
     if (r.parsed) tally.scanned++;
-    if (!r.ok && r.error && r.error !== "no source file") {
+    if (!r.ok && !r.skipped && r.error && r.error !== "no source file") {
       tally.failed++;
       if (cfg.debug) log(`scan failed ${file}: ${r.error}`);
     }
