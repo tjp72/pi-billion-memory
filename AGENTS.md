@@ -231,7 +231,10 @@ The design is deliberately minimal; preserve these properties:
   Honor upstream version stamps — the billion-context-pi sidecar's `schemaVersion` (missing = v1)
   and the billion-context session envelope's `version` (v1-v3 supported) — by skipping an unknown
   newer version once and never rewriting it. Skip auxiliary store files that share the session
-  directories (`.content-store.json`, `*.fb.json`, SQLite) without reading them.
+  directories (`.content-store.json`, `*.fb.json`, SQLite) without reading them. Treat every
+  upstream scalar as untrusted: length-cap the project label, `producer`, `compress_call_id` and
+  lineage ids, accept only a fixed `generation` vocabulary, cap the query length/token count, and
+  keep a hard catalog ceiling (refuse above it, never silently truncate).
   A source that throws must degrade to a `failed` count, never abort the rest of the scan, and an
   allow-list entry with an unknown `adapter` must be rejected where the list is read.
 - Allow-list patterns are matched against paths **relative to the source root**: `*` never crosses a

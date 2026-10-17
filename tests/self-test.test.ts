@@ -572,6 +572,69 @@ check(
   db.db.prepare("SELECT format_version FROM sources WHERE source_file = ?").get(bcV2).format_version === 2,
 );
 
+// --- untrusted upstream metadata caps (anti-bloat) ----------------------------------
+const capSess = path.join(tmp, "--home-dev-CapProj--", "cap.jsonl");
+writeSidecar(capSess, [
+  {
+    blockId: "bCap",
+    runId: "rCap",
+    tier: 1,
+    topic: "cap",
+    summary: "capMarker untrusted metadata",
+    compressedTokens: 1,
+    createdAt: T2,
+    startRef: "m00001",
+    endRef: "m00002",
+    generation: "x".repeat(500),
+    compressCallId: "c".repeat(500),
+    directBlockIds: ["d".repeat(500)],
+  },
+]);
+await db.ingestSidecarFile(capSess, "/home/dev/CapProj");
+const capRow = db.db
+  .prepare("SELECT generation, compress_call_id, direct_block_ids FROM blocks WHERE block_id = 'bCap'")
+  .get();
+check(
+  "a hostile generation value is rejected and long id fields are capped",
+  capRow.generation === null &&
+    capRow.compress_call_id.length === 200 &&
+    capRow.direct_block_ids.length <= 210 &&
+    !capRow.direct_block_ids.includes("d".repeat(300)),
+);
+const longQuery = Array.from({ length: 100 }, (_, i) => `tok${i}`).join(" ");
+check(
+  "an oversized query is token-capped instead of building unbounded SQL",
+  typeof db.search(longQuery, { project: "CapProj" }).mode === "string",
+);
+const cfgCap = internals.sanitizeCfg({ excludePaths: ["x".repeat(500)] });
+check("excludePaths entries are length-capped", cfgCap.excludePaths[0].length === 200);
+fs.writeFileSync(
+  path.join(biliRoot, "cap_host.json"),
+  JSON.stringify({
+    version: 2,
+    id: "cap-origin",
+    payload: {
+      meta: { protocol: "openai", upstreamOrigin: "o".repeat(500) },
+      state: {
+        blocks: [
+          {
+            blockId: "b1",
+            runId: "r",
+            tier: 1,
+            topic: "t",
+            summary: "capOriginMarker",
+            compressedTokens: 1,
+            createdAt: T2,
+          },
+        ],
+      },
+    },
+  }),
+);
+await internals.scanSources(false);
+const capProj = db.db.prepare("SELECT project FROM sources WHERE source_file LIKE ?").get("%cap_host.json").project;
+check("a bili project label from an untrusted origin is capped", capProj.length === 200);
+
 // --- Memory line: timeline + related (mode extension) -------------------------------
 const tlSess = path.join(tmp, "--home-dev-Timeline--", "tl.jsonl");
 const tlT0 = T2;

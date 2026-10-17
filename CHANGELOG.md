@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Hardening for untrusted input: upstream metadata (project label, `producer`,
+  `compress_call_id`, lineage ids) is length-capped and `generation` accepts only `young`/`old`;
+  the query is length/token capped; the full timeline catalog refuses (with a hint) above 20000
+  rows instead of silently truncating or exhausting memory.
+
 ## [0.6.0] - 2026-10-18
 
 ### Added

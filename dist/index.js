@@ -512,6 +512,17 @@ var MAX_TOPIC_CHARS = 200;
 var PREVIEW_CHARS = 600;
 var MAX_MSG_IDS = 4e3;
 var MAX_DIRECT_BLOCKS = 1e3;
+var MAX_DIRECT_ITEM = 200;
+var MAX_CALL_ID_FIELD = 200;
+var MAX_PRODUCER_FIELD = 200;
+var MAX_PROJECT_LABEL = 200;
+var MAX_ID_FIELD = 200;
+var MAX_SOURCE_FIELD = 300;
+var MAX_EXCLUDE_PATH = 200;
+var MAX_CWD_HINT = 1024;
+var MAX_QUERY_CHARS = 512;
+var MAX_QUERY_TOKENS = 32;
+var MAX_TIMELINE_ROWS = 2e4;
 var EXPAND_MANIFEST_MAX = 300;
 var DEFAULT_RESULT_LIMIT = 6;
 var MAX_RESULT_LIMIT = 20;
@@ -563,7 +574,7 @@ function sanitizeCfg(over) {
   if (typeof over.debug === "boolean") out.debug = over.debug;
   if (Array.isArray(over.excludeDirs)) out.excludeDirs = over.excludeDirs.filter((x) => typeof x === "string");
   if (Array.isArray(over.excludePaths))
-    out.excludePaths = over.excludePaths.filter((x) => typeof x === "string" && x.trim() !== "").map((x) => x.trim());
+    out.excludePaths = over.excludePaths.filter((x) => typeof x === "string" && x.trim() !== "").map((x) => x.trim().slice(0, MAX_EXCLUDE_PATH));
   if (typeof over.scanOnStartup === "boolean") out.scanOnStartup = over.scanOnStartup;
   if (typeof over.sourcesPath === "string" && over.sourcesPath) out.sourcesPath = expandHome(over.sourcesPath);
   if (typeof over.logPath === "string" && over.logPath) out.logPath = expandHome(over.logPath);
@@ -764,8 +775,9 @@ function sanitizeSource(raw) {
     enabled: raw.enabled !== false
   };
   if (typeof raw.opencodeDb === "string" && raw.opencodeDb) out.opencodeDb = expandHome(raw.opencodeDb);
-  if (typeof raw.project === "string" && raw.project.trim()) out.project = raw.project.trim();
-  if (typeof raw.cwd === "string" && raw.cwd) out.cwd = expandHome(raw.cwd);
+  if (typeof raw.project === "string" && raw.project.trim())
+    out.project = raw.project.trim().slice(0, MAX_PROJECT_LABEL);
+  if (typeof raw.cwd === "string" && raw.cwd) out.cwd = expandHome(raw.cwd).slice(0, MAX_CWD_HINT);
   return out;
 }
 async function loadSources() {
@@ -898,14 +910,15 @@ function collectMsgIds(block) {
   return out.length ? out : null;
 }
 function blockMetaFields(b) {
-  const direct = Array.isArray(b?.directBlockIds) ? b.directBlockIds.filter((x) => typeof x === "string" && x !== "").slice(0, MAX_DIRECT_BLOCKS) : [];
+  const direct = Array.isArray(b?.directBlockIds) ? b.directBlockIds.filter((x) => typeof x === "string" && x !== "").slice(0, MAX_DIRECT_BLOCKS).map((x) => x.slice(0, MAX_DIRECT_ITEM)) : [];
   return {
     active: typeof b?.active === "boolean" ? b.active ? 1 : 0 : null,
     directBlockIds: direct.length ? JSON.stringify(direct) : null,
     durationMs: toInt(b?.durationMs),
-    generation: typeof b?.generation === "string" && b.generation ? b.generation : null,
+    // Fixed vocabulary only, so a hostile value cannot inject arbitrary text into the store.
+    generation: b?.generation === "young" || b?.generation === "old" ? b.generation : null,
     survivedCount: toInt(b?.survivedCount),
-    compressCallId: typeof b?.compressCallId === "string" && b.compressCallId ? b.compressCallId : null
+    compressCallId: typeof b?.compressCallId === "string" && b.compressCallId ? b.compressCallId.slice(0, MAX_CALL_ID_FIELD) : null
   };
 }
 function normalizePiBlocks(data) {
@@ -965,13 +978,21 @@ function biliHost(sourceFile) {
   const idx = base.lastIndexOf("_");
   return idx > 0 ? base.slice(0, idx) : base || "unknown";
 }
+function cleanLabel(s) {
+  let out = "";
+  for (const ch of String(s || "")) {
+    const code = ch.charCodeAt(0);
+    if (code > 31 && code !== 127) out += ch;
+  }
+  return out;
+}
 function biliProject(data, sourceFile) {
   const payload = data?.payload ?? {};
   const meta = payload?.meta ?? {};
   const origin = meta.upstreamOrigin ?? payload.upstreamOrigin ?? data?.upstreamOrigin;
-  if (typeof origin === "string" && origin.trim()) return origin.trim();
+  if (typeof origin === "string" && origin.trim()) return cleanLabel(origin.trim()).slice(0, MAX_PROJECT_LABEL);
   const protocol = meta.protocol ?? payload.protocol ?? data?.protocol;
-  if (typeof protocol === "string" && protocol.trim()) return protocol.trim();
+  if (typeof protocol === "string" && protocol.trim()) return cleanLabel(protocol.trim()).slice(0, MAX_PROJECT_LABEL);
   return biliHost(sourceFile);
 }
 function normalizeBiliBlocks(data) {
@@ -1235,8 +1256,9 @@ var MemoryDb = class {
       return { ok: true, parsed: false, skipped: true, total: 0, inserted: 0, mtimeMs, size };
     }
     const formatVersion = kind === "pi" ? typeof data?.schemaVersion === "number" && Number.isInteger(data.schemaVersion) ? data.schemaVersion : 1 : kind === "bili" ? typeof data?.version === "number" && Number.isInteger(data.version) ? data.version : 1 : null;
-    const producer = typeof data?.producer === "string" && data.producer ? data.producer : null;
+    const producer = typeof data?.producer === "string" && data.producer ? data.producer.slice(0, MAX_PRODUCER_FIELD) : null;
     if (kind === "bili") project = biliProject(data, sourceFile);
+    if (typeof project === "string") project = cleanLabel(project).slice(0, MAX_PROJECT_LABEL) || "unknown";
     const blocks = kind === "pi" ? normalizePiBlocks(data) : kind === "bili" ? normalizeBiliBlocks(data) : normalizeOpencodeBlocks(data);
     if (blocks === null) {
       return {
@@ -1413,7 +1435,7 @@ var MemoryDb = class {
    * queries. Returns null for an empty query (callers decide what "no filter" means).
    */
   _buildFilter(query, project = null) {
-    const tokens = String(query || "").trim().split(/\s+/).filter(Boolean);
+    const tokens = String(query || "").trim().split(/\s+/).filter(Boolean).slice(0, MAX_QUERY_TOKENS);
     if (tokens.length === 0) return null;
     const escapeLike = (s) => s.replace(/[\\%_]/g, (m) => "\\" + m);
     const ftsTokens = tokens.filter((t) => t.length >= TRIGRAM_MIN_LEN);
@@ -1521,10 +1543,21 @@ var MemoryDb = class {
       ${from}
       WHERE ${where}
       ORDER BY b.created_at DESC, b.id DESC
+      LIMIT ?
     `;
     let rows = [];
     try {
-      rows = this.db.prepare(sql).all(...params);
+      rows = this.db.prepare(sql).all(...params, MAX_TIMELINE_ROWS + 1);
+      if (rows.length > MAX_TIMELINE_ROWS) {
+        return {
+          mode: "timeline",
+          rows: [],
+          listed: 0,
+          total: MAX_TIMELINE_ROWS + 1,
+          hiddenByLimit: 0,
+          note: `too many matches (>${MAX_TIMELINE_ROWS}); narrow with project/from/to`
+        };
+      }
     } catch (e) {
       logLine(`timeline error: ${withoutPaths(e.message)}`);
       rows = [];
@@ -2487,12 +2520,12 @@ function readMemoryExpandParams(raw) {
 }
 function readMemorySearchParams(raw) {
   const value = raw && typeof raw === "object" ? raw : {};
-  const query = typeof value.query === "string" ? value.query : "";
-  const project = typeof value.project === "string" && value.project.trim().length > 0 ? value.project.trim() : null;
+  const query = typeof value.query === "string" ? value.query.slice(0, MAX_QUERY_CHARS) : "";
+  const project = typeof value.project === "string" && value.project.trim().length > 0 ? value.project.trim().slice(0, MAX_PROJECT_LABEL) : null;
   const limit = typeof value.limit === "number" && Number.isInteger(value.limit) ? value.limit : DEFAULT_RESULT_LIMIT;
   const mode = value.mode === "timeline" ? "timeline" : value.mode === "related" ? "related" : "blocks";
-  const block = typeof value.block === "string" && value.block.trim() ? value.block.trim() : null;
-  const source = typeof value.source === "string" && value.source.trim() ? value.source.trim() : null;
+  const block = typeof value.block === "string" && value.block.trim() ? value.block.trim().slice(0, MAX_ID_FIELD) : null;
+  const source = typeof value.source === "string" && value.source.trim() ? value.source.trim().slice(0, MAX_SOURCE_FIELD) : null;
   const int = (v) => typeof v === "number" && Number.isInteger(v) ? v : null;
   return {
     query,
