@@ -2011,6 +2011,9 @@ function sourceLabel(row) {
   if (kind === "pi" && base.endsWith(".acp.json")) base = base.slice(0, -".acp.json".length);
   return `[${kind}] ${base}`;
 }
+function redactOut(text) {
+  return redactSecrets(text).text;
+}
 function duplicateNote(row) {
   return row && row.alsoFrom && row.alsoFrom.length ? `Also from: ${row.alsoFrom.join(", ")}
 ` : "";
@@ -2313,11 +2316,11 @@ function formatResults(res) {
     const project = r.project || "?";
     const tm = fmtTs(r.createdAt);
     const refs = r.refStart ? ` [${r.refStart}${r.refEnd && r.refEnd !== r.refStart ? "\u2013" + r.refEnd : ""}]` : "";
-    const topic = r.topic ? `Topic: ${r.topic}
+    const topic = r.topic ? `Topic: ${redactOut(r.topic)}
 ` : "";
     let summary = r.summary || "";
     if (summary.length > PREVIEW_CHARS) summary = summary.slice(0, PREVIEW_CHARS) + "\u2026";
-    summary = summary.replace(/\n{3,}/g, "\n\n").trim();
+    summary = redactOut(summary.replace(/\n{3,}/g, "\n\n").trim());
     return `[${i + 1}] project ${project} \xB7 ${tm || "time unknown"} \xB7 ${r.blockId || ""} \xB7 tier${r.tier ?? "?"} \xB7 ${fmtTokens(r.tokens) || "?"} tokens compressed${refs}
 Source: ${sourceLabel(r)}
 ${duplicateNote(r)}${topic}${summary}`;
@@ -2331,7 +2334,7 @@ function formatTimeline(res) {
     return "No timeline entries. Try: 1) a broader query; 2) another project; 3) a wider time window (from/to or windowMinutes).";
   }
   const oneLine = (s) => String(s || "").replace(/\s+/g, " ").trim();
-  const line = (r, time) => `${time} \xB7 ${r.project || "?"} \xB7 ${r.blockId || "?"} \xB7 tier${r.tier ?? "?"} \xB7 ${oneLine(r.topic) || "(no topic)"}${r.duplicateCount ? ` (+${r.duplicateCount})` : ""}`;
+  const line = (r, time) => `${time} \xB7 ${r.project || "?"} \xB7 ${r.blockId || "?"} \xB7 tier${r.tier ?? "?"} \xB7 ${redactOut(oneLine(r.topic)) || "(no topic)"}${r.duplicateCount ? ` (+${r.duplicateCount})` : ""}`;
   const lines = [];
   const scope = res.listed && res.listed > rows.length ? `${rows.length} of ${res.listed}` : `${rows.length}`;
   lines.push(`Memory timeline (${scope} entr${rows.length === 1 ? "y" : "ies"}):`);
@@ -2369,11 +2372,13 @@ function formatRelated(res) {
   const seed = res.seed ? ` (seed ${res.seed.blockId}${res.seed.project ? ` in ${res.seed.project}` : ""})` : "";
   const parts = rows.map((r, i) => {
     const time = fmtTs(r.createdAt) || "time missing";
-    const evidence = String(r.evidence || "").replace(/\n{2,}/g, "\n").trim();
+    const evidence = redactOut(
+      String(r.evidence || "").replace(/\n{2,}/g, "\n").trim()
+    );
     return `[${i + 1}] score ${(r.score ?? 0).toFixed(2)} \xB7 ${time} \xB7 project ${r.project || "?"} \xB7 ${r.blockId || ""} \xB7 tier${r.tier ?? "?"}
 Why: ${(r.reasons || []).join(", ") || "related"}
 Source: ${sourceLabel(r)}
-${duplicateNote(r)}Topic: ${r.topic || "(no topic)"}
+${duplicateNote(r)}Topic: ${redactOut(r.topic || "(no topic)")}
 Evidence: ${evidence}`;
   });
   return `Related blocks${seed}: ${rows.length}:
@@ -2384,9 +2389,9 @@ function formatBlockDetail(row) {
     `Block ${row.blockId}${row.tier != null ? ` (tier ${row.tier})` : ""} \xB7 project ${row.project || "unknown"}${row.createdAt ? ` \xB7 ${fmtTs(row.createdAt)}` : " \xB7 time unknown"} \xB7 ${fmtTokens(row.tokens) || "?"} tok compressed`,
     `Source: ${sourceLabel(row)}`
   ];
-  if (row.topic) lines.push(`Topic: ${row.topic}`);
+  if (row.topic) lines.push(`Topic: ${redactOut(row.topic)}`);
   lines.push("");
-  lines.push(row.summary || "(no stored summary)");
+  lines.push(redactOut(row.summary || "(no stored summary)"));
   return lines.join("\n");
 }
 function formatExpansion(row, sessionFile, res, mode) {

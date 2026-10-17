@@ -2066,6 +2066,15 @@ function sourceLabel(row) {
   return `[${kind}] ${base}`;
 }
 
+/**
+ * Defense-in-depth: re-run the secret filter on anything returned to the model. Rows ingested
+ * before the current filter (or copied in) may still hold a value that matches a pattern now, and
+ * stored summaries are never rewritten in place.
+ */
+function redactOut(text) {
+  return redactSecrets(text).text;
+}
+
 /** Secondary-source line for a memory that was copied across source files (fork artifacts). */
 function duplicateNote(row) {
   return row && row.alsoFrom && row.alsoFrom.length ? `Also from: ${row.alsoFrom.join(", ")}\n` : "";
@@ -2429,10 +2438,10 @@ export function formatResults(res) {
     const project = r.project || "?";
     const tm = fmtTs(r.createdAt);
     const refs = r.refStart ? ` [${r.refStart}${r.refEnd && r.refEnd !== r.refStart ? "–" + r.refEnd : ""}]` : "";
-    const topic = r.topic ? `Topic: ${r.topic}\n` : "";
+    const topic = r.topic ? `Topic: ${redactOut(r.topic)}\n` : "";
     let summary = r.summary || "";
     if (summary.length > PREVIEW_CHARS) summary = summary.slice(0, PREVIEW_CHARS) + "…";
-    summary = summary.replace(/\n{3,}/g, "\n\n").trim();
+    summary = redactOut(summary.replace(/\n{3,}/g, "\n\n").trim());
     return (
       `[${i + 1}] project ${project} · ${tm || "time unknown"} · ${r.blockId || ""}` +
       ` · tier${r.tier ?? "?"} · ${fmtTokens(r.tokens) || "?"} tokens compressed${refs}\n` +
@@ -2463,7 +2472,7 @@ export function formatTimeline(res) {
       .replace(/\s+/g, " ")
       .trim();
   const line = (r, time) =>
-    `${time} · ${r.project || "?"} · ${r.blockId || "?"} · tier${r.tier ?? "?"} · ${oneLine(r.topic) || "(no topic)"}` +
+    `${time} · ${r.project || "?"} · ${r.blockId || "?"} · tier${r.tier ?? "?"} · ${redactOut(oneLine(r.topic)) || "(no topic)"}` +
     `${r.duplicateCount ? ` (+${r.duplicateCount})` : ""}`;
   const lines = [];
   const scope = res.listed && res.listed > rows.length ? `${rows.length} of ${res.listed}` : `${rows.length}`;
@@ -2505,13 +2514,15 @@ export function formatRelated(res) {
   const seed = res.seed ? ` (seed ${res.seed.blockId}${res.seed.project ? ` in ${res.seed.project}` : ""})` : "";
   const parts = rows.map((r, i) => {
     const time = fmtTs(r.createdAt) || "time missing";
-    const evidence = String(r.evidence || "")
-      .replace(/\n{2,}/g, "\n")
-      .trim();
+    const evidence = redactOut(
+      String(r.evidence || "")
+        .replace(/\n{2,}/g, "\n")
+        .trim(),
+    );
     return (
       `[${i + 1}] score ${(r.score ?? 0).toFixed(2)} · ${time} · project ${r.project || "?"} · ${r.blockId || ""}` +
       ` · tier${r.tier ?? "?"}\nWhy: ${(r.reasons || []).join(", ") || "related"}\n` +
-      `Source: ${sourceLabel(r)}\n${duplicateNote(r)}Topic: ${r.topic || "(no topic)"}\nEvidence: ${evidence}`
+      `Source: ${sourceLabel(r)}\n${duplicateNote(r)}Topic: ${redactOut(r.topic || "(no topic)")}\nEvidence: ${evidence}`
     );
   });
   return `Related blocks${seed}: ${rows.length}:\n` + parts.join("\n\n---\n\n");
@@ -2525,9 +2536,9 @@ export function formatBlockDetail(row) {
       ` · ${fmtTokens(row.tokens) || "?"} tok compressed`,
     `Source: ${sourceLabel(row)}`,
   ];
-  if (row.topic) lines.push(`Topic: ${row.topic}`);
+  if (row.topic) lines.push(`Topic: ${redactOut(row.topic)}`);
   lines.push("");
-  lines.push(row.summary || "(no stored summary)");
+  lines.push(redactOut(row.summary || "(no stored summary)"));
   return lines.join("\n");
 }
 function formatExpansion(row, sessionFile, res, mode) {

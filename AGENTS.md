@@ -33,7 +33,9 @@ Concretely:
   cookies, Chinese labels, and URLs (http/https/ftp/file/ssh/git/ws(s)/db schemes and bare
   `www.` hosts; URLs become `[REDACTED_URL]`). It must never be disabled, bypassed, or
   weakened; tests must prove both direct redaction and that an ingested secret is not
-  searchable.
+  searchable. **Model-facing output is filtered again** (search results, timeline topic, related
+  evidence, `memory_get`) as defense-in-depth, because rows ingested before the current filter
+  (or copied in) are never rewritten and may hold a value the filter would now catch.
 
 ## 2. Language — English only, with two sanctioned exceptions
 

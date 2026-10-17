@@ -1002,6 +1002,29 @@ check(
 );
 check("memory_get reports a missing block", db.getBlock("nope", null).found === false);
 
+// --- output-time redaction (legacy rows predate the current filter) ------------------
+const legacySecret = "sk-" + "A".repeat(32);
+const legacyFile = path.join(tmp, "legacy.jsonl.acp.json");
+db.db
+  .prepare(
+    "INSERT INTO sources(source_file, kind, project, last_mtime_ms, last_size, first_seen_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+  )
+  .run(legacyFile, "pi", "LegacyProj", 1, 1, T2, T2);
+db.db
+  .prepare(
+    "INSERT INTO blocks(source_file, kind, block_id, tier, topic, summary, compressed_tokens, created_at) VALUES (?,?,?,?,?,?,?,?)",
+  )
+  .run(legacyFile, "pi", "bLegacy", 1, "legacy topic", `legacySecretMarker ${legacySecret} end`, 1, T2);
+const legacyOut = internals.formatResults(db.search("legacySecretMarker", { project: "LegacyProj" }));
+check(
+  "output-time redaction masks a legacy unredacted secret",
+  !legacyOut.includes(legacySecret) && legacyOut.includes("[REDACTED]"),
+);
+check(
+  "output-time redaction does not touch the stored row",
+  db.db.prepare("SELECT summary FROM blocks WHERE block_id='bLegacy'").get().summary.includes(legacySecret),
+);
+
 // --- CJK 2-char words relate through shingles ---------------------------------------
 const bigSess = path.join(tmp, "--home-dev-BigramProj--", "big.jsonl");
 writeSidecar(bigSess, [
