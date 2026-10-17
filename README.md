@@ -37,6 +37,13 @@ affiliated with, endorsed by, or a fork of**
   `memory_search` tool and the `/memory` command, so it is safe to run
   alongside billion-context-pi. It does not participate in context-compression
   ordering or clobber compressed output.
+- billion-context-pi stores compression summaries verbatim and does **not**
+  redact secrets (its only summary normalizer decodes `\uXXXX` escapes); the
+  model can therefore write a credential into a summary and the sidecar keeps
+  it. This extension redacts secrets on ingestion **and** re-runs the filter on
+  everything it returns to the model, so a value that slipped in before the
+  current filter cannot resurface. Stored rows are not rewritten; delete
+  `*.db*` and rescan to scrub durably.
 - The sidecar format is a published downstream contract: billion-context-pi
   writes `schemaVersion` + `producer` on every save, unknown extra block fields
   are additive, and files are replaced atomically (`billion-context-pi`

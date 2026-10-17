@@ -32,6 +32,10 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
 - 本扩展**不会 hook pi 的 `context` 事件**，只注册 `memory_search` 工具和
   `/memory` 命令，因此可以和 billion-context-pi 同时运行，不会参与上下文压缩的
   顺序竞争，也不会覆盖压缩结果。
+- billion-context-pi **原样保存**压缩摘要，**不做密钥脱敏**（它唯一的摘要规范化只解码
+  `\uXXXX` 转义）；模型完全可能把凭据写进摘要并被 sidecar 保留。本扩展在入库时脱敏，
+  并且**对所有返回模型的内容再过滤一次**，因此早于当前过滤器的值也不会再被展示。
+  已存行不会被改写；要彻底清除请删除 `*.db*` 后重扫。
 - sidecar 格式是 billion-context-pi 公开的下游契约：每次保存都写
   `schemaVersion` + `producer`，未知的块字段只做加法，文件原子替换
   （`billion-context-pi` 的 `src/contract.ts` 与 `bcp-block-v1.json`）；
