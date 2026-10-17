@@ -9,8 +9,9 @@
  *              under ~/.pi/agent/sessions/** (default source "pi")
  *   - opencode: opencode-acp state files    ses_*.json (filename = <session.id>.json)
  *              under <home>/.local/share/opencode/storage/plugin/acp (default source "opencode")
- *   - bili:     billion-context proxy session files <host>_<hash>.json (WorkBuddy/codebuddy
- *              proxied sessions) under <home>/.local/share/billion-context/sessions/** (no default)
+ *   - bili:     billion-context session files <host>_<hash>.json (envelope {version,payload} with
+ *              blocks under payload.state.blocks; versions 1-3) or proxy session files
+ *              (WorkBuddy/codebuddy) under <home>/.local/share/billion-context/sessions/** (no default)
  *
  * The allow-list lives in ~/.pi/pi-billion-memory.sources.jsonl (one JSON object per line).
  * Each line points at a root directory + file pattern and selects the adapter that knows how
@@ -49,7 +50,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { expandBlock, isSyntheticRef, parseMsgIds } from "./expand.js";
+import { expandBlock, expandStoredBlock, isSyntheticRef, parseMsgIds } from "./expand.js";
 
 // ---------------------------------------------------------------------------
 // Constants / config / logging
@@ -68,6 +69,11 @@ const DEFAULT_CFG = {
   debug: false,
   /** Directory names to skip inside pi-sidecar source roots (e.g. encoded private project dirs) */
   excludeDirs: [],
+  /**
+   * Case-insensitive path substrings to skip for every source (e.g. test/temp run directories
+   * such as "Temp", "probe", "compare"). Matched against the path relative to the source root.
+   */
+  excludePaths: [],
   /** Background full allow-list scan on session start; disable for faster startups */
   scanOnStartup: true,
   /** JSONL allow-list of compression source roots (one JSON object per line) */
@@ -92,16 +98,108 @@ const MAX_TOPIC_CHARS = 200;
 const PREVIEW_CHARS = 600;
 /** Max message references stored per block (guards against an unbounded sidecar array). */
 const MAX_MSG_IDS = 4000;
+/** Max lineage (direct block id) references stored per block. */
+const MAX_DIRECT_BLOCKS = 1000;
+/** Per-field caps for untrusted upstream metadata (a hostile sidecar must not bloat the store). */
+const MAX_DIRECT_ITEM = 200;
+const MAX_CALL_ID_FIELD = 200;
+const MAX_PRODUCER_FIELD = 200;
+const MAX_PROJECT_LABEL = 200;
+/** Caps for caller-supplied ids/labels (block id, source substring). */
+const MAX_ID_FIELD = 200;
+const MAX_SOURCE_FIELD = 300;
+/** Cap an allow-list excludePaths entry and an allow-list cwd hint. */
+const MAX_EXCLUDE_PATH = 200;
+const MAX_CWD_HINT = 1024;
+/** Query caps: a huge query must not build an unbounded FTS expression or SQL clause list. */
+const MAX_QUERY_CHARS = 512;
+const MAX_QUERY_TOKENS = 32;
+/** Hard safety ceiling for the full catalog. Exceeding it refuses with a hint instead of OOM. */
+const MAX_TIMELINE_ROWS = 20000;
 /** Max manifest lines rendered by a `list` expansion. */
 const EXPAND_MANIFEST_MAX = 300;
 const DEFAULT_RESULT_LIMIT = 6;
 const MAX_RESULT_LIMIT = 20;
+/** Max significant tokens taken from one side of a related comparison. */
+const RELATED_MAX_TOKENS = 40;
+/**
+ * Related-line scoring window. Text shorter than the minimum carries too little signal to relate
+ * on; text longer than the maximum is truncated before token extraction. Both bounds apply to the
+ * seed and to every candidate.
+ */
+const RELATED_TEXT_MIN_CHARS = 20;
+const RELATED_TEXT_MAX_CHARS = 800;
+/** A token present in more than this fraction of candidate evidence sentences is generic here. */
+const RELATED_GENERIC_DF = 0.6;
+/** Candidate rows fetched before scoring related blocks. */
+const RELATED_CANDIDATE_LIMIT = 200;
+/** Shared column list for the timeline/related candidate queries (blocks search keeps its own). */
+const BLOCK_ROW_COLUMNS =
+  "b.id, b.source_file AS sourceFile, b.kind AS kind, b.block_id AS blockId, b.run_id AS runId, b.tier, b.topic, " +
+  "b.ref_start AS refStart, b.ref_end AS refEnd, b.compressed_tokens AS tokens, b.created_at AS createdAt, " +
+  "b.summary, b.active AS active, b.direct_block_ids AS directBlockIds, b.duration_ms AS durationMs, " +
+  "b.generation AS generation, b.survived_count AS survivedCount, b.compress_call_id AS compressCallId, " +
+  "s.project, s.cwd";
 const LOG_MAX_BYTES = 1_000_000;
 const TRIGRAM_MIN_LEN = 3;
 /** TTL for the cached official SessionManager cwd map (fallback only; the header read is primary) */
 const PI_MAP_TTL_MS = 10 * 60 * 1000;
 /** Hard cap for the session header read; the first line is normally a few KB */
 const SESSION_HEADER_MAX_BYTES = 1_000_000;
+/**
+ * billion-context-pi writes `schemaVersion` on every sidecar save; a missing value means the
+ * pre-contract v1 (#368). An unknown NEWER version means block fields may have changed, so the
+ * file is skipped (never rewritten, watermark not advanced) and reported once.
+ */
+const SUPPORTED_SIDECAR_SCHEMA_VERSION = 1;
+/** billion-context session-envelope versions this extension understands. */
+const SUPPORTED_BC_ENVELOPE_VERSIONS = new Set([1, 2, 3]);
+/** Keys of unsupported-format notices already logged, so repeated scans stay quiet. */
+const unsupportedFormatNotices = new Set<string>();
+
+/** Log an unsupported-format notice once per key; the file itself is never rewritten. */
+function noteUnsupportedFormat(key: string, message: string) {
+  if (unsupportedFormatNotices.has(key)) return;
+  unsupportedFormatNotices.add(key);
+  logLine(message);
+}
+
+/**
+ * Auxiliary files share the compression directories but hold no blocks: billion-context's
+ * content-addressed original store (`<hash>.content-store.json`), the kernel store's fallback slot
+ * (`*.fb.json`), and SQLite sidecars. They are skipped without reading so an allow-list glob that
+ * matches every JSON file cannot turn them into repeating failed sources.
+ */
+function isAuxiliarySourceFile(file: string): boolean {
+  const base = fileBase(file).toLowerCase();
+  return (
+    base.endsWith(".content-store.json") ||
+    base.endsWith(".fb.json") ||
+    base.endsWith(".db") ||
+    base.endsWith(".db-wal") ||
+    base.endsWith(".db-shm")
+  );
+}
+
+/** null when the pi sidecar uses a supported schema version, else the unsupported version. */
+function unsupportedSidecarSchema(data: any) {
+  if (!data || typeof data !== "object") return null;
+  const raw = data.schemaVersion;
+  if (raw === undefined || raw === null) return null; // pre-contract files are v1
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) return raw;
+  return raw > SUPPORTED_SIDECAR_SCHEMA_VERSION ? raw : null;
+}
+
+/** null when the billion-context envelope uses a supported version, else the unsupported version. */
+function unsupportedBcEnvelope(data: any) {
+  if (!data || typeof data !== "object") return null;
+  const payload = data.payload;
+  if (!payload || typeof payload !== "object") return null; // legacy flat shape, not this envelope
+  const raw = data.version;
+  if (raw === undefined || raw === null) return null; // pre-envelope record: read as v1
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) return raw;
+  return SUPPORTED_BC_ENVELOPE_VERSIONS.has(raw) ? null : raw;
+}
 
 /** @internal Test seam: the same sanitizer the config loader uses. */
 export function sanitizeCfg(over) {
@@ -116,6 +214,10 @@ export function sanitizeCfg(over) {
   }
   if (typeof over.debug === "boolean") out.debug = over.debug;
   if (Array.isArray(over.excludeDirs)) out.excludeDirs = over.excludeDirs.filter((x) => typeof x === "string");
+  if (Array.isArray(over.excludePaths))
+    out.excludePaths = over.excludePaths
+      .filter((x) => typeof x === "string" && x.trim() !== "")
+      .map((x) => x.trim().slice(0, MAX_EXCLUDE_PATH));
   if (typeof over.scanOnStartup === "boolean") out.scanOnStartup = over.scanOnStartup;
   if (typeof over.sourcesPath === "string" && over.sourcesPath) out.sourcesPath = expandHome(over.sourcesPath);
   if (typeof over.logPath === "string" && over.logPath) out.logPath = expandHome(over.logPath);
@@ -361,6 +463,24 @@ export function withoutPaths(text: string): string {
   );
 }
 
+/**
+ * Platform-neutral basename: splits on both `/` and `\`, so a source path produced on Windows
+ * (host data) is still reduced to its file name when the extension runs under WSL/Linux. Model
+ * output and logs must never print an absolute local path.
+ */
+function fileBase(p) {
+  const s = String(p || "");
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+
+/** Platform-neutral parent directory basename (for the pi project fallback). */
+function parentBase(p) {
+  const s = String(p || "").replace(/[\\/]+$/, "");
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return i > 0 ? fileBase(s.slice(0, i)) : "";
+}
+
 /** Adapter ids the scanner understands; anything else is rejected where the allow-list is read. */
 const SOURCE_ADAPTERS = new Set(["pi-sidecar", "opencode-acp", "bili-session"]);
 
@@ -383,6 +503,11 @@ export function sanitizeSource(raw) {
     enabled: raw.enabled !== false,
   };
   if (typeof raw.opencodeDb === "string" && raw.opencodeDb) out.opencodeDb = expandHome(raw.opencodeDb);
+  // Optional hints so a source can skip the lazy session-header read entirely: `project` sets the
+  // label, `cwd` (expanded like every configured path) also gives project = basename(cwd).
+  if (typeof raw.project === "string" && raw.project.trim())
+    out.project = raw.project.trim().slice(0, MAX_PROJECT_LABEL);
+  if (typeof raw.cwd === "string" && raw.cwd) out.cwd = expandHome(raw.cwd).slice(0, MAX_CWD_HINT);
   return out;
 }
 
@@ -568,6 +693,29 @@ export function collectMsgIds(block: any): string[] | null {
   return out.length ? out : null;
 }
 
+/**
+ * Lifecycle/lineage fields shared by all three adapters. Numbers accept the string form the
+ * billion-context proxy writes; anything unrecognized becomes null ("unknown"), never a guess.
+ */
+function blockMetaFields(b: any) {
+  const direct = Array.isArray(b?.directBlockIds)
+    ? b.directBlockIds
+        .filter((x: unknown) => typeof x === "string" && x !== "")
+        .slice(0, MAX_DIRECT_BLOCKS)
+        .map((x: string) => x.slice(0, MAX_DIRECT_ITEM))
+    : [];
+  return {
+    active: typeof b?.active === "boolean" ? (b.active ? 1 : 0) : null,
+    directBlockIds: direct.length ? JSON.stringify(direct) : null,
+    durationMs: toInt(b?.durationMs),
+    // Fixed vocabulary only, so a hostile value cannot inject arbitrary text into the store.
+    generation: b?.generation === "young" || b?.generation === "old" ? b.generation : null,
+    survivedCount: toInt(b?.survivedCount),
+    compressCallId:
+      typeof b?.compressCallId === "string" && b.compressCallId ? b.compressCallId.slice(0, MAX_CALL_ID_FIELD) : null,
+  };
+}
+
 function normalizePiBlocks(data: any) {
   // null = unrecognized payload shape: the caller must not advance the watermark (retry later)
   if (!data || typeof data !== "object" || !Array.isArray(data.blocks)) return null;
@@ -581,6 +729,7 @@ function normalizePiBlocks(data: any) {
       tier: Number.isInteger(b.tier) ? b.tier : null,
       topic: typeof b.topic === "string" && b.topic ? b.topic.slice(0, MAX_TOPIC_CHARS) : null,
       summary: b.summary,
+      ...blockMetaFields(b),
       msgIds: collectMsgIds(b),
       refStart: typeof b.startRef === "string" ? b.startRef : null,
       refEnd: typeof b.endRef === "string" ? b.endRef : null,
@@ -609,6 +758,7 @@ function normalizeOpencodeBlocks(data: any) {
           MAX_TOPIC_CHARS,
         ) || null,
       summary: cleanOpencodeSummary(b.summary),
+      ...blockMetaFields(b),
       msgIds: collectMsgIds(b),
       refStart: typeof b.startId === "string" ? b.startId : null,
       refEnd: typeof b.endId === "string" ? b.endId : null,
@@ -634,9 +784,34 @@ function toInt(v: any) {
  * not record a working directory, so the upstream host is the best available "project" name.
  */
 function biliHost(sourceFile) {
-  const base = path.basename(sourceFile, ".json");
+  const base = fileBase(sourceFile).replace(/\.json$/, "");
   const idx = base.lastIndexOf("_");
   return idx > 0 ? base.slice(0, idx) : base || "unknown";
+}
+
+/**
+ * Project label for a billion-context session: the envelope's upstream origin (v2+ `meta.*`, or
+ * the v1 flat field) when present, otherwise the `<host>` segment of the file name. The value is a
+ * host label such as `zhipu`/`anthropic`, never a local filesystem path.
+ */
+/** Drop ASCII control characters from an untrusted label (log/output hygiene). */
+function cleanLabel(s) {
+  let out = "";
+  for (const ch of String(s || "")) {
+    const code = ch.charCodeAt(0);
+    if (code > 31 && code !== 127) out += ch;
+  }
+  return out;
+}
+
+function biliProject(data: any, sourceFile: string) {
+  const payload = data?.payload ?? {};
+  const meta = payload?.meta ?? {};
+  const origin = meta.upstreamOrigin ?? payload.upstreamOrigin ?? data?.upstreamOrigin;
+  if (typeof origin === "string" && origin.trim()) return cleanLabel(origin.trim()).slice(0, MAX_PROJECT_LABEL);
+  const protocol = meta.protocol ?? payload.protocol ?? data?.protocol;
+  if (typeof protocol === "string" && protocol.trim()) return cleanLabel(protocol.trim()).slice(0, MAX_PROJECT_LABEL);
+  return biliHost(sourceFile);
 }
 
 /**
@@ -660,6 +835,7 @@ function normalizeBiliBlocks(data: any) {
       tier: toInt(b.tier),
       topic: typeof b.topic === "string" && b.topic ? b.topic.slice(0, MAX_TOPIC_CHARS) : null,
       summary: b.summary,
+      ...blockMetaFields(b),
       msgIds: null,
       refStart: typeof b.startRef === "string" ? b.startRef : null,
       refEnd: typeof b.endRef === "string" ? b.endRef : null,
@@ -728,7 +904,9 @@ export class MemoryDb {
         last_mtime_ms  INTEGER DEFAULT 0,     -- source file mtime of last successful scan
         last_size      INTEGER DEFAULT 0,
         first_seen_at  INTEGER,
-        updated_at     INTEGER
+        updated_at     INTEGER,
+        format_version INTEGER,               -- upstream format version (schemaVersion / envelope version)
+        producer       TEXT                   -- upstream producer string when present
       );
       CREATE TABLE IF NOT EXISTS blocks(
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -744,6 +922,12 @@ export class MemoryDb {
         compressed_tokens INTEGER,
         created_at        INTEGER,            -- block.createdAt / block.createdAt (ms)
         msg_ids           TEXT,               -- JSON array of raw message ids (NULL = not expandable)
+        active            INTEGER,            -- 1/0 from the source; NULL = unknown
+        direct_block_ids  TEXT,               -- JSON array of lineage block ids (NULL = unknown)
+        duration_ms       INTEGER,            -- block duration when the source records it
+        generation        TEXT,               -- 'young' | 'old' (NULL = unknown)
+        survived_count    INTEGER,
+        compress_call_id  TEXT,
         UNIQUE(source_file, block_id)
       );
       CREATE INDEX IF NOT EXISTS idx_blocks_source ON blocks(source_file);
@@ -774,6 +958,26 @@ export class MemoryDb {
     const blockCols = this.db.prepare("PRAGMA table_info(blocks)").all();
     const addedMsgIds = !blockCols.some((c) => c.name === "msg_ids");
     if (addedMsgIds) this.db.exec("ALTER TABLE blocks ADD COLUMN msg_ids TEXT;");
+    // Additive migration (0.6.0): upstream lifecycle/lineage metadata. Existing rows stay NULL
+    // ("unknown") until the source changes or a force rescan refreshes them; no watermark reset is
+    // needed because the timeline treats a missing value as unknown rather than a guess.
+    for (const [name, type] of [
+      ["active", "INTEGER"],
+      ["direct_block_ids", "TEXT"],
+      ["duration_ms", "INTEGER"],
+      ["generation", "TEXT"],
+      ["survived_count", "INTEGER"],
+      ["compress_call_id", "TEXT"],
+    ] as const) {
+      if (!blockCols.some((c) => c.name === name)) this.db.exec(`ALTER TABLE blocks ADD COLUMN ${name} ${type};`);
+    }
+    const sourceCols = this.db.prepare("PRAGMA table_info(sources)").all();
+    for (const [name, type] of [
+      ["format_version", "INTEGER"],
+      ["producer", "TEXT"],
+    ] as const) {
+      if (!sourceCols.some((c) => c.name === name)) this.db.exec(`ALTER TABLE sources ADD COLUMN ${name} ${type};`);
+    }
     // Idempotent migration: seed the watermark ledger from existing sources rows.
     this.db.exec(`
       INSERT OR IGNORE INTO source_watermarks(source_file, last_mtime_ms, last_size, updated_at)
@@ -832,7 +1036,7 @@ export class MemoryDb {
       {
         kind: "pi",
         cwd: cwd || null,
-        project: cwd ? path.basename(cwd) : null,
+        project: cwd ? fileBase(cwd) : null,
       },
       force,
       async (sf) => piSessionHeaderCwd(sf),
@@ -863,6 +1067,10 @@ export class MemoryDb {
     }
     const mtimeMs = st.mtimeMs;
     const size = st.size;
+    if (isAuxiliarySourceFile(sourceFile)) {
+      // Content stores and SQLite sidecars live next to session files but hold no blocks.
+      return { ok: true, parsed: false, skipped: true, total: 0, inserted: 0, mtimeMs, size };
+    }
     const kind = meta?.kind === "opencode" ? "opencode" : meta?.kind === "bili" ? "bili" : "pi";
     let cwd = typeof meta?.cwd === "string" && meta.cwd ? meta.cwd : null;
     let project = typeof meta?.project === "string" && meta.project ? meta.project : null;
@@ -888,13 +1096,13 @@ export class MemoryDb {
           const resolved = await resolveCwd(sessionFile);
           if (typeof resolved === "string" && resolved) cwd = resolved;
         } catch (e) {
-          log(`cwd resolve failed ${path.basename(sessionFile)}: ${e.message}`);
+          log(`cwd resolve failed ${fileBase(sessionFile)}: ${e.message}`);
         }
       }
     }
     if (!project) {
-      if (cwd) project = path.basename(cwd);
-      else if (kind === "pi") project = path.basename(path.dirname(sourceFile));
+      if (cwd) project = fileBase(cwd);
+      else if (kind === "pi") project = parentBase(sourceFile);
       else if (kind === "bili") project = biliHost(sourceFile);
       else project = "unknown";
     }
@@ -905,6 +1113,31 @@ export class MemoryDb {
       // Possibly mid-write by another process: leave watermark untouched, retry next scan
       return { ok: false, parsed: false, total: 0, inserted: 0, mtimeMs, size, error: `parse: ${e.message}` };
     }
+    const unsupported =
+      kind === "pi" ? unsupportedSidecarSchema(data) : kind === "bili" ? unsupportedBcEnvelope(data) : null;
+    if (unsupported !== null) {
+      noteUnsupportedFormat(
+        `${kind}:${sourceFile}:${String(unsupported)}`,
+        `unsupported ${kind} format version ${String(unsupported)}; skipped ${fileBase(sourceFile)}`,
+      );
+      return { ok: true, parsed: false, skipped: true, total: 0, inserted: 0, mtimeMs, size };
+    }
+    // Format version + producer are recorded for diagnostics; a bili project prefers the envelope's
+    // own origin over the file-name host segment.
+    const formatVersion =
+      kind === "pi"
+        ? typeof data?.schemaVersion === "number" && Number.isInteger(data.schemaVersion)
+          ? data.schemaVersion
+          : 1
+        : kind === "bili"
+          ? typeof data?.version === "number" && Number.isInteger(data.version)
+            ? data.version
+            : 1
+          : null;
+    const producer =
+      typeof data?.producer === "string" && data.producer ? data.producer.slice(0, MAX_PRODUCER_FIELD) : null;
+    if (kind === "bili") project = biliProject(data, sourceFile);
+    if (typeof project === "string") project = cleanLabel(project).slice(0, MAX_PROJECT_LABEL) || "unknown";
     const blocks =
       kind === "pi"
         ? normalizePiBlocks(data)
@@ -937,17 +1170,19 @@ export class MemoryDb {
     try {
       this.db
         .prepare(
-          `INSERT INTO sources(source_file, kind, project, cwd, last_mtime_ms, last_size, first_seen_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO sources(source_file, kind, project, cwd, last_mtime_ms, last_size, first_seen_at, updated_at, format_version, producer)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(source_file) DO UPDATE SET
              kind = excluded.kind,
              project = excluded.project,
              cwd = excluded.cwd,
              last_mtime_ms = excluded.last_mtime_ms,
              last_size = excluded.last_size,
-             updated_at = excluded.updated_at`,
+             updated_at = excluded.updated_at,
+             format_version = excluded.format_version,
+             producer = excluded.producer`,
         )
-        .run(sourceFile, kind, project, cwd, mtimeMs, size, now, now);
+        .run(sourceFile, kind, project, cwd, mtimeMs, size, now, now, formatVersion, producer);
       this.db
         .prepare(
           `INSERT INTO source_watermarks(source_file, last_mtime_ms, last_size, updated_at)
@@ -960,8 +1195,8 @@ export class MemoryDb {
         .run(sourceFile, mtimeMs, size, now);
       const ins = this.db.prepare(
         `INSERT OR IGNORE INTO blocks
-           (source_file, kind, block_id, run_id, tier, topic, summary, ref_start, ref_end, compressed_tokens, created_at, msg_ids)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           (source_file, kind, block_id, run_id, tier, topic, summary, ref_start, ref_end, compressed_tokens, created_at, msg_ids, active, direct_block_ids, duration_ms, generation, survived_count, compress_call_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE NOT EXISTS (SELECT 1 FROM block_tombstones WHERE source_file = ? AND block_id = ?)`,
       );
       // INSERT OR IGNORE leaves existing rows alone, so refresh the pointer column separately —
@@ -972,6 +1207,13 @@ export class MemoryDb {
       const updMsgIds = this.db.prepare(
         `UPDATE blocks SET msg_ids = ?
           WHERE source_file = ? AND block_id = ? AND (msg_ids IS NOT ?)`,
+      );
+      // Lifecycle/lineage metadata is refreshable on force rescan. It feeds timeline/related
+      // ordering only, never FTS, so an unconditional in-place update is safe.
+      const updMeta = this.db.prepare(
+        `UPDATE blocks SET
+           active = ?, direct_block_ids = ?, duration_ms = ?, generation = ?, survived_count = ?, compress_call_id = ?
+         WHERE source_file = ? AND block_id = ?`,
       );
       for (const b of blocks) {
         if (!b || typeof b.summary !== "string") continue;
@@ -997,11 +1239,29 @@ export class MemoryDb {
           b.compressedTokens,
           b.createdAt,
           msgIdsJson,
+          b.active ?? null,
+          b.directBlockIds ?? null,
+          b.durationMs ?? null,
+          b.generation ?? null,
+          b.survivedCount ?? null,
+          b.compressCallId ?? null,
           sourceFile,
           b.blockId,
         );
         if (r.changes > 0) inserted++;
-        else if (updMsgIds.run(msgIdsJson, sourceFile, b.blockId, msgIdsJson).changes > 0) refreshed++;
+        else {
+          if (updMsgIds.run(msgIdsJson, sourceFile, b.blockId, msgIdsJson).changes > 0) refreshed++;
+          updMeta.run(
+            b.active ?? null,
+            b.directBlockIds ?? null,
+            b.durationMs ?? null,
+            b.generation ?? null,
+            b.survivedCount ?? null,
+            b.compressCallId ?? null,
+            sourceFile,
+            b.blockId,
+          );
+        }
       }
       this.db.exec("COMMIT");
     } catch (e) {
@@ -1013,9 +1273,9 @@ export class MemoryDb {
       return { ok: false, parsed: true, total: blocks.length, inserted: 0, mtimeMs, size, error: e.message };
     }
     if (redactedHits > 0) {
-      logLine(`redacted ${redactedHits} potential secret(s) before storing ${path.basename(sourceFile)}`);
+      logLine(`redacted ${redactedHits} potential secret(s) before storing ${fileBase(sourceFile)}`);
     }
-    log(`ingest ${path.basename(sourceFile)} kind=${kind} project=${project} blocks=${blocks.length} new=${inserted}`);
+    log(`ingest ${fileBase(sourceFile)} kind=${kind} project=${project} blocks=${blocks.length} new=${inserted}`);
     return { ok: true, parsed: true, total: blocks.length, inserted, refreshed, redacted: redactedHits, mtimeMs, size };
   }
 
@@ -1033,10 +1293,13 @@ export class MemoryDb {
     return this.db
       .prepare(
         `SELECT b.id, b.source_file AS sourceFile, b.kind AS kind,
-                b.block_id AS blockId, b.tier, b.topic, b.summary,
+                b.block_id AS blockId, b.run_id AS runId, b.tier, b.topic, b.summary,
                 b.ref_start AS refStart, b.ref_end AS refEnd,
                 b.compressed_tokens AS tokens, b.created_at AS createdAt,
-                b.msg_ids AS msgIds, s.project, s.cwd
+                b.msg_ids AS msgIds, b.active AS active, b.direct_block_ids AS directBlockIds,
+                b.duration_ms AS durationMs, b.generation AS generation,
+                b.survived_count AS survivedCount, b.compress_call_id AS compressCallId,
+                s.project, s.cwd
            FROM blocks b LEFT JOIN sources s ON s.source_file = b.source_file
           WHERE ${where}
           ORDER BY b.created_at DESC, b.id DESC
@@ -1065,25 +1328,30 @@ export class MemoryDb {
   }
 
   /**
-   * Build the search SQL shared by search()/explainSearch().
-   * - all tokens >= 3 chars: FTS5 trigram (bm25 ordering);
-   * - mixed: FTS for long tokens + AND-ed LIKE for short tokens;
-   * - all short: LIKE on summary OR topic, deliberately without the blocks_fts join so SQLite
-   *   can use idx_blocks_created (no FTS scan + temp B-tree sort).
-   * @returns {{mode:string, sql:string|null, params:Array<any>, limit:number}}
+   * Read-only detail for the catalog: one stored block (topic + already-redacted summary) plus its
+   * metadata. Never reads raw session messages; that stays the opt-in `memory_expand` path.
+   * @param {string} blockId block id as shown by memory_search/timeline
+   * @param {string|null} source optional substring match on the source file name or project
+   * @returns {{found:boolean,total:number,row:object|null}} newest row and the duplicate count
    */
-  _buildSearch(query, opts: any = {}) {
-    const limit = Math.max(
-      1,
-      Math.min(MAX_RESULT_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT),
-    );
-    const project = opts.project || null;
+  getBlock(blockId, source = null) {
+    this.open();
+    const rows = this.findBlocks(blockId, source, 2);
+    if (!rows.length) return { found: false, total: 0, row: null };
+    return { found: true, total: this.countBlocks(blockId, source), row: rows[0] };
+  }
+
+  /**
+   * Token-matching WHERE/FROM shared by the blocks search and the timeline/related candidate
+   * queries. Returns null for an empty query (callers decide what "no filter" means).
+   */
+  _buildFilter(query, project = null) {
     const tokens = String(query || "")
       .trim()
       .split(/\s+/)
-      .filter(Boolean);
-    if (tokens.length === 0) return { mode: "empty", sql: null, params: [], limit };
-
+      .filter(Boolean)
+      .slice(0, MAX_QUERY_TOKENS);
+    if (tokens.length === 0) return null;
     const escapeLike = (s) => s.replace(/[\\%_]/g, (m) => "\\" + m);
     const ftsTokens = tokens.filter((t) => t.length >= TRIGRAM_MIN_LEN);
     const likeTokens = tokens.filter((t) => t.length < TRIGRAM_MIN_LEN);
@@ -1107,27 +1375,50 @@ export class MemoryDb {
       where += " AND s.project = ?";
       params.push(project);
     }
-    params.push(limit);
     const mode = useFts ? (likeTokens.length ? "mixed" : "fts") : "like";
     const from = useFts
       ? "FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid JOIN sources s ON s.source_file = b.source_file"
       : "FROM blocks b JOIN sources s ON s.source_file = b.source_file";
-    const rank = useFts ? "bm25(blocks_fts)" : "NULL";
+    return { mode, where, params, from, useFts };
+  }
+
+  /**
+   * Build the search SQL shared by search()/explainSearch().
+   * - all tokens >= 3 chars: FTS5 trigram (bm25 ordering);
+   * - mixed: FTS for long tokens + AND-ed LIKE for short tokens;
+   * - all short: LIKE on summary OR topic, deliberately without the blocks_fts join so SQLite
+   *   can use idx_blocks_created (no FTS scan + temp B-tree sort).
+   * @returns {{mode:string, sql:string|null, params:Array<any>, limit:number}}
+   */
+  _buildSearch(query, opts: any = {}) {
+    const limit = Math.max(
+      1,
+      Math.min(MAX_RESULT_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT),
+    );
+    const built = this._buildFilter(query, opts.project || null);
+    if (!built) return { mode: "empty", sql: null, params: [], limit };
+    const params = [...built.params, limit];
+    const rank = built.useFts ? "bm25(blocks_fts)" : "NULL";
     // Pure LIKE keeps ORDER BY created_at only so idx_blocks_created satisfies the ordering.
-    const order = useFts ? "ORDER BY bm25(blocks_fts), b.created_at DESC, b.id DESC" : "ORDER BY b.created_at DESC";
+    const order = built.useFts
+      ? "ORDER BY bm25(blocks_fts), b.created_at DESC, b.id DESC"
+      : "ORDER BY b.created_at DESC";
     const sql = `
       SELECT b.id, b.source_file AS sourceFile, b.kind AS kind,
-             b.block_id AS blockId, b.tier, b.topic,
+             b.block_id AS blockId, b.run_id AS runId, b.tier, b.topic,
              b.ref_start AS refStart, b.ref_end AS refEnd,
              b.compressed_tokens AS tokens, b.created_at AS createdAt,
-             b.summary, s.project, s.cwd,
+             b.summary, b.active AS active, b.direct_block_ids AS directBlockIds,
+             b.duration_ms AS durationMs, b.generation AS generation,
+             b.survived_count AS survivedCount, b.compress_call_id AS compressCallId,
+             s.project, s.cwd,
              ${rank} AS rank
-      ${from}
-      WHERE ${where}
+      ${built.from}
+      WHERE ${built.where}
       ${order}
       LIMIT ?
     `;
-    return { mode, sql, params, limit };
+    return { mode: built.mode, sql, params, limit };
   }
 
   /**
@@ -1146,7 +1437,7 @@ export class MemoryDb {
       logLine(`search error: ${withoutPaths(e.message)} | sql=${built.sql}`);
       rows = [];
     }
-    return { mode: built.mode, rows };
+    return { mode: built.mode, rows: mergeDuplicateRows(rows) };
   }
 
   /** EXPLAIN QUERY PLAN for the same SQL as search(); used by tests to lock the LIKE plan. */
@@ -1155,6 +1446,207 @@ export class MemoryDb {
     const built = this._buildSearch(query, opts);
     if (built.mode === "empty") return [];
     return this.db.prepare(`EXPLAIN QUERY PLAN ${built.sql}`).all(...built.params);
+  }
+
+  /**
+   * Timeline view: the complete catalog of matches, ordered by the timeline key (exact time when
+   * present, otherwise a source-local estimate from the numeric block id). `exact` marks rows with a
+   * real `created_at`; an estimated time is for ordering only and rendered as `--:--`. Rows with
+   * neither a time nor an order still appear (in the `unplaced` section). `limit` is an explicit
+   * caller cap, never a silent truncation.
+   */
+  timeline(query, opts: any = {}) {
+    this.open();
+    const built = this._buildFilter(query, opts.project || null);
+    const from = built ? built.from : "FROM blocks b JOIN sources s ON s.source_file = b.source_file";
+    let where = built ? built.where : "1=1";
+    const params = built ? [...built.params] : [];
+    if (!built && opts.project) {
+      where += " AND s.project = ?";
+      params.push(opts.project);
+    }
+    const sql = `
+      SELECT ${BLOCK_ROW_COLUMNS}, NULL AS rank
+      ${from}
+      WHERE ${where}
+      ORDER BY b.created_at DESC, b.id DESC
+      LIMIT ?
+    `;
+    let rows = [];
+    try {
+      // Fetch one past the safety ceiling: if it is exceeded the catalog is refused with a hint
+      // (never silently truncated). The ceiling bounds memory on a very large store.
+      rows = this.db.prepare(sql).all(...params, MAX_TIMELINE_ROWS + 1);
+      if (rows.length > MAX_TIMELINE_ROWS) {
+        return {
+          mode: "timeline",
+          rows: [],
+          listed: 0,
+          total: MAX_TIMELINE_ROWS + 1,
+          hiddenByLimit: 0,
+          note: `too many matches (>${MAX_TIMELINE_ROWS}); narrow with project/from/to`,
+        };
+      }
+    } catch (e) {
+      logLine(`timeline error: ${withoutPaths(e.message)}`);
+      rows = [];
+    }
+    let anchor = null;
+    if (opts.block) {
+      const found = this.findBlocks(String(opts.block), opts.source || null, 1);
+      if (!found.length) return { mode: "timeline", rows: [], unknown: 0, total: 0, note: "anchor not found" };
+      anchor = found[0];
+    }
+    const anchorsBySource = new Map();
+    for (const r of rows) {
+      if (!Number.isInteger(r.createdAt)) continue;
+      const list = anchorsBySource.get(r.sourceFile) || [];
+      list.push({ seq: blockSeqNum(r.blockId), createdAt: r.createdAt });
+      anchorsBySource.set(r.sourceFile, list);
+    }
+    const windowMs = Number.isInteger(opts.windowMinutes) ? opts.windowMinutes * 60000 : null;
+    let lo = Number.isInteger(opts.from) ? opts.from : null;
+    let hi = Number.isInteger(opts.to) ? opts.to : null;
+    const sameSourceOnly = anchor && windowMs !== null ? anchor.sourceFile : null;
+    if (anchor && windowMs !== null && Number.isInteger(anchor.createdAt)) {
+      lo = anchor.createdAt - windowMs;
+      hi = anchor.createdAt + windowMs;
+    }
+    const entries = [];
+    for (const r of rows) {
+      if (sameSourceOnly && r.sourceFile !== sameSourceOnly) continue;
+      const key = timelineKey(r, anchorsBySource);
+      if (key.rank === 0 && key.time !== null && (lo !== null || hi !== null)) {
+        if ((lo !== null && key.time < lo) || (hi !== null && key.time > hi)) continue;
+      }
+      entries.push({
+        ...r,
+        timelineTime: key.time,
+        estimated: key.estimated,
+        exact: Number.isInteger(r.createdAt),
+        orderRank: key.rank,
+      });
+    }
+    entries.sort((a, b) => {
+      if (a.orderRank !== b.orderRank) return a.orderRank - b.orderRank;
+      const at = a.timelineTime ?? 0;
+      const bt = b.timelineTime ?? 0;
+      if (at !== bt) return at - bt;
+      const as = blockSeqNum(a.blockId) ?? 0;
+      const bs = blockSeqNum(b.blockId) ?? 0;
+      if (as !== bs) return as - bs;
+      return (a.id ?? 0) - (b.id ?? 0);
+    });
+    const merged = mergeDuplicateRows(entries);
+    // Full catalog by default: `limit` is only an explicit, caller-chosen cap (never a silent
+    // truncation), and rows are already in ascending timeline order.
+    const explicit = Number.isInteger(opts.limit) && opts.limit > 0 ? opts.limit : null;
+    const listed = explicit ? merged.slice(-explicit) : merged;
+    return {
+      mode: "timeline",
+      rows: listed,
+      listed: merged.length,
+      total: rows.length,
+      hiddenByLimit: explicit ? Math.max(0, merged.length - listed.length) : 0,
+    };
+  }
+
+  /**
+   * Related-line view: score other blocks against a seed block by structural evidence first
+   * (compression lineage, same run, source neighbor) and lexical overlap second. Deterministic,
+   * offline, and bounded by RELATED_CANDIDATE_LIMIT; each row carries its `reasons`.
+   */
+  related(query, opts: any = {}) {
+    this.open();
+    const limit = Math.max(
+      1,
+      Math.min(MAX_RESULT_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT),
+    );
+    let seed = null;
+    const queryTokens = significantTokens(query || "", 60);
+    if (queryTokens.length === 0) {
+      return { mode: "related", rows: [], note: "related needs a query: the search words anchor the relation" };
+    }
+    if (opts.block) {
+      const found = this.findBlocks(String(opts.block), opts.source || null, 1);
+      seed = found[0] || null;
+    } else {
+      const s = this.search(query, { project: opts.project || null, limit: 1 });
+      seed = s.rows[0] || null;
+    }
+    if (!seed) return { mode: "related", rows: [], note: "seed not found" };
+    const seedEvidence = evidenceSentence(seed, queryTokens);
+    if (!seedEvidence) {
+      return { mode: "related", rows: [], note: "the seed has no sentence containing the query words" };
+    }
+    if (seedEvidence.length < RELATED_TEXT_MIN_CHARS) {
+      return { mode: "related", rows: [], note: "seed evidence sentence is too short for a reliable relation" };
+    }
+    const candidates = new Map();
+    const baseSql =
+      `SELECT ${BLOCK_ROW_COLUMNS} FROM blocks b JOIN sources s ON s.source_file = b.source_file ` +
+      `WHERE b.id != ? AND ${
+        seed.project ? "s.project = ?" : "b.source_file = ?"
+      } ORDER BY b.created_at DESC, b.id DESC LIMIT ?`;
+    try {
+      const baseParams = seed.project
+        ? [seed.id, seed.project, RELATED_CANDIDATE_LIMIT]
+        : [seed.id, seed.sourceFile, RELATED_CANDIDATE_LIMIT];
+      for (const r of this.db.prepare(baseSql).all(...baseParams)) candidates.set(r.id, r);
+    } catch (e) {
+      logLine(`related candidates error: ${withoutPaths(e.message)}`);
+    }
+    const filter = this._buildFilter(queryTokens.slice(0, 6).join(" "), opts.project || null);
+    if (filter) {
+      const sql = `SELECT ${BLOCK_ROW_COLUMNS} ${filter.from} WHERE b.id != ? AND ${filter.where} ORDER BY b.created_at DESC LIMIT ?`;
+      try {
+        for (const r of this.db.prepare(sql).all(seed.id, ...filter.params, RELATED_CANDIDATE_LIMIT))
+          candidates.set(r.id, r);
+      } catch (e) {
+        logLine(`related token error: ${withoutPaths(e.message)}`);
+      }
+    }
+    // Sentence-level evidence only: a candidate must contain a sentence with the query words.
+    const withEvidence = [];
+    for (const r of candidates.values()) {
+      const evidence = evidenceSentence(r, queryTokens);
+      if (!evidence || evidence.length < RELATED_TEXT_MIN_CHARS) continue;
+      withEvidence.push({ ...r, evidence });
+    }
+    // Data-driven generic-token suppression: a token present in most candidate evidence sentences
+    // is noise for this query and is ignored for scoring (never deleted from the shown sentence).
+    const df = new Map();
+    for (const r of withEvidence) {
+      for (const t of new Set(contentTokens(r.evidence))) df.set(t, (df.get(t) || 0) + 1);
+    }
+    const N = withEvidence.length || 1;
+    const seedTokens = new Set(contentTokens(seedEvidence));
+    const scored = withEvidence
+      .map((r) => {
+        const struct = structuralScore(seed, r);
+        let score = struct.score;
+        const reasons = [...struct.reasons];
+        const shared = [];
+        for (const t of new Set(contentTokens(r.evidence))) {
+          if (!seedTokens.has(t)) continue;
+          const dfT = df.get(t) || 0;
+          // Generic only when the token is genuinely common across candidates; with one or two
+          // candidates a shared token is real evidence, not noise.
+          if (dfT >= 2 && dfT / N > RELATED_GENERIC_DF) continue;
+          score += Math.log(1 + N / (1 + dfT));
+          shared.push(t);
+        }
+        if (shared.length) reasons.push(`same-sentence:${shared.slice(0, 4).join(",")}`);
+        return { ...r, score, reasons };
+      })
+      .filter((r) => r.score > 0 && r.reasons.some((x) => x !== "project-window"))
+      .sort((a, b) => b.score - a.score || (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id - b.id);
+    return {
+      mode: "related",
+      rows: mergeDuplicateRows(scored).slice(0, limit),
+      seed: { blockId: seed.blockId, project: seed.project, sourceFile: seed.sourceFile },
+      seedEvidence,
+    };
   }
 
   stats() {
@@ -1374,16 +1866,16 @@ export async function loadOpencodeSessionMap(source, files) {
     }
     const stmt = odb.prepare("SELECT id, directory, path, project_id FROM session WHERE id = ?");
     for (const file of files) {
-      const base = path.basename(file);
+      const base = fileBase(file);
       if (!base.startsWith("ses_") || !base.endsWith(".json")) continue;
       const sessionId = base.slice(0, -5); // state file name is <sessionId>.json; session.id includes the "ses_" prefix
       const row = stmt.get(sessionId);
       if (!row) continue;
       const cwd = row.directory || row.path || null;
       const project = row.directory
-        ? path.basename(row.directory)
+        ? fileBase(row.directory)
         : row.path
-          ? path.basename(row.path)
+          ? fileBase(row.path)
           : typeof row.project_id === "string"
             ? row.project_id
             : null;
@@ -1471,6 +1963,17 @@ export async function scanSources(force = false) {
 async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) {
   const listing = await listSourceFiles(source);
   let files = listing.files;
+  // Auxiliary store files (content-store, fallback slots, SQLite) are not compression sources.
+  files = files.filter((f) => !isAuxiliarySourceFile(f));
+  if (cfg.excludePaths.length) {
+    // Case-insensitive substring match on the path relative to the source root; a cheap way to
+    // drop whole test/temp run trees (e.g. "Temp", "probe", "compare") without a glob engine.
+    const needles = cfg.excludePaths.map((s) => s.toLowerCase());
+    files = files.filter((f) => {
+      const rel = path.relative(source.root, f).toLowerCase();
+      return !needles.some((n) => rel.includes(n));
+    });
+  }
   if (listing.errors.length) {
     // An unreadable or missing root must be visible: treating it as "0 files" hid permission
     // errors and stale allow-list paths from both the log and the failure tally.
@@ -1499,7 +2002,8 @@ async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) 
     let meta;
     if (source.adapter === "pi-sidecar") {
       // cwd is resolved lazily inside ingestSourceFile (explicit → stored → header → API map).
-      meta = { kind: "pi", cwd: null, project: null };
+      // An allow-list `project`/`cwd` hint short-circuits that and avoids the header read.
+      meta = { kind: "pi", cwd: source.cwd ?? null, project: source.project ?? null };
     } else if (source.adapter === "opencode-acp") {
       const info = opencodeMap?.get(file);
       meta = { kind: "opencode", cwd: info?.cwd ?? null, project: info?.project ?? null };
@@ -1513,7 +2017,7 @@ async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) 
     }
     const r = await d.ingestSourceFile(file, meta, force, source.adapter === "pi-sidecar" ? resolvePiCwd : null);
     if (r.parsed) tally.scanned++;
-    if (!r.ok && r.error && r.error !== "no source file") {
+    if (!r.ok && !r.skipped && r.error && r.error !== "no source file") {
       tally.failed++;
       if (cfg.debug) log(`scan failed ${file}: ${r.error}`);
     }
@@ -1557,9 +2061,359 @@ function fmtTokens(n) {
 
 function sourceLabel(row) {
   const kind = row.kind === "opencode" || row.kind === "bili" ? row.kind : "pi";
-  let base = path.basename(row.sourceFile || "");
+  let base = fileBase(row.sourceFile);
   if (kind === "pi" && base.endsWith(".acp.json")) base = base.slice(0, -".acp.json".length);
   return `[${kind}] ${base}`;
+}
+
+/**
+ * Defense-in-depth: re-run the secret filter on anything returned to the model. Rows ingested
+ * before the current filter (or copied in) may still hold a value that matches a pattern now, and
+ * stored summaries are never rewritten in place.
+ */
+function redactOut(text) {
+  return redactSecrets(text).text;
+}
+
+/** Secondary-source line for a memory that was copied across source files (fork artifacts). */
+function duplicateNote(row) {
+  return row && row.alsoFrom && row.alsoFrom.length ? `Also from: ${row.alsoFrom.join(", ")}\n` : "";
+}
+
+/** Numeric suffix of a block id ("b12" -> 12, "12" -> 12), or null when there is none. */
+function blockSeqNum(blockId) {
+  const m = /\d+/.exec(String(blockId ?? ""));
+  return m ? parseInt(m[0], 10) : null;
+}
+
+/** Parse the stored lineage JSON without ever throwing on a malformed value. */
+function parseDirectBlockIds(raw) {
+  if (typeof raw !== "string" || !raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Significant tokens of a summary/topic for related-line matching (>=3 chars, deduped, capped). */
+function significantTokens(text: string, max = RELATED_MAX_TOKENS, cjkBigrams = false): string[] {
+  const out = new Set<string>();
+  const s = String(text || "");
+  for (const m of s.matchAll(/[A-Za-z0-9_]{3,}/g)) {
+    out.add(m[0].toLowerCase());
+    if (out.size >= max) return [...out];
+  }
+  // CJK runs stay whole; they are already distinct enough at 2+ chars. For evidence matching the
+  // 2-char shingles are added too, so a word inside a longer run still lines up across blocks.
+  for (const m of s.matchAll(/[\u4e00-\u9fff]{2,}/g)) {
+    const run = m[0];
+    out.add(run);
+    if (cjkBigrams && run.length > 2) {
+      for (let i = 0; i + 2 <= run.length; i++) {
+        out.add(run.slice(i, i + 2));
+        if (out.size >= max) break;
+      }
+    }
+    if (out.size >= max) break;
+  }
+  return [...out];
+}
+
+/** Tokens used for related evidence: significant tokens (with CJK shingles) minus stopwords. */
+function contentTokens(text) {
+  return significantTokens(text, 60, true).filter((t) => !STOPWORDS.has(t.toLowerCase()));
+}
+
+/**
+ * Conservative stopword set. Only function words and a few pure filler tokens are listed; real
+ * content words (even short code-ish ones like `git`, `test`, `run`) are deliberately NOT removed,
+ * because deleting those would harm actual content. Ubiquitous-for-this-query tokens are instead
+ * demoted by the data-driven DF gate, never deleted from the evidence sentence.
+ */
+const STOPWORDS = new Set([
+  "a",
+  "an",
+  "the",
+  "and",
+  "or",
+  "but",
+  "if",
+  "then",
+  "else",
+  "for",
+  "of",
+  "to",
+  "in",
+  "on",
+  "at",
+  "by",
+  "with",
+  "from",
+  "as",
+  "is",
+  "are",
+  "was",
+  "were",
+  "be",
+  "been",
+  "being",
+  "do",
+  "does",
+  "did",
+  "not",
+  "no",
+  "yes",
+  "it",
+  "its",
+  "this",
+  "that",
+  "these",
+  "those",
+  "you",
+  "your",
+  "we",
+  "our",
+  "they",
+  "their",
+  "he",
+  "she",
+  "his",
+  "her",
+  "him",
+  "them",
+  "us",
+  "i",
+  "me",
+  "my",
+  "so",
+  "than",
+  "too",
+  "very",
+  "can",
+  "could",
+  "should",
+  "would",
+  "will",
+  "shall",
+  "may",
+  "might",
+  "must",
+  "have",
+  "has",
+  "had",
+  "here",
+  "there",
+  "when",
+  "where",
+  "which",
+  "who",
+  "whom",
+  "what",
+  "how",
+  "why",
+  "all",
+  "any",
+  "each",
+  "some",
+  "such",
+  "into",
+  "over",
+  "under",
+  "again",
+  "more",
+  "most",
+  "other",
+  "new",
+  "via",
+  "etc",
+  "per",
+  "vs",
+  "的",
+  "了",
+  "在",
+  "和",
+  "是",
+  "与",
+  "及",
+  "或",
+  "对",
+  "被",
+  "把",
+  "就",
+  "都",
+  "而",
+  "也",
+  "还",
+  "之",
+  "其",
+  "等",
+  "我",
+  "你",
+  "他",
+  "她",
+  "它",
+  "们",
+  "这",
+  "那",
+  "有",
+  "无",
+  "为",
+  "以",
+  "于",
+  "从",
+  "到",
+  "会",
+  "要",
+  "不",
+  "没",
+  "很",
+  "更",
+  "最",
+  "并",
+  "且",
+  "但",
+  "若",
+  "则",
+  "即",
+  "可",
+  "能",
+  "需",
+  "应",
+  "该",
+  "上",
+  "下",
+  "中",
+  "内",
+  "外",
+  "前",
+  "后",
+  "时",
+  "个",
+  "些",
+  "种",
+]);
+
+/** Split text into sentences on ASCII/CJK sentence punctuation and newlines. */
+function splitSentences(text) {
+  return String(text || "")
+    .split(/[。！？!?.;\n]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * The evidence sentence(s) of a block: sentences containing at least one query word. This is the
+ * unit of relatedness — "the sentence with the LLM search term", not the whole summary or a bag of
+ * words. Returns "" when no sentence carries a query word; the result is capped to the max window.
+ */
+function evidenceSentence(row, queryTokens) {
+  const sentences = splitSentences(`${row?.topic || ""} ${row?.summary || ""}`);
+  const hits = [];
+  for (const s of sentences) {
+    // Cap first, then match: a query word buried past the window must not count (the far tail is
+    // not shown as evidence anyway).
+    const capped = s.slice(0, RELATED_TEXT_MAX_CHARS);
+    const low = capped.toLowerCase();
+    if (queryTokens.some((t) => low.includes(t.toLowerCase()))) hits.push(capped);
+  }
+  return hits.join(" ").slice(0, RELATED_TEXT_MAX_CHARS);
+}
+
+/**
+ * Structural (query-independent) evidence between a seed and a candidate: compression lineage,
+ * same run, source neighbor, and a weak same-project time prior. Content evidence is scored
+ * separately at sentence level.
+ */
+function structuralScore(seed, row) {
+  const reasons = [];
+  let score = 0;
+  const seedDirect = parseDirectBlockIds(seed.directBlockIds);
+  const rowDirect = parseDirectBlockIds(row.directBlockIds);
+  if (seedDirect.includes(String(row.blockId)) || rowDirect.includes(String(seed.blockId))) {
+    score += 5;
+    reasons.push("lineage");
+  }
+  if (seed.runId && row.runId && seed.runId === row.runId) {
+    score += 2;
+    reasons.push("same-run");
+  }
+  if (seed.sourceFile === row.sourceFile) {
+    const a = blockSeqNum(seed.blockId);
+    const b = blockSeqNum(row.blockId);
+    if (a !== null && b !== null && Math.abs(a - b) <= 1) {
+      score += 1.5;
+      reasons.push("neighbor");
+    }
+  }
+  if (seed.project && row.project === seed.project) {
+    score += 0.5;
+    reasons.push("project-window");
+  }
+  return { score, reasons };
+}
+
+/**
+ * Collapse exact-duplicate memories copied across source files (fork/copy artifacts) into one row
+ * that lists the alternate sources. Blocks from the same source are never merged, so multi-tier
+ * parent/child pairs survive. `rows` must already be in display order; the first row of a group is
+ * kept and the rest only contribute their source labels.
+ */
+export function mergeDuplicateRows(rows) {
+  const groups = new Map();
+  const keyOf = (r) => `${r.kind}\u0000${r.topic || ""}\u0000${r.summary || ""}`;
+  for (const r of rows) {
+    const key = keyOf(r);
+    const g = groups.get(key);
+    if (g) {
+      g.sourceFiles.add(r.sourceFile);
+      g.rows.push(r);
+    } else {
+      groups.set(key, { sourceFiles: new Set([r.sourceFile]), rows: [r] });
+    }
+  }
+  const out = [];
+  for (const r of rows) {
+    const g = groups.get(keyOf(r));
+    if (g.sourceFiles.size > 1) {
+      if (g.rows[0] !== r) continue; // only the first row of a merged group survives
+      const others = [...new Set(g.rows.filter((x) => x.sourceFile !== r.sourceFile).map((x) => sourceLabel(x)))];
+      out.push({ ...r, duplicateCount: others.length, alsoFrom: others.slice(0, 8) });
+    } else {
+      out.push(r); // same-source rows (multi-tier parent/child) are never collapsed
+    }
+  }
+  return out;
+}
+
+/**
+ * Timeline ordering key. An exact `created_at` wins; a block without one is anchored to the timed
+ * rows of the same source by its numeric block id (interpolated between the nearest anchors, or
+ * offset from the single nearest one). `rank` 0 = placeable, 1 = source-local order only (the
+ * source has no timed row), 2 = neither. Estimated times are for ordering only, never displayed.
+ */
+function timelineKey(row, anchorsBySource) {
+  if (Number.isInteger(row.createdAt)) return { time: row.createdAt, rank: 0, estimated: false };
+  const seq = blockSeqNum(row.blockId);
+  const anchors = (anchorsBySource.get(row.sourceFile) || []).filter((a) => a.seq !== null);
+  if (seq === null || anchors.length === 0) return { time: null, rank: seq === null ? 2 : 1, estimated: true };
+  let prev = null;
+  let next = null;
+  for (const a of anchors) {
+    if (a.seq <= seq && (!prev || a.seq > prev.seq)) prev = a;
+    if (a.seq >= seq && (!next || a.seq < next.seq)) next = a;
+  }
+  if (prev && next && next.seq !== prev.seq) {
+    return {
+      time: prev.createdAt + ((seq - prev.seq) / (next.seq - prev.seq)) * (next.createdAt - prev.createdAt),
+      rank: 0,
+      estimated: true,
+    };
+  }
+  const a = prev || next;
+  if (a) return { time: a.createdAt + (prev ? seq - a.seq : a.seq - seq), rank: 0, estimated: true };
+  return { time: null, rank: 1, estimated: true };
 }
 
 /** @internal */
@@ -1584,24 +2438,109 @@ export function formatResults(res) {
     const project = r.project || "?";
     const tm = fmtTs(r.createdAt);
     const refs = r.refStart ? ` [${r.refStart}${r.refEnd && r.refEnd !== r.refStart ? "–" + r.refEnd : ""}]` : "";
-    const topic = r.topic ? `Topic: ${r.topic}\n` : "";
+    const topic = r.topic ? `Topic: ${redactOut(r.topic)}\n` : "";
     let summary = r.summary || "";
     if (summary.length > PREVIEW_CHARS) summary = summary.slice(0, PREVIEW_CHARS) + "…";
-    summary = summary.replace(/\n{3,}/g, "\n\n").trim();
+    summary = redactOut(summary.replace(/\n{3,}/g, "\n\n").trim());
     return (
       `[${i + 1}] project ${project} · ${tm || "time unknown"} · ${r.blockId || ""}` +
       ` · tier${r.tier ?? "?"} · ${fmtTokens(r.tokens) || "?"} tokens compressed${refs}\n` +
       `Source: ${sourceLabel(r)}\n` +
-      `${topic}${summary}`
+      `${duplicateNote(r)}${topic}${summary}`
     );
   });
   return head + parts.join("\n\n---\n\n");
 }
 
 /**
- * Render one expansion result for the model. `list` mode never emits conversation text; it only
- * reports what is available so the caller has to make an explicit, bounded second call.
+ * Render the memory catalog: one line per memory, date-grouped, never truncated. This is the
+ * timeline body itself (an index / table of contents); a block's summary is fetched separately
+ * with `memory_get`.
+ * @internal
  */
+export function formatTimeline(res) {
+  const rows = res.rows || [];
+  if (res.note) return `No timeline: ${res.note}.`;
+  if (!rows.length) {
+    return (
+      "No timeline entries. Try: 1) a broader query; 2) another project; 3) a wider time window " +
+      "(from/to or windowMinutes)."
+    );
+  }
+  const oneLine = (s) =>
+    String(s || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  const line = (r, time) =>
+    `${time} · ${r.project || "?"} · ${r.blockId || "?"} · tier${r.tier ?? "?"} · ${redactOut(oneLine(r.topic)) || "(no topic)"}` +
+    `${r.duplicateCount ? ` (+${r.duplicateCount})` : ""}`;
+  const lines = [];
+  const scope = res.listed && res.listed > rows.length ? `${rows.length} of ${res.listed}` : `${rows.length}`;
+  lines.push(`Memory timeline (${scope} entr${rows.length === 1 ? "y" : "ies"}):`);
+  let currentDate = "";
+  for (const r of rows) {
+    if (r.orderRank >= 1) continue; // listed in the unplaced section below
+    const date = Number.isInteger(r.timelineTime) ? new Date(r.timelineTime).toISOString().slice(0, 10) : "(no date)";
+    if (date !== currentDate) {
+      lines.push(`## ${date}`);
+      currentDate = date;
+    }
+    const time =
+      r.exact && Number.isInteger(r.timelineTime) ? new Date(r.timelineTime).toISOString().slice(11, 16) : "--:--";
+    lines.push(line(r, time));
+  }
+  const unplaced = rows.filter((r) => r.orderRank >= 1);
+  if (unplaced.length) {
+    lines.push("## unplaced (no exact time and no order)");
+    for (const r of unplaced) lines.push(line(r, "--:--"));
+  }
+  if (rows.length > 300) {
+    lines.push("");
+    lines.push(
+      `(${rows.length} entries listed in full; narrow with project/from/to to reduce the size — entries are never truncated)`,
+    );
+  }
+  if (res.hiddenByLimit > 0) {
+    lines.push(`(an explicit limit hid ${res.hiddenByLimit} entries; drop the limit for the full catalog)`);
+  }
+  return lines.join("\n");
+}
+
+/** Render related-line results with their evidence sentence and reason labels. @internal */
+export function formatRelated(res) {
+  const rows = res.rows || [];
+  if (res.note) return `No related blocks: ${res.note}.`;
+  if (!rows.length) return "No related blocks found for that seed.";
+  const seed = res.seed ? ` (seed ${res.seed.blockId}${res.seed.project ? ` in ${res.seed.project}` : ""})` : "";
+  const parts = rows.map((r, i) => {
+    const time = fmtTs(r.createdAt) || "time missing";
+    const evidence = redactOut(
+      String(r.evidence || "")
+        .replace(/\n{2,}/g, "\n")
+        .trim(),
+    );
+    return (
+      `[${i + 1}] score ${(r.score ?? 0).toFixed(2)} · ${time} · project ${r.project || "?"} · ${r.blockId || ""}` +
+      ` · tier${r.tier ?? "?"}\nWhy: ${(r.reasons || []).join(", ") || "related"}\n` +
+      `Source: ${sourceLabel(r)}\n${duplicateNote(r)}Topic: ${redactOut(r.topic || "(no topic)")}\nEvidence: ${evidence}`
+    );
+  });
+  return `Related blocks${seed}: ${rows.length}:\n` + parts.join("\n\n---\n\n");
+}
+
+/** Render one stored block for `memory_get` (summary only; no raw session text). @internal */
+export function formatBlockDetail(row) {
+  const lines = [
+    `Block ${row.blockId}${row.tier != null ? ` (tier ${row.tier})` : ""} · project ${row.project || "unknown"}` +
+      `${row.createdAt ? ` · ${fmtTs(row.createdAt)}` : " · time unknown"}` +
+      ` · ${fmtTokens(row.tokens) || "?"} tok compressed`,
+    `Source: ${sourceLabel(row)}`,
+  ];
+  if (row.topic) lines.push(`Topic: ${redactOut(row.topic)}`);
+  lines.push("");
+  lines.push(redactOut(row.summary || "(no stored summary)"));
+  return lines.join("\n");
+}
 function formatExpansion(row, sessionFile, res, mode) {
   const lines = [
     `Block ${row.blockId}${row.tier != null ? ` (tier ${row.tier})` : ""} · project ${row.project || "unknown"}` +
@@ -1610,7 +2549,7 @@ function formatExpansion(row, sessionFile, res, mode) {
     `Source: ${sourceLabel(row)}`,
     // Basename only: the absolute path carries the OS user name and the encoded project directory,
     // and expansion never needs it (the `source` filter takes the session file name or project).
-    `Session: ${path.basename(sessionFile)}`,
+    `Session: ${fileBase(sessionFile)}`,
   ];
   const kb = (n) => `${Math.round(n / 1024)} KB`;
   lines.push(
@@ -1674,17 +2613,60 @@ const MEMORY_SEARCH_PARAMETERS = {
     },
     limit: {
       type: "number",
-      description: "Max number of results, default 6, max 20",
+      description: "Max number of results, default 6, max 20 (timeline: max 50)",
     },
+    mode: {
+      type: "string",
+      enum: ["blocks", "timeline", "related"],
+      description:
+        "'blocks' (default) relevance search; 'timeline' returns the complete memory catalog (one line per memory, date-grouped, never truncated); 'related' finds blocks whose sentence containing the query words is related to the seed",
+    },
+    block: {
+      type: "string",
+      description: "Anchor block id for mode 'timeline' or 'related', e.g. 'b2' (from a previous result)",
+    },
+    source: {
+      type: "string",
+      description: "Disambiguate an anchor block id that exists in several sources (substring of the Source label)",
+    },
+    from: { type: "number", description: "Timeline window start as epoch milliseconds" },
+    to: { type: "number", description: "Timeline window end as epoch milliseconds" },
+    windowMinutes: {
+      type: "number",
+      description: "Timeline window around the anchor block, in minutes (requires 'block')",
+    },
+    reasons: { type: "boolean", description: "Include relation reason labels for mode 'related' (always on for now)" },
   },
-  required: ["query"],
 } as const;
 
 interface MemorySearchParams {
   query: string;
   project: string | null;
   limit: number;
+  mode: "blocks" | "timeline" | "related";
+  block: string | null;
+  source: string | null;
+  from: number | null;
+  to: number | null;
+  windowMinutes: number | null;
+  reasons: boolean;
 }
+
+const MEMORY_GET_PARAMETERS = {
+  type: "object",
+  properties: {
+    block: {
+      type: "string",
+      description: "Block id from a memory_search or timeline line, e.g. 'b2'",
+    },
+    source: {
+      type: "string",
+      description:
+        "Optional disambiguator when the same block id exists in several sources (substring of the 'Source:' label or the project)",
+    },
+  },
+  required: ["block"],
+} as const;
 
 const MEMORY_EXPAND_PARAMETERS = {
   type: "object",
@@ -1742,10 +2724,30 @@ function readMemoryExpandParams(raw: unknown): MemoryExpandParams {
 
 function readMemorySearchParams(raw: unknown): MemorySearchParams {
   const value = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-  const query = typeof value.query === "string" ? value.query : "";
-  const project = typeof value.project === "string" && value.project.trim().length > 0 ? value.project.trim() : null;
+  const query = typeof value.query === "string" ? value.query.slice(0, MAX_QUERY_CHARS) : "";
+  const project =
+    typeof value.project === "string" && value.project.trim().length > 0
+      ? value.project.trim().slice(0, MAX_PROJECT_LABEL)
+      : null;
   const limit = typeof value.limit === "number" && Number.isInteger(value.limit) ? value.limit : DEFAULT_RESULT_LIMIT;
-  return { query, project, limit };
+  const mode = value.mode === "timeline" ? "timeline" : value.mode === "related" ? "related" : "blocks";
+  const block =
+    typeof value.block === "string" && value.block.trim() ? value.block.trim().slice(0, MAX_ID_FIELD) : null;
+  const source =
+    typeof value.source === "string" && value.source.trim() ? value.source.trim().slice(0, MAX_SOURCE_FIELD) : null;
+  const int = (v: unknown) => (typeof v === "number" && Number.isInteger(v) ? v : null);
+  return {
+    query,
+    project,
+    limit,
+    mode,
+    block,
+    source,
+    from: int(value.from),
+    to: int(value.to),
+    windowMinutes: int(value.windowMinutes),
+    reasons: value.reasons !== false,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1764,8 +2766,8 @@ export default async function factory(pi: ExtensionAPI) {
       cfg.debug
         ? `session_start file=${sessionFile || "(ephemeral)"} cwd=${ctx.cwd ?? ""}`
         : // Logs are what users paste into issues: without debug, keep names, not full paths.
-          `session_start file=${sessionFile ? path.basename(sessionFile) : "(ephemeral)"} ` +
-            `cwd=${ctx.cwd ? path.basename(ctx.cwd) : ""}`,
+          `session_start file=${sessionFile ? fileBase(sessionFile) : "(ephemeral)"} ` +
+            `cwd=${ctx.cwd ? fileBase(ctx.cwd) : ""}`,
     );
     if (!cfg.scanOnStartup) {
       // Startup full scan disabled: force-scan only the current session so it is visible immediately;
@@ -1788,7 +2790,7 @@ export default async function factory(pi: ExtensionAPI) {
         await scanCurrentSession(sessionFile, true, ctx.cwd); // force-scan the current session so it is visible right away
         if (generation !== sessionGeneration) return;
         const st = getDb().stats();
-        logLine(`db ready: ${path.basename(st.dbPath)} sources=${st.sources} blocks=${st.blocks}`);
+        logLine(`db ready: ${fileBase(st.dbPath)} sources=${st.sources} blocks=${st.blocks}`);
       })
       .catch((e) => logLine(`session_start scan error: ${withoutPaths(e.stack || e.message)}`));
     backgroundScan = run;
@@ -1849,7 +2851,10 @@ export default async function factory(pi: ExtensionAPI) {
     description:
       "Search pi's long-term memory store: block summaries produced by ACP compression from " +
       "allow-listed sources (pi billion-context-pi sidecars, opencode-acp state files, and billion-context sessions) across all " +
-      "allowed projects. Use when the user asks about past work, conclusions, decisions, technical " +
+      "allowed projects. Modes: 'blocks' (default) relevance search; 'timeline' orders the same matches by " +
+      "time and order (missing times stay blank, unplaceable blocks are reported separately); 'related' " +
+      "finds blocks related to an anchor block or query hit (compression lineage, same run, neighbors, shared terms). " +
+      "Use when the user asks about past work, conclusions, decisions, technical " +
       "pitfalls, code locations, project context, or content compressed earlier in this session. " +
       "Query with Chinese or English keywords / phrases; results are relevance-ranked and annotated " +
       "with source kind, project, file, block and time.",
@@ -1857,18 +2862,53 @@ export default async function factory(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use memory_search when the user asks about past work, conclusions, decisions, or context from earlier sessions or from earlier in this session after compression.",
       "For Chinese queries shorter than 3 characters, memory_search falls back to substring matching automatically — still pass the query as-is.",
+      "Use mode 'timeline' for a chronological catalog of matches (one line per memory, full, never truncated); follow a line with memory_get to read that block's stored summary.",
+      "Use mode 'related' with a query (the search words) to find blocks whose sentence containing those words is related; pass 'block' to anchor on a specific block.",
     ],
     parameters: paramsSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       try {
         // Light allow-list scan (mtime watermark) before every search so latest compressions are included
         await scanSources();
-        const { query, project, limit } = readMemorySearchParams(params);
-        const res = getDb().search(query, { project, limit });
+        const p = readMemorySearchParams(params);
+        const db = getDb();
+        if (p.mode === "timeline") {
+          const res = db.timeline(p.query, {
+            project: p.project,
+            limit: p.limit,
+            block: p.block,
+            source: p.source,
+            from: p.from,
+            to: p.to,
+            windowMinutes: p.windowMinutes,
+          });
+          return {
+            content: [{ type: "text", text: formatTimeline(res) }],
+            details: {
+              mode: "timeline",
+              hits: res.rows.length,
+              unknown: res.unknown,
+              dbPath: fileBase(cfg.dbPath),
+            },
+          };
+        }
+        if (p.mode === "related") {
+          const res = db.related(p.query, {
+            project: p.project,
+            limit: p.limit,
+            block: p.block,
+            source: p.source,
+          });
+          return {
+            content: [{ type: "text", text: formatRelated(res) }],
+            details: { mode: "related", hits: res.rows.length, dbPath: fileBase(cfg.dbPath) },
+          };
+        }
+        const res = db.search(p.query, { project: p.project, limit: p.limit });
         const text = formatResults(res);
         return {
           content: [{ type: "text", text }],
-          details: { mode: res.mode, hits: res.rows.length, dbPath: path.basename(cfg.dbPath) },
+          details: { mode: res.mode, hits: res.rows.length, dbPath: fileBase(cfg.dbPath) },
         };
       } catch (e) {
         logLine(`memory_search error: ${withoutPaths(e.stack || e.message)}`);
@@ -1879,7 +2919,69 @@ export default async function factory(pi: ExtensionAPI) {
               text: `memory_search failed: ${withoutPaths(e.message) || "unknown error"} (the extension log has the full trace)`,
             },
           ],
-          details: { mode: "error", hits: 0, dbPath: path.basename(cfg.dbPath) },
+          details: { mode: "error", hits: 0, dbPath: fileBase(cfg.dbPath) },
+        };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_get",
+    label: "Memory Get",
+    description:
+      "Open one memory line from a memory_search or timeline result and read its stored summary by " +
+      "block id. Read-only and always available: it returns the already-redacted stored topic+summary, " +
+      "never raw session messages (use the opt-in memory_expand for originals).",
+    promptSnippet: "Open one memory line (block id) and read its stored summary",
+    promptGuidelines: [
+      "After a timeline/catalog line, call memory_get with its block id to read the stored summary; pass 'source' when the id exists in several sources.",
+    ],
+    parameters: MEMORY_GET_PARAMETERS,
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      try {
+        const value = params && typeof params === "object" ? (params as Record<string, unknown>) : {};
+        const block = typeof value.block === "string" ? value.block.trim() : "";
+        const source = typeof value.source === "string" && value.source.trim() ? value.source.trim() : null;
+        if (!block) {
+          return {
+            content: [{ type: "text", text: "memory_get: 'block' is required." }],
+            details: { mode: "error", hits: 0 },
+          };
+        }
+        const res = getDb().getBlock(block, source);
+        if (!res.found) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `memory_get: no stored block '${block}'${source ? ` matching '${source}'` : ""}.`,
+              },
+            ],
+            details: { mode: "missing", hits: 0 },
+          };
+        }
+        if (res.total > 1) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `memory_get: ${res.total} blocks share the id '${block}'. Pass 'source' to pick one. ` +
+                  `Newest: ${formatBlockDetail(res.row)}`,
+              },
+            ],
+            details: { mode: "ambiguous", hits: res.total },
+          };
+        }
+        return {
+          content: [{ type: "text", text: formatBlockDetail(res.row) }],
+          details: { mode: "block", hits: 1, dbPath: fileBase(cfg.dbPath) },
+        };
+      } catch (e) {
+        logLine(`memory_get error: ${withoutPaths(e.stack || e.message)}`);
+        return {
+          content: [{ type: "text", text: `memory_get failed: ${withoutPaths(e.message) || "unknown error"}` }],
+          details: { mode: "error", hits: 0 },
         };
       }
     },
@@ -1935,7 +3037,7 @@ export default async function factory(pi: ExtensionAPI) {
               .map(
                 (r) =>
                   `- ${r.blockId} · project ${r.project || "?"} · ${fmtTs(r.createdAt) || "time unknown"}` +
-                  ` · ${path.basename(r.sourceFile)}`,
+                  ` · ${fileBase(r.sourceFile)}`,
               )
               .join("\n");
             return {
@@ -1949,6 +3051,35 @@ export default async function factory(pi: ExtensionAPI) {
             };
           }
           const row = rows[0];
+          if (row.kind === "bili") {
+            // billion-context keeps each block's originals in its own envelope, so expansion never
+            // touches the host session log for these sources.
+            const res = await expandStoredBlock({
+              file: row.sourceFile,
+              blockId: row.blockId,
+              mode: p.mode,
+              select: p.select,
+              maxChars: Math.min(cfg.expandMaxChars, p.chars ?? cfg.expandMaxChars),
+              maxMessages: Math.min(cfg.expandMaxMessages, p.limit ?? cfg.expandMaxMessages),
+              maxReadBytes: cfg.expandMaxReadBytes,
+              redact: redactSecrets,
+            });
+            log(
+              `expand ${row.blockId} stored mode=${p.mode} entries=${res.entries.length} returned=${res.returnedChars}`,
+            );
+            return {
+              content: [{ type: "text", text: formatExpansion(row, row.sourceFile, res, p.mode) }],
+              details: {
+                mode: p.mode,
+                block: row.blockId,
+                entries: res.entries.length,
+                found: res.entries.filter((e) => e.found).length,
+                chars: res.returnedChars,
+                truncated: res.truncated,
+                source: "block-contents",
+              },
+            };
+          }
           if (!String(row.sourceFile).endsWith(".acp.json")) {
             return {
               content: [

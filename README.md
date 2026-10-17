@@ -37,9 +37,21 @@ affiliated with, endorsed by, or a fork of**
   `memory_search` tool and the `/memory` command, so it is safe to run
   alongside billion-context-pi. It does not participate in context-compression
   ordering or clobber compressed output.
-- The sidecar format is an implementation detail of billion-context-pi and may
-  change. This extension is tested against the sidecar format produced by
-  billion-context-pi `0.1.65`; a format change may require an adapter update.
+- billion-context-pi stores compression summaries verbatim and does **not**
+  redact secrets (its only summary normalizer decodes `\uXXXX` escapes); the
+  model can therefore write a credential into a summary and the sidecar keeps
+  it. This extension redacts secrets on ingestion **and** re-runs the filter on
+  everything it returns to the model, so a value that slipped in before the
+  current filter cannot resurface. Stored rows are not rewritten; delete
+  `*.db*` and rescan to scrub durably.
+- The sidecar format is a published downstream contract: billion-context-pi
+  writes `schemaVersion` + `producer` on every save, unknown extra block fields
+  are additive, and files are replaced atomically (`billion-context-pi`
+  `src/contract.ts`, schema `bcp-block-v1.json`). A missing `schemaVersion` means
+  v1. This extension reads the version and **skips** an unknown newer version
+  (logging once, never rewriting it), so a future format bump cannot corrupt or
+  mis-ingest the store. billion-context (proxy/native) session envelopes
+  (`{version, payload.state.blocks}`) are read at versions 1-3 the same way.
 - billion-context-pi is MIT-licensed. Its name and logo belong to its authors.
   This project's MIT license covers only this project's code.
 
@@ -57,16 +69,36 @@ affiliated with, endorsed by, or a fork of**
   durable ledger; `UNIQUE(source_file, block_id)` + `INSERT OR IGNORE` dedupes
   blocks. `prune()` writes tombstones so a later rescan cannot resurrect
   pruned blocks.
+- **Upstream lifecycle metadata**: when the source records it, each block also
+  keeps `active`, `direct_block_ids` (compression lineage), `duration_ms`,
+  `generation`, `survived_count`, and `compress_call_id`; sources keep
+  `format_version`/`producer`. A force rescan refreshes these in place without
+  touching stored summaries.
 - **Chinese-friendly search**: FTS5 `trigram` for queries of 3+ characters;
   AND-ed `LIKE` against `summary OR topic` for shorter queries; a mixed mode
   combines both. No LLM translation or keyword generation.
+- **Memory-line modes**: `memory_search` takes a `mode`. `blocks` (default)
+  ranks by relevance; `timeline` returns the **complete catalog** (one line per
+  memory: time, project, block id, tier, topic — date-grouped, never truncated);
+  `related` compares the **sentence containing the query words** in each block
+  (stopwords and data-driven IDF suppress generic-token noise; compression
+  lineage/run/neighbor are structural evidence) and shows that evidence
+  sentence. Follow a catalog line with `memory_get` to read the stored summary.
+- **Read one memory**: `memory_get` opens a catalog/search line by block id and
+  returns the stored (already-redacted) topic + summary; it never reads raw
+  session messages.
+- **Exact-duplicate merge**: a memory copied across source files (fork/copy
+  artifacts) is shown once and lists its alternate sources; blocks from the same
+  source (multi-tier parent/child) are never collapsed.
 - **Lazy project resolution**: the pi session header is read only when a source
   file actually needs (re)ingestion, and only its first line is read. An
   unchanged store costs no header reads.
 - **Optional block expansion**: with `expandEnabled`, `memory_expand` resolves a
   block's recorded message pointers back to the original session messages on
-  demand. It is two-step (manifest first, then an explicit selection), bounded,
-  filtered like ingestion, and never written to the store.
+  demand. For billion-context sessions it instead reads the envelope's own
+  `payload.blockContents`, so it never touches the host session log. It is
+  two-step (manifest first, then an explicit selection), bounded, filtered like
+  ingestion, and never written to the store.
 - **No context hook**: the extension never participates in pi's `context`
   event; it only indexes and searches compression summaries.
 
@@ -222,6 +254,7 @@ bili sessions (<host>_<hash>.json)┘                                 (SQLite + 
   "maxSummaryChars": 20000,
   "debug": false,
   "excludeDirs": [],
+  "excludePaths": [],
   "scanOnStartup": true,
   "expandEnabled": false,
   "expandMaxChars": 40000,
@@ -238,6 +271,9 @@ bili sessions (<host>_<hash>.json)┘                                 (SQLite + 
   restart pi to rebuild from source.
 - `debug`: verbose logging.
 - `excludeDirs`: directory names to skip inside pi-sidecar source roots.
+- `excludePaths`: case-insensitive path substrings skipped for every source,
+  matched against the path relative to the source root (e.g. `["Temp","probe"]`
+  drops test/temp run trees).
 - `scanOnStartup`: run a background allow-list scan at session start. If
   disabled, the current session is still force-scanned once and other sources
   are picked up by later scans.
@@ -269,6 +305,11 @@ extension uses these two built-in defaults:
 - `opencodeDb` is optional but recommended for opencode sources: it lets the
   adapter resolve each state file to its real working directory (project name)
   via a read-only lookup.
+- `project` and `cwd` are optional hints for `pi-sidecar` sources. Setting them
+  lets the adapter skip the lazy session-header read entirely; otherwise it
+  reads only the session file's first line (and only when the source is new or
+  changed). `project` sets the label; `cwd` supports `~` and also derives the
+  label from its basename.
 
 Example: index a billion-context proxy session directory (WorkBuddy/codebuddy):
 
@@ -283,7 +324,8 @@ Example: index a billion-context proxy session directory (WorkBuddy/codebuddy):
 ```
 
 - `bili-session` reads blocks under `payload.state.blocks` from each matched
-  `<host>_<hash>.json` file; the project name is the `<host>` segment.
+  `<host>_<hash>.json` file; the project name is the envelope's own
+  `upstreamOrigin`/`protocol` when present, otherwise the `<host>` segment.
 
 Example: scan only a pi sessions subtree plus one extra sidecar root:
 

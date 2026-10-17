@@ -33,7 +33,9 @@ Concretely:
   cookies, Chinese labels, and URLs (http/https/ftp/file/ssh/git/ws(s)/db schemes and bare
   `www.` hosts; URLs become `[REDACTED_URL]`). It must never be disabled, bypassed, or
   weakened; tests must prove both direct redaction and that an ingested secret is not
-  searchable.
+  searchable. **Model-facing output is filtered again** (search results, timeline topic, related
+  evidence, `memory_get`) as defense-in-depth, because rows ingested before the current filter
+  (or copied in) are never rewritten and may hold a value the filter would now catch.
 
 ## 2. Language — English only, with two sanctioned exceptions
 
@@ -71,7 +73,8 @@ Coverage that must be preserved and extended, never removed:
   resurrect pruned blocks, force rescan still skips tombstones, and the watermark ledger backfills
   from older `sources` rows;
 - **lazy pi cwd resolution**: a new/changed source reads only the session header; an unchanged
-  source reads nothing; a stored cwd is reused on incremental scans and refreshed on force;
+  source reads nothing; a stored cwd is reused on incremental scans and refreshed on force; an
+  allow-list `project`/`cwd` hint skips the header read entirely;
 - schema drift: a missing `blocks`/`blocksById` payload is rejected without advancing the
   watermark and a later valid payload is ingested;
 - allow-list read errors are fail-closed (ENOENT -> defaults, other errors -> no sources);
@@ -90,23 +93,33 @@ Coverage that must be preserved and extended, never removed:
   conversation text; `full` mode renders only an explicit `select` and **throws** when that
   selection is empty, a narrow selection is **not** reported as truncation while a per-entry trim
   is, and the rendered text never exceeds `maxChars`; `maxChars`/`maxMessages` caps and the
-  injected redactor are honored; `readCapped` stops the physical read at `expandMaxReadBytes`,
-  and missing session files degrade to `missing` refs instead of throwing; `custom_message`
+  injected redactor are honored; `readCapped` stops the physical read at `expandMaxReadBytes`, a
+  wanted id is found without reading the whole file (streaming early exit) and a wanted id near the
+  end is reached through a bounded tail window, and missing session files degrade to `missing` refs
+  instead of throwing; a billion-context session block expands from its envelope's own
+  `payload.blockContents` (full/one manifest), never the host session log; `custom_message`
   (extension-injected) lines expand as user text and generated `acp_summary_*` refs are labelled
   `synthetic`; pointer backfill refreshes existing rows without re-inserting them and clears
   pointers the sidecar no longer lists; the 0.4.x -> 0.5.0 migration adds `msg_ids` and resets the
   watermark ledger exactly once, including for a source row that had no ledger row yet;
 
+- **memory_search modes**: `timeline` lists every match (orderable first, unplaced last), one line
+  per memory with no summary text, reports an explicit `limit` instead of silently truncating, and
+  never hides an unplaceable row; `related` refuses a missing query, uses sentence-level evidence,
+  rejects below-minimum/over-window evidence, and keeps the pure-LIKE query plan unchanged;
+  cross-source exact duplicates merge into one result while same-source parent/child blocks do not;
+  `excludePaths` keeps matching sources out of the store.
+- **memory_get**: returns a stored summary and reports a missing/ambiguous block.
+
 Fixture conventions: sessions live under encoded-dir names like `--home-dev-ProjA--` with a
 matching neutral cwd (`/home/dev/ProjA` -> project `ProjA`). Keep it that way — no real paths.
-
 Additional gates:
 
 - `npm run e2e` loads the built `dist/index.js`, asserts the default export is a function,
-  checks that the factory registers the three session events, `memory_search`, and `/memory` —
-  and that it does **not** register `memory_expand` under the default config — then re-imports the
-  bundle with `expandEnabled: true` to prove the expansion tool appears only when opted in, and
-  opens the SQLite store through `node:sqlite` in an isolated temporary home.
+  checks that the factory registers the three session events, `memory_search`, `memory_get`, and
+  `/memory` — and that it does **not** register `memory_expand` under the default config — then
+  re-imports the bundle with `expandEnabled: true` to prove the expansion tool appears only when
+  opted in, and opens the SQLite store through `node:sqlite` in an isolated temporary home.
 - `npm run verify:dist` rebuilds and fails if the committed `dist/` differs from a fresh build.
   `dist/` is committed because pi's git installer runs `npm install --omit=dev` and never runs a
   build (see §4).
@@ -141,7 +154,8 @@ The design is deliberately minimal; preserve these properties:
   parsed; `opencode.db` is opened read-only/`query_only` only to map session IDs to working
   directories. The single exception is opt-in expansion: when `expandEnabled` is true and
   `memory_expand` is called, `src/expand.ts` may read the specific message lines a stored block
-  references — never a scan, never a cache, never a write.
+  references — never a scan, never a cache, never a write. For a billion-context source it reads
+  the block's own `payload.blockContents` from the session envelope instead of message lines.
 - **Secret redaction before storage**: `redactSecrets()` runs on every normalized block's
   `topic` and `summary` inside `ingestSourceFile()` before the `blocks` insert; it is not
   optional. Log a hit count (never the secret) and continue ingesting the redacted block.
@@ -170,13 +184,26 @@ The design is deliberately minimal; preserve these properties:
   for short ones. Pure-LIKE queries must not join `blocks_fts` (so `idx_blocks_created` can
   satisfy the ordering); never route queries through an LLM for translation or keyword
   generation.
+- **memory_search modes**: `blocks` (default) keeps the existing relevance semantics. `timeline`
+  returns the complete catalog: one line per memory (time, project, block id, tier, topic), date
+  grouped, never truncated, with unplaceable rows in a trailing `unplaced` section; `limit` is an
+  explicit caller cap and any hiding must be reported, never silent. Never fabricate or display an
+  estimated wall-clock time (show `--:--`). `related` needs a query and compares the sentence that
+  contains the query words (bounded min/max); it removes only function-word stopwords, demotes
+  generic tokens with a data-driven IDF gate (never deleting content words), keeps compression
+  lineage (`direct_block_ids`)/`run_id`/neighbor as structural evidence, drops zero-evidence
+  candidates, and shows the evidence sentence. All modes stay offline, bounded, and dependency-free.
+- **memory_get**: read-only, always registered; returns one stored block's topic+summary by id
+  (never raw session messages) with the same ambiguity handling as expansion.
 - **No silent data loss**: `prune()` (manual, via `/memory prune <days>`) is the only deletion
   mechanism; no automatic expiry. Prune is durable via tombstones, and the watermark ledger keeps
   pruned-but-unchanged sources skipped, so a rescan cannot resurrect them. Ingestion-parameter
   changes do not rewrite old rows — the documented remedy (delete `*.db*`, rescan) is the
   intended behavior.
-- **Multi-tier duplication is by design**: parent (tier 2/3) and child blocks both match; do not
-  dedupe results.
+- **Multi-tier duplication is by design, exact duplicates are not**: parent (tier 2/3) and child
+  blocks from the _same source_ both match; never collapse those. Blocks with identical
+  `topic`+`summary` coming from **different** source files (fork/copy artifacts) are merged into
+  one result that lists the alternate sources, so a copied session cannot multiply a memory.
 - **Plain JSON schema**: `memory_search` parameters are a plain JSON schema validated by a small
   runtime guard. Do not add `typebox` or another runtime schema dependency.
 - Config: `~/.pi/pi-billion-memory.json` merged over `DEFAULT_CFG`; allow-list
@@ -203,12 +230,21 @@ The design is deliberately minimal; preserve these properties:
 - Upstream compression formats are internal implementations that can change. Adapters must be
   defensive: detect/ignore malformed or mid-write files (parse failure leaves the watermark
   untouched), never crash the scan, and remain easy to update when a source format changes.
+  Honor upstream version stamps — the billion-context-pi sidecar's `schemaVersion` (missing = v1)
+  and the billion-context session envelope's `version` (v1-v3 supported) — by skipping an unknown
+  newer version once and never rewriting it. Skip auxiliary store files that share the session
+  directories (`.content-store.json`, `*.fb.json`, SQLite) without reading them. Treat every
+  upstream scalar as untrusted: length-cap the project label, `producer`, `compress_call_id` and
+  lineage ids, accept only a fixed `generation` vocabulary, cap the query length/token count, and
+  keep a hard catalog ceiling (refuse above it, never silently truncate).
   A source that throws must degrade to a `failed` count, never abort the rest of the scan, and an
   allow-list entry with an unknown `adapter` must be rejected where the list is read.
 - Allow-list patterns are matched against paths **relative to the source root**: `*` never crosses a
   `/`, `**` is the only segment that does, and symlinks are never followed (the list describes real
-  files). A directory that cannot be read counts as a failed source and is logged; it must not look
-  like an empty source. Any budget cap that skips files must be logged with its limit.
+  files). `excludeDirs` drops exact directory segments; `excludePaths` drops case-insensitive path
+  substrings for every adapter (e.g. test/temp run trees). A directory that cannot be read counts as
+  a failed source and is logged; it must not look like an empty source. Any budget cap that skips
+  files must be logged with its limit.
 - Scan lifecycle: `session_shutdown` closes the store and latches it closed. A scan in flight must
   stop at the next boundary (session-generation check, captured before the first `await`) and must
   never reopen the file-backed store; `getDb()` and `MemoryDb.open()` throw once the store is

@@ -438,6 +438,652 @@ check("source label formatting includes bili kind", internals.formatResults(qBil
 const qOutside = db.search("outsideMarker");
 check("files outside the allow-list are never ingested", qOutside.rows.length === 0);
 
+// --- Upstream format contract: version gating + auxiliary-file skip (#368) --------
+const newerPi = path.join(whiteDir, "newer-schema.jsonl");
+fs.writeFileSync(
+  newerPi + ".acp.json",
+  JSON.stringify({
+    ...mkSidecar([{ ...b3, blockId: "bNewer", topic: "newer", summary: "newerSchemaMarker" }]),
+    schemaVersion: 99,
+    producer: "billion-context-pi@test",
+  }),
+);
+const bcNewer = path.join(biliRoot, "example.test_newer.json");
+fs.writeFileSync(
+  bcNewer,
+  JSON.stringify({
+    version: 4,
+    id: "pfa-newer",
+    payload: {
+      state: {
+        blocks: [
+          {
+            blockId: "b1",
+            runId: "r1",
+            tier: 1,
+            topic: "t",
+            summary: "bcNewerMarker",
+            compressedTokens: 1,
+            createdAt: T2,
+          },
+        ],
+      },
+    },
+  }),
+);
+fs.writeFileSync(
+  path.join(biliRoot, "abc123.content-store.json"),
+  JSON.stringify({ version: 1, byHash: {}, byRef: {} }),
+);
+fs.writeFileSync(
+  path.join(biliRoot, "deadbeef.fb.json"),
+  JSON.stringify({ id: "x", payload: { state: { blocks: [{ blockId: "b1", summary: "fbMarker" }] } } }),
+);
+
+const scanV = await internals.scanSources(false);
+check(
+  "unsupported newer sidecar schemaVersion is skipped, not ingested",
+  db.search("newerSchemaMarker").rows.length === 0,
+);
+check("unsupported newer bc envelope version is skipped, not ingested", db.search("bcNewerMarker").rows.length === 0);
+check(
+  "auxiliary store files are neither ingested nor counted as failed",
+  db.search("fbMarker").rows.length === 0 && scanV.failed === 0,
+);
+check(
+  "a repeated scan keeps skipped formats out of the failure tally",
+  (await internals.scanSources(false)).failed === 0,
+);
+
+// --- billion-context envelope v1/v2 metadata + lifecycle/lineage fields -----------
+const bcV2 = path.join(biliRoot, "example.test_v2.json");
+fs.writeFileSync(
+  bcV2,
+  JSON.stringify({
+    version: 2,
+    id: "pfa-v2",
+    payload: {
+      meta: { protocol: "openai", upstreamOrigin: "zhipu" },
+      state: {
+        blocks: [
+          {
+            blockId: "b2",
+            runId: "r2",
+            tier: 2,
+            topic: "v2",
+            summary: "bcV2Marker",
+            compressedTokens: 5,
+            createdAt: T2,
+            active: true,
+            directBlockIds: ["b1"],
+            durationMs: 1234,
+            generation: "young",
+            survivedCount: 2,
+            compressCallId: "call_1",
+          },
+        ],
+      },
+    },
+  }),
+);
+const bcV1 = path.join(biliRoot, "example.test_v1.json");
+fs.writeFileSync(
+  bcV1,
+  JSON.stringify({
+    version: 1,
+    id: "pfa-v1",
+    payload: {
+      upstreamOrigin: "anthropic",
+      state: {
+        blocks: [
+          {
+            blockId: "b1",
+            runId: "r1",
+            tier: 1,
+            topic: "v1",
+            summary: "bcV1Marker",
+            compressedTokens: 4,
+            createdAt: T2,
+          },
+        ],
+      },
+    },
+  }),
+);
+await internals.scanSources(false);
+const qV2 = db.search("bcV2Marker");
+const qV1 = db.search("bcV1Marker");
+check("bc envelope v2 reads meta.upstreamOrigin as project", qV2.rows.length === 1 && qV2.rows[0].project === "zhipu");
+check(
+  "bc envelope v2 lifecycle/lineage fields are stored",
+  qV2.rows[0].active === 1 &&
+    qV2.rows[0].directBlockIds === '["b1"]' &&
+    qV2.rows[0].durationMs === 1234 &&
+    qV2.rows[0].generation === "young" &&
+    qV2.rows[0].survivedCount === 2 &&
+    qV2.rows[0].compressCallId === "call_1",
+);
+check(
+  "bc envelope v1 flat upstreamOrigin is read as project",
+  qV1.rows.length === 1 && qV1.rows[0].project === "anthropic",
+);
+check(
+  "sources record the upstream format version",
+  db.db.prepare("SELECT format_version FROM sources WHERE source_file = ?").get(bcV2).format_version === 2,
+);
+
+// --- untrusted upstream metadata caps (anti-bloat) ----------------------------------
+const capSess = path.join(tmp, "--home-dev-CapProj--", "cap.jsonl");
+writeSidecar(capSess, [
+  {
+    blockId: "bCap",
+    runId: "rCap",
+    tier: 1,
+    topic: "cap",
+    summary: "capMarker untrusted metadata",
+    compressedTokens: 1,
+    createdAt: T2,
+    startRef: "m00001",
+    endRef: "m00002",
+    generation: "x".repeat(500),
+    compressCallId: "c".repeat(500),
+    directBlockIds: ["d".repeat(500)],
+  },
+]);
+await db.ingestSidecarFile(capSess, "/home/dev/CapProj");
+const capRow = db.db
+  .prepare("SELECT generation, compress_call_id, direct_block_ids FROM blocks WHERE block_id = 'bCap'")
+  .get();
+check(
+  "a hostile generation value is rejected and long id fields are capped",
+  capRow.generation === null &&
+    capRow.compress_call_id.length === 200 &&
+    capRow.direct_block_ids.length <= 210 &&
+    !capRow.direct_block_ids.includes("d".repeat(300)),
+);
+const longQuery = Array.from({ length: 100 }, (_, i) => `tok${i}`).join(" ");
+check(
+  "an oversized query is token-capped instead of building unbounded SQL",
+  typeof db.search(longQuery, { project: "CapProj" }).mode === "string",
+);
+const cfgCap = internals.sanitizeCfg({ excludePaths: ["x".repeat(500)] });
+check("excludePaths entries are length-capped", cfgCap.excludePaths[0].length === 200);
+fs.writeFileSync(
+  path.join(biliRoot, "cap_host.json"),
+  JSON.stringify({
+    version: 2,
+    id: "cap-origin",
+    payload: {
+      meta: { protocol: "openai", upstreamOrigin: "o".repeat(500) },
+      state: {
+        blocks: [
+          {
+            blockId: "b1",
+            runId: "r",
+            tier: 1,
+            topic: "t",
+            summary: "capOriginMarker",
+            compressedTokens: 1,
+            createdAt: T2,
+          },
+        ],
+      },
+    },
+  }),
+);
+await internals.scanSources(false);
+const capProj = db.db.prepare("SELECT project FROM sources WHERE source_file LIKE ?").get("%cap_host.json").project;
+check("a bili project label from an untrusted origin is capped", capProj.length === 200);
+
+// --- Memory line: timeline + related (mode extension) -------------------------------
+const tlSess = path.join(tmp, "--home-dev-Timeline--", "tl.jsonl");
+const tlT0 = T2;
+const tlBlocks = [
+  {
+    blockId: "b10",
+    runId: "rt",
+    tier: 1,
+    topic: "tl one",
+    summary: "timeLineMarker alpha",
+    compressedTokens: 1,
+    createdAt: tlT0,
+    startRef: "m00001",
+    endRef: "m00002",
+    active: true,
+  },
+  {
+    blockId: "b11",
+    runId: "rt",
+    tier: 1,
+    topic: "tl two",
+    summary: "timeLineMarker beta",
+    compressedTokens: 1,
+    createdAt: tlT0 + 2 * 3600000,
+    startRef: "m00003",
+    endRef: "m00004",
+    active: true,
+    directBlockIds: ["b10"],
+  },
+  {
+    blockId: "b12",
+    runId: "rt",
+    tier: 1,
+    topic: "tl three",
+    summary: "timeLineMarker gamma",
+    compressedTokens: 1,
+    startRef: "m00005",
+    endRef: "m00006",
+  },
+  {
+    blockId: "bX",
+    runId: "rt",
+    tier: 1,
+    topic: "tl x",
+    summary: "timeLineMarker omega",
+    compressedTokens: 1,
+    startRef: "m00007",
+  },
+];
+fs.mkdirSync(path.dirname(tlSess), { recursive: true });
+fs.writeFileSync(tlSess + ".acp.json", JSON.stringify(mkSidecar(tlBlocks)));
+const tlIng = await db.ingestSidecarFile(tlSess, "/home/dev/Timeline");
+check("timeline fixture ingests", tlIng.ok && tlIng.inserted === 4);
+
+const tl = db.timeline("timeLineMarker", { project: "Timeline" });
+check(
+  "timeline lists every match (orderable first, unplaceable last)",
+  tl.rows.length === 4 &&
+    tl.rows[0].blockId === "b10" &&
+    tl.rows[1].blockId === "b11" &&
+    tl.rows[2].blockId === "b12" &&
+    tl.rows[3].blockId === "bX",
+);
+check(
+  "timeline marks the untimed entry as estimated (no exact time)",
+  tl.rows[2].exact === false && tl.rows[2].estimated === true,
+);
+const tlText = internals.formatTimeline(tl);
+check(
+  "the catalog is one line per memory and never hides an unplaceable block",
+  tlText.includes("## unplaced") && tlText.includes("· bX ·") && !tlText.includes("timeLineMarker beta"),
+);
+check(
+  "the catalog shows one line per entry with the block id and topic",
+  tlText.split("\n").filter((l) => /^\d\d:\d\d · /.test(l)).length === 2 &&
+    tlText.split("\n").filter((l) => l.startsWith("--:-- · ")).length === 2,
+);
+check(
+  "an explicit limit is reported instead of silently truncating",
+  db.timeline("timeLineMarker", { project: "Timeline", limit: 2 }).hiddenByLimit === 2,
+);
+
+const rel = db.related("timeLineMarker", { block: "b10", project: "Timeline" });
+check(
+  "related ranks the lineage child first and reports the reason",
+  rel.rows.length >= 1 && rel.rows[0].blockId === "b11" && rel.rows[0].reasons.includes("lineage"),
+);
+check(
+  "related shows the evidence sentence rather than the whole summary",
+  typeof rel.rows[0].evidence === "string" && rel.rows[0].evidence.includes("timeLineMarker"),
+);
+check(
+  "related formatter renders the reason and evidence lines",
+  internals.formatRelated(rel).includes("Why:") && internals.formatRelated(rel).includes("Evidence:"),
+);
+check(
+  "related without a query is refused (relevance is anchored by the search words)",
+  db.related("", { block: "b10" }).note.includes("needs a query"),
+);
+
+// --- JSONL read reduction: allow-list hints + streaming early exit ------------------
+const hint = internals.sanitizeSource({
+  id: "hint",
+  adapter: "pi-sidecar",
+  root: "/home/dev/HintRoot",
+  pattern: "**/*.jsonl.acp.json",
+  project: "HintProj",
+  cwd: "~/hint-proj",
+});
+check(
+  "allow-list project/cwd hints are parsed and ~ is expanded",
+  hint.project === "HintProj" && hint.cwd === path.join(os.homedir(), "hint-proj"),
+);
+
+const streamFile = path.join(tmp, "stream.jsonl");
+const streamLines = [
+  JSON.stringify({
+    type: "message",
+    id: "m00001",
+    message: { role: "user", content: [{ type: "text", text: "streamWantedMarker" }] },
+  }),
+];
+for (let i = 0; i < 5000; i++) {
+  streamLines.push(
+    JSON.stringify({
+      type: "message",
+      id: `pad${i}`,
+      message: { role: "assistant", content: [{ type: "text", text: "p".repeat(500) }] },
+    }),
+  );
+}
+fs.writeFileSync(streamFile, streamLines.join("\n") + "\n");
+const streamRead = await internals.readSessionMessages(streamFile, 10 * 1024 * 1024, undefined, new Set(["m00001"]));
+check(
+  "streaming read stops once the wanted id is found",
+  streamRead.messages.has("m00001") && streamRead.bytesRead < streamRead.totalBytes && streamRead.truncated === false,
+);
+
+const tailFile = path.join(tmp, "tail.jsonl");
+const tailLines = [];
+for (let i = 0; i < 5000; i++) {
+  tailLines.push(
+    JSON.stringify({
+      type: "message",
+      id: `head${i}`,
+      message: { role: "assistant", content: [{ type: "text", text: "h".repeat(500) }] },
+    }),
+  );
+}
+tailLines.push(
+  JSON.stringify({
+    type: "message",
+    id: "mTail",
+    message: { role: "user", content: [{ type: "text", text: "tailWantedMarker" }] },
+  }),
+);
+fs.writeFileSync(tailFile, tailLines.join("\n") + "\n");
+const tailRead = await internals.readSessionMessages(tailFile, 200000, undefined, new Set(["mTail"]));
+check(
+  "a wanted id near the end is found through the tail window within the byte budget",
+  tailRead.messages.has("mTail") && tailRead.bytesRead <= 200000 && tailRead.truncated === false,
+);
+
+// --- billion-context blockContents expansion (opt-in stored source) -----------------
+const bcExpandFile = path.join(biliRoot, "expand_bc.json");
+fs.writeFileSync(
+  bcExpandFile,
+  JSON.stringify({
+    version: 3,
+    id: "pfa-expand",
+    payload: {
+      state: {
+        blocks: [
+          {
+            blockId: "bE",
+            runId: "rE",
+            tier: 1,
+            topic: "exp",
+            summary: "bcExpandMarker",
+            compressedTokens: 3,
+            createdAt: T2,
+          },
+        ],
+      },
+      blockContents: {
+        bE: {
+          full: { text: "bcExpandFullMarker original text", count: 2 },
+          one: { text: "bcExpandOneMarker first message", count: 1 },
+        },
+      },
+    },
+  }),
+);
+const storedList = await internals.expandStoredBlock({
+  file: bcExpandFile,
+  blockId: "bE",
+  mode: "list",
+  maxChars: 1000,
+  maxMessages: 10,
+  maxReadBytes: 1_000_000,
+});
+check(
+  "stored block list exposes the full/one manifest without text",
+  storedList.text === null && storedList.entries.length === 2 && storedList.entries.every((e) => e.found === true),
+);
+const storedFull = await internals.expandStoredBlock({
+  file: bcExpandFile,
+  blockId: "bE",
+  mode: "full",
+  select: [1],
+  maxChars: 1000,
+  maxMessages: 10,
+  maxReadBytes: 1_000_000,
+});
+check(
+  "stored block full renders only the selected entry",
+  storedFull.text.includes("bcExpandFullMarker") && !storedFull.text.includes("bcExpandOneMarker"),
+);
+const storedMissing = await internals.expandStoredBlock({
+  file: path.join(biliRoot, "nope.json"),
+  blockId: "bE",
+  mode: "list",
+  maxChars: 100,
+  maxMessages: 1,
+  maxReadBytes: 1000,
+});
+check("stored block expansion degrades to sessionMissing", storedMissing.sessionMissing === true);
+
+// --- Fork duplication merge + related length window ---------------------------------
+const dupSessA = path.join(tmp, "--home-dev-DupProj--", "dupA.jsonl");
+const dupSessB = path.join(tmp, "--home-dev-DupProj--", "dupB.jsonl");
+const dupSessC = path.join(tmp, "--home-dev-DupProj--", "dupC.jsonl");
+const sharedDup = {
+  runId: "rDup",
+  tier: 1,
+  topic: "dup topic",
+  summary: "dupMergeMarker shared body text",
+  compressedTokens: 5,
+  createdAt: T2,
+  startRef: "m00001",
+  endRef: "m00002",
+};
+writeSidecar(dupSessA, [
+  { ...sharedDup, blockId: "bA" },
+  {
+    blockId: "bU",
+    runId: "rA",
+    tier: 1,
+    topic: "u",
+    summary: "uniqueAMarker",
+    compressedTokens: 1,
+    createdAt: T2 + 1000,
+    startRef: "m00003",
+    endRef: "m00004",
+  },
+]);
+writeSidecar(dupSessB, [
+  { ...sharedDup, blockId: "bB" },
+  {
+    blockId: "bV",
+    runId: "rB",
+    tier: 1,
+    topic: "v",
+    summary: "uniqueBMarker",
+    compressedTokens: 1,
+    createdAt: T2 + 2000,
+    startRef: "m00005",
+    endRef: "m00006",
+  },
+]);
+writeSidecar(dupSessC, [
+  {
+    blockId: "bP",
+    runId: "rC",
+    tier: 1,
+    topic: "same-source",
+    summary: "dupSameSourceMarker identical",
+    compressedTokens: 1,
+    createdAt: T2,
+    startRef: "m00007",
+    endRef: "m00008",
+  },
+  {
+    blockId: "bQ",
+    runId: "rC",
+    tier: 2,
+    topic: "same-source",
+    summary: "dupSameSourceMarker identical",
+    compressedTokens: 1,
+    createdAt: T2 + 1,
+    startRef: "m00009",
+    endRef: "m00010",
+  },
+]);
+await db.ingestSidecarFile(dupSessA, "/home/dev/DupProj");
+await db.ingestSidecarFile(dupSessB, "/home/dev/DupProj");
+await db.ingestSidecarFile(dupSessC, "/home/dev/DupProj");
+const dupSearch = db.search("dupMergeMarker", { project: "DupProj" });
+check(
+  "identical blocks copied across sources merge into one result",
+  dupSearch.rows.length === 1 && dupSearch.rows[0].duplicateCount >= 1 && dupSearch.rows[0].alsoFrom.length >= 1,
+);
+check("the merged formatter lists the alternate source", internals.formatResults(dupSearch).includes("Also from:"));
+const sameSearch = db.search("dupSameSourceMarker", { project: "DupProj" });
+check("same-source parent/child blocks with identical text are not merged", sameSearch.rows.length === 2);
+
+const relSess = path.join(tmp, "--home-dev-RelProj--", "rel.jsonl");
+writeSidecar(relSess, [
+  {
+    blockId: "bS",
+    runId: "rSeed",
+    tier: 1,
+    topic: "relseed",
+    summary: "relatedMinMaxSeedMarker long enough body",
+    compressedTokens: 1,
+    createdAt: T2,
+    startRef: "m00001",
+    endRef: "m00002",
+  },
+  {
+    blockId: "bShort",
+    runId: "rShort",
+    tier: 1,
+    topic: "s",
+    summary: "short body",
+    compressedTokens: 1,
+    createdAt: null,
+    startRef: "m00003",
+    endRef: "m00004",
+  },
+  {
+    blockId: "bLong",
+    runId: "rLong",
+    tier: 1,
+    topic: "l",
+    summary: "z".repeat(900) + " relatedMinMaxSeedMarker",
+    compressedTokens: 1,
+    createdAt: null,
+    startRef: "m00005",
+    endRef: "m00006",
+  },
+]);
+await db.ingestSidecarFile(relSess, "/home/dev/RelProj");
+const relMinMax = db.related("relatedMinMaxSeedMarker", { block: "bS", project: "RelProj" });
+check(
+  "related drops candidates below the minimum length and beyond the maximum window",
+  relMinMax.rows.every((r) => r.blockId !== "bShort" && r.blockId !== "bLong"),
+);
+const relShortSeed = db.related("short", { block: "bShort", project: "RelProj" });
+check(
+  "a too-short seed evidence is refused for related",
+  relShortSeed.note === "seed evidence sentence is too short for a reliable relation",
+);
+
+// --- memory_get: read one stored summary (no raw messages) ---------------------------
+const got = db.getBlock("bS", "RelProj");
+check(
+  "memory_get returns the stored summary, not raw session text",
+  got.found && got.total === 1 && got.row.summary.includes("relatedMinMaxSeedMarker"),
+);
+const gotText = internals.formatBlockDetail(got.row);
+check(
+  "memory_get formatter renders the block header and summary",
+  gotText.includes("Block bS") && gotText.includes("relatedMinMaxSeedMarker"),
+);
+check("memory_get reports a missing block", db.getBlock("nope", null).found === false);
+
+// --- output-time redaction (legacy rows predate the current filter) ------------------
+const legacySecret = "sk-" + "A".repeat(32);
+const legacyFile = path.join(tmp, "legacy.jsonl.acp.json");
+db.db
+  .prepare(
+    "INSERT INTO sources(source_file, kind, project, last_mtime_ms, last_size, first_seen_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+  )
+  .run(legacyFile, "pi", "LegacyProj", 1, 1, T2, T2);
+db.db
+  .prepare(
+    "INSERT INTO blocks(source_file, kind, block_id, tier, topic, summary, compressed_tokens, created_at) VALUES (?,?,?,?,?,?,?,?)",
+  )
+  .run(legacyFile, "pi", "bLegacy", 1, "legacy topic", `legacySecretMarker ${legacySecret} end`, 1, T2);
+const legacyOut = internals.formatResults(db.search("legacySecretMarker", { project: "LegacyProj" }));
+check(
+  "output-time redaction masks a legacy unredacted secret",
+  !legacyOut.includes(legacySecret) && legacyOut.includes("[REDACTED]"),
+);
+check(
+  "output-time redaction does not touch the stored row",
+  db.db.prepare("SELECT summary FROM blocks WHERE block_id='bLegacy'").get().summary.includes(legacySecret),
+);
+
+// --- CJK 2-char words relate through shingles ---------------------------------------
+const bigSess = path.join(tmp, "--home-dev-BigramProj--", "big.jsonl");
+writeSidecar(bigSess, [
+  {
+    blockId: "bSeed",
+    runId: "rBig",
+    tier: 1,
+    topic: "沙箱建立",
+    summary: "测试沙箱环境建立完成并且完成验收记录归档",
+    compressedTokens: 1,
+    createdAt: T2,
+    startRef: "m00001",
+    endRef: "m00002",
+  },
+  {
+    blockId: "bCand",
+    runId: "rBig2",
+    tier: 1,
+    topic: "运行沙箱测试",
+    summary: "运行沙箱测试并记录结果以及后续修复步骤文档",
+    compressedTokens: 1,
+    createdAt: T2 + 1000,
+    startRef: "m00003",
+    endRef: "m00004",
+  },
+]);
+await db.ingestSidecarFile(bigSess, "/home/dev/BigramProj");
+const bigRel = db.related("沙箱", { block: "bSeed", project: "BigramProj" });
+check(
+  "CJK words inside longer runs relate through 2-char shingles",
+  bigRel.rows.some((r) => r.blockId === "bCand" && r.reasons.some((x) => x.startsWith("same-sentence:"))),
+);
+
+// --- platform-neutral basename in model output --------------------------------------
+const winRow = {
+  sourceFile: "C:\\Users\\x\\sessions\\--F--git--\\s.jsonl.acp.json",
+  kind: "pi",
+  blockId: "b1",
+  tier: 1,
+  tokens: 1,
+  createdAt: T2,
+  summary: "winbaseMarker",
+  project: "git",
+  refStart: null,
+  refEnd: null,
+};
+const winOut = internals.formatResults({ mode: "fts", rows: [winRow] });
+check(
+  "source label reduces a Windows path to its file name",
+  winOut.includes("[pi] s.jsonl") && !winOut.includes("C:\\Users"),
+);
+
+// --- excludePaths config --------------------------------------------------------------
+const cfgEx = internals.sanitizeCfg({ excludePaths: ["Temp", " probe "] });
+check(
+  "sanitizeCfg trims excludePaths and drops blanks",
+  JSON.stringify(cfgEx.excludePaths) === JSON.stringify(["Temp", "probe"]),
+);
+
 // --- Durable prune: tombstones + watermark ledger ---------------------------------
 const pruneDb = new internals.MemoryDb(path.join(tmp, "prune.db"));
 const pruneSess = path.join(tmp, "--home-dev-Prune--", "prune.jsonl");
@@ -1408,6 +2054,42 @@ check(
   "an unreadable session file degrades to missing instead of failing the tool call",
   exDenied.missing === true && exDenied.messages.size === 0,
 );
+
+// --- excludePaths integration (runs last: it replaces the allow-list) ---------------
+const exPathsRoot = path.join(tmp, "exclude-root");
+const exPathsDir = path.join(exPathsRoot, "run-Temp-exclude-me");
+fs.mkdirSync(exPathsDir, { recursive: true });
+const exPathsSess = path.join(exPathsDir, "ex.jsonl");
+writeSidecar(exPathsSess, [
+  {
+    blockId: "b1",
+    runId: "r",
+    tier: 1,
+    topic: "t",
+    summary: "excludePathMarker",
+    compressedTokens: 1,
+    createdAt: T2,
+    startRef: "m00001",
+    endRef: "m00002",
+  },
+]);
+fs.writeFileSync(
+  sourcesPath,
+  JSON.stringify({
+    id: "ex",
+    adapter: "pi-sidecar",
+    root: exPathsRoot,
+    pattern: "**/*.jsonl.acp.json",
+    enabled: true,
+  }) + "\n",
+);
+internals._setConfig({ excludePaths: ["Temp"] });
+await internals.scanSources(false);
+check(
+  "excludePaths keeps matching sources out of the store",
+  internals.getDb().search("excludePathMarker").rows.length === 0,
+);
+internals._setConfig({ excludePaths: [] });
 
 // --- cleanup --------------------------------------------------------------------
 // Windows locks a database file while a handle is open, so the unlink below fails with EBUSY.

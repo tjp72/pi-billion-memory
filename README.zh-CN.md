@@ -32,9 +32,17 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
 - 本扩展**不会 hook pi 的 `context` 事件**，只注册 `memory_search` 工具和
   `/memory` 命令，因此可以和 billion-context-pi 同时运行，不会参与上下文压缩的
   顺序竞争，也不会覆盖压缩结果。
-- sidecar 格式是 billion-context-pi 的内部实现，可能变化。本扩展针对
-  billion-context-pi `0.1.65` 的 sidecar 格式做过测试；如果上游格式变化，
-  可能需要更新适配器。
+- billion-context-pi **原样保存**压缩摘要，**不做密钥脱敏**（它唯一的摘要规范化只解码
+  `\uXXXX` 转义）；模型完全可能把凭据写进摘要并被 sidecar 保留。本扩展在入库时脱敏，
+  并且**对所有返回模型的内容再过滤一次**，因此早于当前过滤器的值也不会再被展示。
+  已存行不会被改写；要彻底清除请删除 `*.db*` 后重扫。
+- sidecar 格式是 billion-context-pi 公开的下游契约：每次保存都写
+  `schemaVersion` + `producer`，未知的块字段只做加法，文件原子替换
+  （`billion-context-pi` 的 `src/contract.ts` 与 `bcp-block-v1.json`）；
+  缺失 `schemaVersion` 视为 v1。本扩展会读取版本号，遇到**未知的更新版本会跳过**
+  （只记一次日志、绝不改写），因此上游格式升级不会写坏或误吞数据。
+  billion-context（代理/原生）的会话信封（`{version, payload.state.blocks}`）
+  也按版本 1-3 同样读取。
 - billion-context-pi 使用 MIT 许可证；它的名称和 logo 归其作者所有。
   本项目的 MIT 许可证只覆盖本项目代码。
 
@@ -48,14 +56,28 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
 - **增量且持久**：每个源文件用 `mtime + size` 水位线记录进度；
   `UNIQUE(source_file, block_id)` + `INSERT OR IGNORE` 去重；`prune()` 会写
   tombstone，后续 rescan 不会复活已删除的块。
+- **上游生命周期元数据**：源文件提供时，块还会保存 `active`、
+  `direct_block_ids`（压缩谱系）、`duration_ms`、`generation`、
+  `survived_count`、`compress_call_id`；源记录保存 `format_version`/`producer`。
+  强制 rescan 可原地刷新这些字段，不改动已存摘要。
 - **中文友好搜索**：3 个字符及以上使用 FTS5 `trigram`；1–2 个字符使用
   `LIKE` 对 `summary OR topic` 做 AND 匹配；长短混合查询两种模式并用。
   不调用 LLM 翻译或生成关键词。
+- **记忆线模式**：`memory_search` 支持 `mode`。`blocks`（默认）按相关性排序；
+  `timeline` 返回**完整目录**（一行一条：时间、项目、块号、tier、topic，按日期分组，
+  永不截断）；`related` 比较每个块中**包含搜索词的那句话**（停用词 + 数据驱动 IDF
+  抑制泛词噪声，压缩谱系/同一次压缩/相邻作为结构证据），并展示该证据句。
+  目录行可用 `memory_get` 打开读取已存摘要。
+- **读取单条记忆**：`memory_get` 按块号打开目录/搜索中的一行，返回已脱敏的
+  topic + summary；不读取原始 session 消息。
+- **重复内容合并**：被 fork/复制到不同源文件的完全相同记忆只显示一条，并列出
+  其它出处；同一源内的多层级父子块不会被合并。
 - **惰性项目解析**：只有在 sidecar 需要（重新）入库时才读取 pi session 文件的
   **第一行**（`cwd` 等 header 元数据）；未变化的库不会产生 header 读取。
 - **可选块展开**：开启 `expandEnabled` 后，`memory_expand` 可按需把某个块记录的
-  消息指针还原成原始 session 消息。两段式（先看清单，再显式选段）、有硬上限、
-  走与入库相同的过滤，并且**不写回本地库**。
+  消息指针还原成原始 session 消息。对 billion-context 会话则改读信封自身的
+  `payload.blockContents`，完全不碰宿主 session 日志。两段式（先看清单，再显式选段）、
+  有硬上限、走与入库相同的过滤，并且**不写回本地库**。
 - **不 hook context**：扩展只负责索引和搜索压缩摘要，不参与 pi 的上下文压缩。
 
 ## 环境要求
@@ -194,6 +216,7 @@ bili sessions (<host>_<hash>.json)┘                              (SQLite + FTS
   "maxSummaryChars": 20000,
   "debug": false,
   "excludeDirs": [],
+  "excludePaths": [],
   "scanOnStartup": true,
   "expandEnabled": false,
   "expandMaxChars": 40000,
@@ -209,6 +232,8 @@ bili sessions (<host>_<hash>.json)┘                              (SQLite + FTS
   并重启 pi 可从源文件重建；
 - `debug`：详细日志；
 - `excludeDirs`：在 pi-sidecar 源 root 内要跳过的目录名；
+- `excludePaths`：对每个源都生效的路径子串（大小写不敏感），按相对源 root 的路径
+  匹配，例如 `["Temp","probe"]` 可排除测试/临时 run 目录；
 - `scanOnStartup`：启动时是否后台全量扫描。关闭后，当前 session 仍会强制扫描
   一次，其他源由后续扫描逐步发现；
 - `expandEnabled`：是否注册可选的 `memory_expand` 工具（默认 `false`），
@@ -234,6 +259,9 @@ bili sessions (<host>_<hash>.json)┘                              (SQLite + FTS
 - `pattern` 支持递归 `**/*.jsonl.acp.json` 形式或扁平 `ses_*.json` 形式；
 - `opencodeDb` 对 opencode 源可选但推荐：用于只读解析每个 state 文件对应的
   工作目录（项目名）。
+- `project` 与 `cwd` 是 `pi-sidecar` 源的可选提示：设置后适配器可完全跳过惰性
+  session header 读取；否则只在该源新增/变化时读取 session 文件第一行。
+  `project` 直接作为项目名；`cwd` 支持 `~`，并用其 basename 作为项目名。
 
 例如索引一个 billion-context 代理 session 目录（WorkBuddy/codebuddy）：
 
@@ -248,7 +276,7 @@ bili sessions (<host>_<hash>.json)┘                              (SQLite + FTS
 ```
 
 - `bili-session` 从每个匹配的 `<host>_<hash>.json` 文件读取 `payload.state.blocks`
-  下的块；项目名是 `<host>` 段。
+  下的块；项目名优先取信封自身的 `upstreamOrigin`/`protocol`，否则取 `<host>` 段。
 
 例如只扫描一个 pi sessions 子树和一个额外的 sidecar root：
 

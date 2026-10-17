@@ -114,7 +114,89 @@ async function readCapped(file, maxBytes) {
     }
   }
 }
-async function readSessionMessages(sessionFile, maxReadBytes, readFile = readCapped) {
+async function readSelectedMessages(file, maxBytes, wanted) {
+  const { promises: fsp } = await import('fs');
+  const messages = /* @__PURE__ */ new Map();
+  const cap = Math.max(0, Math.floor(maxBytes));
+  const found = /* @__PURE__ */ new Set();
+  const CHUNK = 1024 * 1024;
+  let handle;
+  try {
+    handle = await fsp.open(file, "r");
+  } catch (e) {
+    if (e && ["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EISDIR"].includes(e.code)) {
+      return { messages, bytesRead: 0, totalBytes: 0, truncated: false, missing: true };
+    }
+    throw e;
+  }
+  try {
+    const { size } = await handle.stat();
+    let pos = 0;
+    let bytesRead = 0;
+    let leftover = "";
+    const ingestLine = (rawLine) => {
+      const raw = rawLine.trim();
+      if (!raw) return;
+      let line;
+      try {
+        line = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      if (!line || typeof line !== "object") return;
+      if (line.type !== "message" && line.type !== "custom_message") return;
+      if (typeof line.id !== "string" || !line.id) return;
+      messages.set(line.id, line);
+      if (wanted.has(line.id)) found.add(line.id);
+    };
+    const consume = (chunk) => {
+      leftover += chunk;
+      let at = leftover.indexOf("\n");
+      while (at >= 0) {
+        ingestLine(leftover.slice(0, at));
+        leftover = leftover.slice(at + 1);
+        at = leftover.indexOf("\n");
+      }
+    };
+    const headLimit = size > cap ? Math.max(1, Math.floor(cap / 2)) : cap;
+    while (pos < size && bytesRead < headLimit && found.size < wanted.size) {
+      const want = Math.min(CHUNK, headLimit - bytesRead, size - pos);
+      const buffer = Buffer.allocUnsafe(want);
+      const { bytesRead: n } = await handle.read(buffer, 0, want, pos);
+      if (n <= 0) break;
+      pos += n;
+      bytesRead += n;
+      consume(buffer.subarray(0, n).toString("utf8"));
+    }
+    if (found.size < wanted.size && pos < size && bytesRead < cap) {
+      const tailLen = Math.min(cap - bytesRead, size - pos);
+      const tailStart = size - tailLen;
+      const buffer = Buffer.allocUnsafe(tailLen);
+      const { bytesRead: n } = await handle.read(buffer, 0, tailLen, tailStart);
+      if (n > 0) {
+        bytesRead += n;
+        pos += n;
+        let text = buffer.subarray(0, n).toString("utf8");
+        const nl = text.indexOf("\n");
+        if (tailStart > 0 && nl >= 0) text = text.slice(nl + 1);
+        consume(text);
+      }
+    }
+    const { size: after } = await handle.stat();
+    const truncated = found.size < wanted.size && (bytesRead >= cap || pos < after);
+    return { messages, bytesRead, totalBytes: after, truncated, missing: false };
+  } finally {
+    try {
+      await handle.close();
+    } catch {
+    }
+  }
+}
+async function readSessionMessages(sessionFile, maxReadBytes, readFile = readCapped, wantedIds = null) {
+  const wanted = wantedIds instanceof Set ? wantedIds : new Set(wantedIds || []);
+  if (readFile === readCapped && wanted.size > 0) {
+    return readSelectedMessages(sessionFile, maxReadBytes, wanted);
+  }
   const messages = /* @__PURE__ */ new Map();
   const cap = Math.max(0, Math.floor(maxReadBytes));
   let read;
@@ -160,7 +242,12 @@ async function expandBlock(opts) {
   if (opts.mode === "full" && select.length === 0) {
     throw new Error('mode "full" requires a non-empty select (run mode "list" first and pick indices)');
   }
-  const read = await readSessionMessages(opts.sessionFile, opts.maxReadBytes, opts.readFile);
+  const wantedBase = /* @__PURE__ */ new Set();
+  for (const ref of opts.msgIds) {
+    const { base: base2 } = splitMessageId(ref);
+    if (base2 && !isSyntheticRef(base2)) wantedBase.add(base2);
+  }
+  const read = await readSessionMessages(opts.sessionFile, opts.maxReadBytes, opts.readFile, wantedBase);
   const entries = [];
   const renderedByIndex = /* @__PURE__ */ new Map();
   let availableChars = 0;
@@ -254,6 +341,135 @@ async function expandBlock(opts) {
   base.truncated = capTrimmed || skipped > 0 || returned < requestedCount;
   return base;
 }
+function blockView(v) {
+  if (!v || typeof v !== "object") return null;
+  const view = v;
+  if (typeof view.text !== "string") return null;
+  return { text: view.text, count: Number.isInteger(view.count) ? view.count : 1 };
+}
+async function expandStoredBlock(opts) {
+  const cap = Math.max(0, Math.floor(opts.maxReadBytes));
+  const empty = (missing) => ({
+    entries: [],
+    text: null,
+    truncated: false,
+    availableChars: 0,
+    returnedChars: 0,
+    skippedMessages: 0,
+    readTruncated: false,
+    bytesRead: 0,
+    totalBytes: 0,
+    sessionMissing: missing
+  });
+  let read;
+  try {
+    read = await (opts.readFile ?? readCapped)(opts.file, cap);
+  } catch (e) {
+    if (e && ["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EISDIR"].includes(e.code)) return empty(true);
+    throw e;
+  }
+  const readTruncated = read.buffer.length < read.totalBytes;
+  let data = null;
+  try {
+    data = JSON.parse(read.buffer.toString("utf8"));
+  } catch {
+  }
+  const content = data?.payload?.blockContents?.[opts.blockId];
+  const full = blockView(content?.full);
+  const one = blockView(content?.one);
+  const entries = [];
+  const bodies = /* @__PURE__ */ new Map();
+  let index = 0;
+  const push = (label, view) => {
+    index++;
+    if (view) {
+      entries.push({
+        index,
+        ref: label,
+        messageId: label,
+        callId: null,
+        role: "block",
+        chars: view.text.length,
+        found: true
+      });
+      bodies.set(index, view.text);
+    } else {
+      entries.push({ index, ref: label, messageId: label, callId: null, role: null, chars: 0, found: false });
+    }
+  };
+  push("full", full);
+  if (one) push("one", one);
+  const availableChars = entries.reduce((n, e) => n + e.chars, 0);
+  const base = {
+    entries,
+    text: null,
+    truncated: false,
+    availableChars,
+    returnedChars: 0,
+    skippedMessages: 0,
+    readTruncated,
+    bytesRead: read.buffer.length,
+    totalBytes: read.totalBytes,
+    sessionMissing: false
+  };
+  if (opts.mode === "list") return base;
+  const select = Array.isArray(opts.select) ? opts.select.filter((n) => Number.isInteger(n) && n > 0) : [];
+  if (select.length === 0) {
+    throw new Error('mode "full" requires a non-empty select (run mode "list" first and pick indices)');
+  }
+  const wanted = new Set(select);
+  const maxChars = Math.max(0, Math.floor(opts.maxChars));
+  const maxMessages = Math.max(1, Math.floor(opts.maxMessages));
+  const chunks = [];
+  let used = 0;
+  let returned = 0;
+  let skipped = 0;
+  let capTrimmed = false;
+  for (const entry of entries) {
+    if (!wanted.has(entry.index)) continue;
+    if (!entry.found) {
+      skipped++;
+      continue;
+    }
+    if (returned >= maxMessages) {
+      skipped++;
+      continue;
+    }
+    let body = bodies.get(entry.index) ?? "";
+    if (opts.redact) body = opts.redact(body).text;
+    const header = `### [${entry.index}] block ${entry.ref} \xB7 ${body.length} chars
+`;
+    const sep2 = chunks.length ? 2 : 0;
+    const room = maxChars - used - sep2;
+    if (room <= 0) {
+      skipped++;
+      continue;
+    }
+    if (header.length + body.length <= room) {
+      chunks.push(`${header}${body}`);
+      used += sep2 + header.length + body.length;
+      returned++;
+      continue;
+    }
+    const marker = `
+[entry truncated at ${maxChars} chars]`;
+    const bodyRoom = room - header.length - marker.length;
+    if (bodyRoom > 0) {
+      chunks.push(`${header}${body.slice(0, bodyRoom)}${marker}`);
+      used += sep2 + header.length + bodyRoom + marker.length;
+    } else {
+      chunks.push(body.slice(0, room));
+      used += sep2 + room;
+    }
+    returned++;
+    capTrimmed = true;
+  }
+  base.text = chunks.join("\n\n");
+  base.returnedChars = base.text.length;
+  base.skippedMessages = skipped;
+  base.truncated = capTrimmed || skipped > 0;
+  return base;
+}
 
 // src/extension.ts
 var HOME = os.homedir();
@@ -268,6 +484,11 @@ var DEFAULT_CFG = {
   debug: false,
   /** Directory names to skip inside pi-sidecar source roots (e.g. encoded private project dirs) */
   excludeDirs: [],
+  /**
+   * Case-insensitive path substrings to skip for every source (e.g. test/temp run directories
+   * such as "Temp", "probe", "compare"). Matched against the path relative to the source root.
+   */
+  excludePaths: [],
   /** Background full allow-list scan on session start; disable for faster startups */
   scanOnStartup: true,
   /** JSONL allow-list of compression source roots (one JSON object per line) */
@@ -290,13 +511,59 @@ var DEFAULT_CFG = {
 var MAX_TOPIC_CHARS = 200;
 var PREVIEW_CHARS = 600;
 var MAX_MSG_IDS = 4e3;
+var MAX_DIRECT_BLOCKS = 1e3;
+var MAX_DIRECT_ITEM = 200;
+var MAX_CALL_ID_FIELD = 200;
+var MAX_PRODUCER_FIELD = 200;
+var MAX_PROJECT_LABEL = 200;
+var MAX_ID_FIELD = 200;
+var MAX_SOURCE_FIELD = 300;
+var MAX_EXCLUDE_PATH = 200;
+var MAX_CWD_HINT = 1024;
+var MAX_QUERY_CHARS = 512;
+var MAX_QUERY_TOKENS = 32;
+var MAX_TIMELINE_ROWS = 2e4;
 var EXPAND_MANIFEST_MAX = 300;
 var DEFAULT_RESULT_LIMIT = 6;
 var MAX_RESULT_LIMIT = 20;
+var RELATED_MAX_TOKENS = 40;
+var RELATED_TEXT_MIN_CHARS = 20;
+var RELATED_TEXT_MAX_CHARS = 800;
+var RELATED_GENERIC_DF = 0.6;
+var RELATED_CANDIDATE_LIMIT = 200;
+var BLOCK_ROW_COLUMNS = "b.id, b.source_file AS sourceFile, b.kind AS kind, b.block_id AS blockId, b.run_id AS runId, b.tier, b.topic, b.ref_start AS refStart, b.ref_end AS refEnd, b.compressed_tokens AS tokens, b.created_at AS createdAt, b.summary, b.active AS active, b.direct_block_ids AS directBlockIds, b.duration_ms AS durationMs, b.generation AS generation, b.survived_count AS survivedCount, b.compress_call_id AS compressCallId, s.project, s.cwd";
 var LOG_MAX_BYTES = 1e6;
 var TRIGRAM_MIN_LEN = 3;
 var PI_MAP_TTL_MS = 10 * 60 * 1e3;
 var SESSION_HEADER_MAX_BYTES = 1e6;
+var SUPPORTED_SIDECAR_SCHEMA_VERSION = 1;
+var SUPPORTED_BC_ENVELOPE_VERSIONS = /* @__PURE__ */ new Set([1, 2, 3]);
+var unsupportedFormatNotices = /* @__PURE__ */ new Set();
+function noteUnsupportedFormat(key, message) {
+  if (unsupportedFormatNotices.has(key)) return;
+  unsupportedFormatNotices.add(key);
+  logLine(message);
+}
+function isAuxiliarySourceFile(file) {
+  const base = fileBase(file).toLowerCase();
+  return base.endsWith(".content-store.json") || base.endsWith(".fb.json") || base.endsWith(".db") || base.endsWith(".db-wal") || base.endsWith(".db-shm");
+}
+function unsupportedSidecarSchema(data) {
+  if (!data || typeof data !== "object") return null;
+  const raw = data.schemaVersion;
+  if (raw === void 0 || raw === null) return null;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) return raw;
+  return raw > SUPPORTED_SIDECAR_SCHEMA_VERSION ? raw : null;
+}
+function unsupportedBcEnvelope(data) {
+  if (!data || typeof data !== "object") return null;
+  const payload = data.payload;
+  if (!payload || typeof payload !== "object") return null;
+  const raw = data.version;
+  if (raw === void 0 || raw === null) return null;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) return raw;
+  return SUPPORTED_BC_ENVELOPE_VERSIONS.has(raw) ? null : raw;
+}
 function sanitizeCfg(over) {
   const out = {};
   if (!over || typeof over !== "object") return out;
@@ -306,6 +573,8 @@ function sanitizeCfg(over) {
   }
   if (typeof over.debug === "boolean") out.debug = over.debug;
   if (Array.isArray(over.excludeDirs)) out.excludeDirs = over.excludeDirs.filter((x) => typeof x === "string");
+  if (Array.isArray(over.excludePaths))
+    out.excludePaths = over.excludePaths.filter((x) => typeof x === "string" && x.trim() !== "").map((x) => x.trim().slice(0, MAX_EXCLUDE_PATH));
   if (typeof over.scanOnStartup === "boolean") out.scanOnStartup = over.scanOnStartup;
   if (typeof over.sourcesPath === "string" && over.sourcesPath) out.sourcesPath = expandHome(over.sourcesPath);
   if (typeof over.logPath === "string" && over.logPath) out.logPath = expandHome(over.logPath);
@@ -479,6 +748,16 @@ function blockFilter(blockId, source) {
 function withoutPaths(text) {
   return String(text).replace(/file:\/\/\/[^\s'"]+/g, "file://<path>").replace(/(?<![\w:/\\])(?:[A-Za-z]:[\\/]|\\\\|\/\/)[^\s'"]+(?: [^\s'"]*[\\/][^\s'"]*)*/g, "<path>").replace(/(?<![\w.:/\\])~?\/(?:[^\s'":,)]*\/)*[^\s'":,)]+(?: [^\s'":,)]*\/[^\s'":,)]*)*/g, "<path>");
 }
+function fileBase(p) {
+  const s = String(p || "");
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+function parentBase(p) {
+  const s = String(p || "").replace(/[\\/]+$/, "");
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return i > 0 ? fileBase(s.slice(0, i)) : "";
+}
 var SOURCE_ADAPTERS = /* @__PURE__ */ new Set(["pi-sidecar", "opencode-acp", "bili-session"]);
 function sanitizeSource(raw) {
   if (!raw || typeof raw !== "object") return null;
@@ -496,6 +775,9 @@ function sanitizeSource(raw) {
     enabled: raw.enabled !== false
   };
   if (typeof raw.opencodeDb === "string" && raw.opencodeDb) out.opencodeDb = expandHome(raw.opencodeDb);
+  if (typeof raw.project === "string" && raw.project.trim())
+    out.project = raw.project.trim().slice(0, MAX_PROJECT_LABEL);
+  if (typeof raw.cwd === "string" && raw.cwd) out.cwd = expandHome(raw.cwd).slice(0, MAX_CWD_HINT);
   return out;
 }
 async function loadSources() {
@@ -627,6 +909,18 @@ function collectMsgIds(block) {
   }
   return out.length ? out : null;
 }
+function blockMetaFields(b) {
+  const direct = Array.isArray(b?.directBlockIds) ? b.directBlockIds.filter((x) => typeof x === "string" && x !== "").slice(0, MAX_DIRECT_BLOCKS).map((x) => x.slice(0, MAX_DIRECT_ITEM)) : [];
+  return {
+    active: typeof b?.active === "boolean" ? b.active ? 1 : 0 : null,
+    directBlockIds: direct.length ? JSON.stringify(direct) : null,
+    durationMs: toInt(b?.durationMs),
+    // Fixed vocabulary only, so a hostile value cannot inject arbitrary text into the store.
+    generation: b?.generation === "young" || b?.generation === "old" ? b.generation : null,
+    survivedCount: toInt(b?.survivedCount),
+    compressCallId: typeof b?.compressCallId === "string" && b.compressCallId ? b.compressCallId.slice(0, MAX_CALL_ID_FIELD) : null
+  };
+}
 function normalizePiBlocks(data) {
   if (!data || typeof data !== "object" || !Array.isArray(data.blocks)) return null;
   const out = [];
@@ -639,6 +933,7 @@ function normalizePiBlocks(data) {
       tier: Number.isInteger(b.tier) ? b.tier : null,
       topic: typeof b.topic === "string" && b.topic ? b.topic.slice(0, MAX_TOPIC_CHARS) : null,
       summary: b.summary,
+      ...blockMetaFields(b),
       msgIds: collectMsgIds(b),
       refStart: typeof b.startRef === "string" ? b.startRef : null,
       refEnd: typeof b.endRef === "string" ? b.endRef : null,
@@ -664,6 +959,7 @@ function normalizeOpencodeBlocks(data) {
         MAX_TOPIC_CHARS
       ) || null,
       summary: cleanOpencodeSummary(b.summary),
+      ...blockMetaFields(b),
       msgIds: collectMsgIds(b),
       refStart: typeof b.startId === "string" ? b.startId : null,
       refEnd: typeof b.endId === "string" ? b.endId : null,
@@ -678,9 +974,26 @@ function toInt(v) {
   return Number.isInteger(n) ? n : null;
 }
 function biliHost(sourceFile) {
-  const base = path.basename(sourceFile, ".json");
+  const base = fileBase(sourceFile).replace(/\.json$/, "");
   const idx = base.lastIndexOf("_");
   return idx > 0 ? base.slice(0, idx) : base || "unknown";
+}
+function cleanLabel(s) {
+  let out = "";
+  for (const ch of String(s || "")) {
+    const code = ch.charCodeAt(0);
+    if (code > 31 && code !== 127) out += ch;
+  }
+  return out;
+}
+function biliProject(data, sourceFile) {
+  const payload = data?.payload ?? {};
+  const meta = payload?.meta ?? {};
+  const origin = meta.upstreamOrigin ?? payload.upstreamOrigin ?? data?.upstreamOrigin;
+  if (typeof origin === "string" && origin.trim()) return cleanLabel(origin.trim()).slice(0, MAX_PROJECT_LABEL);
+  const protocol = meta.protocol ?? payload.protocol ?? data?.protocol;
+  if (typeof protocol === "string" && protocol.trim()) return cleanLabel(protocol.trim()).slice(0, MAX_PROJECT_LABEL);
+  return biliHost(sourceFile);
 }
 function normalizeBiliBlocks(data) {
   const blocks = data?.payload?.state?.blocks;
@@ -695,6 +1008,7 @@ function normalizeBiliBlocks(data) {
       tier: toInt(b.tier),
       topic: typeof b.topic === "string" && b.topic ? b.topic.slice(0, MAX_TOPIC_CHARS) : null,
       summary: b.summary,
+      ...blockMetaFields(b),
       msgIds: null,
       refStart: typeof b.startRef === "string" ? b.startRef : null,
       refEnd: typeof b.endRef === "string" ? b.endRef : null,
@@ -745,7 +1059,9 @@ var MemoryDb = class {
         last_mtime_ms  INTEGER DEFAULT 0,     -- source file mtime of last successful scan
         last_size      INTEGER DEFAULT 0,
         first_seen_at  INTEGER,
-        updated_at     INTEGER
+        updated_at     INTEGER,
+        format_version INTEGER,               -- upstream format version (schemaVersion / envelope version)
+        producer       TEXT                   -- upstream producer string when present
       );
       CREATE TABLE IF NOT EXISTS blocks(
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -761,6 +1077,12 @@ var MemoryDb = class {
         compressed_tokens INTEGER,
         created_at        INTEGER,            -- block.createdAt / block.createdAt (ms)
         msg_ids           TEXT,               -- JSON array of raw message ids (NULL = not expandable)
+        active            INTEGER,            -- 1/0 from the source; NULL = unknown
+        direct_block_ids  TEXT,               -- JSON array of lineage block ids (NULL = unknown)
+        duration_ms       INTEGER,            -- block duration when the source records it
+        generation        TEXT,               -- 'young' | 'old' (NULL = unknown)
+        survived_count    INTEGER,
+        compress_call_id  TEXT,
         UNIQUE(source_file, block_id)
       );
       CREATE INDEX IF NOT EXISTS idx_blocks_source ON blocks(source_file);
@@ -788,6 +1110,23 @@ var MemoryDb = class {
     const blockCols = this.db.prepare("PRAGMA table_info(blocks)").all();
     const addedMsgIds = !blockCols.some((c) => c.name === "msg_ids");
     if (addedMsgIds) this.db.exec("ALTER TABLE blocks ADD COLUMN msg_ids TEXT;");
+    for (const [name, type] of [
+      ["active", "INTEGER"],
+      ["direct_block_ids", "TEXT"],
+      ["duration_ms", "INTEGER"],
+      ["generation", "TEXT"],
+      ["survived_count", "INTEGER"],
+      ["compress_call_id", "TEXT"]
+    ]) {
+      if (!blockCols.some((c) => c.name === name)) this.db.exec(`ALTER TABLE blocks ADD COLUMN ${name} ${type};`);
+    }
+    const sourceCols = this.db.prepare("PRAGMA table_info(sources)").all();
+    for (const [name, type] of [
+      ["format_version", "INTEGER"],
+      ["producer", "TEXT"]
+    ]) {
+      if (!sourceCols.some((c) => c.name === name)) this.db.exec(`ALTER TABLE sources ADD COLUMN ${name} ${type};`);
+    }
     this.db.exec(`
       INSERT OR IGNORE INTO source_watermarks(source_file, last_mtime_ms, last_size, updated_at)
       SELECT source_file, last_mtime_ms, last_size, updated_at
@@ -839,7 +1178,7 @@ var MemoryDb = class {
       {
         kind: "pi",
         cwd: cwd || null,
-        project: cwd ? path.basename(cwd) : null
+        project: cwd ? fileBase(cwd) : null
       },
       force,
       async (sf) => piSessionHeaderCwd(sf)
@@ -869,6 +1208,9 @@ var MemoryDb = class {
     }
     const mtimeMs = st.mtimeMs;
     const size = st.size;
+    if (isAuxiliarySourceFile(sourceFile)) {
+      return { ok: true, parsed: false, skipped: true, total: 0, inserted: 0, mtimeMs, size };
+    }
     const kind = meta?.kind === "opencode" ? "opencode" : meta?.kind === "bili" ? "bili" : "pi";
     let cwd = typeof meta?.cwd === "string" && meta.cwd ? meta.cwd : null;
     let project = typeof meta?.project === "string" && meta.project ? meta.project : null;
@@ -889,13 +1231,13 @@ var MemoryDb = class {
           const resolved = await resolveCwd(sessionFile);
           if (typeof resolved === "string" && resolved) cwd = resolved;
         } catch (e) {
-          log(`cwd resolve failed ${path.basename(sessionFile)}: ${e.message}`);
+          log(`cwd resolve failed ${fileBase(sessionFile)}: ${e.message}`);
         }
       }
     }
     if (!project) {
-      if (cwd) project = path.basename(cwd);
-      else if (kind === "pi") project = path.basename(path.dirname(sourceFile));
+      if (cwd) project = fileBase(cwd);
+      else if (kind === "pi") project = parentBase(sourceFile);
       else if (kind === "bili") project = biliHost(sourceFile);
       else project = "unknown";
     }
@@ -905,6 +1247,18 @@ var MemoryDb = class {
     } catch (e) {
       return { ok: false, parsed: false, total: 0, inserted: 0, mtimeMs, size, error: `parse: ${e.message}` };
     }
+    const unsupported = kind === "pi" ? unsupportedSidecarSchema(data) : kind === "bili" ? unsupportedBcEnvelope(data) : null;
+    if (unsupported !== null) {
+      noteUnsupportedFormat(
+        `${kind}:${sourceFile}:${String(unsupported)}`,
+        `unsupported ${kind} format version ${String(unsupported)}; skipped ${fileBase(sourceFile)}`
+      );
+      return { ok: true, parsed: false, skipped: true, total: 0, inserted: 0, mtimeMs, size };
+    }
+    const formatVersion = kind === "pi" ? typeof data?.schemaVersion === "number" && Number.isInteger(data.schemaVersion) ? data.schemaVersion : 1 : kind === "bili" ? typeof data?.version === "number" && Number.isInteger(data.version) ? data.version : 1 : null;
+    const producer = typeof data?.producer === "string" && data.producer ? data.producer.slice(0, MAX_PRODUCER_FIELD) : null;
+    if (kind === "bili") project = biliProject(data, sourceFile);
+    if (typeof project === "string") project = cleanLabel(project).slice(0, MAX_PROJECT_LABEL) || "unknown";
     const blocks = kind === "pi" ? normalizePiBlocks(data) : kind === "bili" ? normalizeBiliBlocks(data) : normalizeOpencodeBlocks(data);
     if (blocks === null) {
       return {
@@ -927,16 +1281,18 @@ var MemoryDb = class {
     this.db.exec("BEGIN");
     try {
       this.db.prepare(
-        `INSERT INTO sources(source_file, kind, project, cwd, last_mtime_ms, last_size, first_seen_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO sources(source_file, kind, project, cwd, last_mtime_ms, last_size, first_seen_at, updated_at, format_version, producer)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(source_file) DO UPDATE SET
              kind = excluded.kind,
              project = excluded.project,
              cwd = excluded.cwd,
              last_mtime_ms = excluded.last_mtime_ms,
              last_size = excluded.last_size,
-             updated_at = excluded.updated_at`
-      ).run(sourceFile, kind, project, cwd, mtimeMs, size, now, now);
+             updated_at = excluded.updated_at,
+             format_version = excluded.format_version,
+             producer = excluded.producer`
+      ).run(sourceFile, kind, project, cwd, mtimeMs, size, now, now, formatVersion, producer);
       this.db.prepare(
         `INSERT INTO source_watermarks(source_file, last_mtime_ms, last_size, updated_at)
            VALUES (?, ?, ?, ?)
@@ -947,13 +1303,18 @@ var MemoryDb = class {
       ).run(sourceFile, mtimeMs, size, now);
       const ins = this.db.prepare(
         `INSERT OR IGNORE INTO blocks
-           (source_file, kind, block_id, run_id, tier, topic, summary, ref_start, ref_end, compressed_tokens, created_at, msg_ids)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           (source_file, kind, block_id, run_id, tier, topic, summary, ref_start, ref_end, compressed_tokens, created_at, msg_ids, active, direct_block_ids, duration_ms, generation, survived_count, compress_call_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE NOT EXISTS (SELECT 1 FROM block_tombstones WHERE source_file = ? AND block_id = ?)`
       );
       const updMsgIds = this.db.prepare(
         `UPDATE blocks SET msg_ids = ?
           WHERE source_file = ? AND block_id = ? AND (msg_ids IS NOT ?)`
+      );
+      const updMeta = this.db.prepare(
+        `UPDATE blocks SET
+           active = ?, direct_block_ids = ?, duration_ms = ?, generation = ?, survived_count = ?, compress_call_id = ?
+         WHERE source_file = ? AND block_id = ?`
       );
       for (const b of blocks) {
         if (!b || typeof b.summary !== "string") continue;
@@ -976,11 +1337,29 @@ var MemoryDb = class {
           b.compressedTokens,
           b.createdAt,
           msgIdsJson,
+          b.active ?? null,
+          b.directBlockIds ?? null,
+          b.durationMs ?? null,
+          b.generation ?? null,
+          b.survivedCount ?? null,
+          b.compressCallId ?? null,
           sourceFile,
           b.blockId
         );
         if (r.changes > 0) inserted++;
-        else if (updMsgIds.run(msgIdsJson, sourceFile, b.blockId, msgIdsJson).changes > 0) refreshed++;
+        else {
+          if (updMsgIds.run(msgIdsJson, sourceFile, b.blockId, msgIdsJson).changes > 0) refreshed++;
+          updMeta.run(
+            b.active ?? null,
+            b.directBlockIds ?? null,
+            b.durationMs ?? null,
+            b.generation ?? null,
+            b.survivedCount ?? null,
+            b.compressCallId ?? null,
+            sourceFile,
+            b.blockId
+          );
+        }
       }
       this.db.exec("COMMIT");
     } catch (e) {
@@ -991,9 +1370,9 @@ var MemoryDb = class {
       return { ok: false, parsed: true, total: blocks.length, inserted: 0, mtimeMs, size, error: e.message };
     }
     if (redactedHits > 0) {
-      logLine(`redacted ${redactedHits} potential secret(s) before storing ${path.basename(sourceFile)}`);
+      logLine(`redacted ${redactedHits} potential secret(s) before storing ${fileBase(sourceFile)}`);
     }
-    log(`ingest ${path.basename(sourceFile)} kind=${kind} project=${project} blocks=${blocks.length} new=${inserted}`);
+    log(`ingest ${fileBase(sourceFile)} kind=${kind} project=${project} blocks=${blocks.length} new=${inserted}`);
     return { ok: true, parsed: true, total: blocks.length, inserted, refreshed, redacted: redactedHits, mtimeMs, size };
   }
   /**
@@ -1009,10 +1388,13 @@ var MemoryDb = class {
     params.push(Math.max(1, Math.min(50, limit)));
     return this.db.prepare(
       `SELECT b.id, b.source_file AS sourceFile, b.kind AS kind,
-                b.block_id AS blockId, b.tier, b.topic, b.summary,
+                b.block_id AS blockId, b.run_id AS runId, b.tier, b.topic, b.summary,
                 b.ref_start AS refStart, b.ref_end AS refEnd,
                 b.compressed_tokens AS tokens, b.created_at AS createdAt,
-                b.msg_ids AS msgIds, s.project, s.cwd
+                b.msg_ids AS msgIds, b.active AS active, b.direct_block_ids AS directBlockIds,
+                b.duration_ms AS durationMs, b.generation AS generation,
+                b.survived_count AS survivedCount, b.compress_call_id AS compressCallId,
+                s.project, s.cwd
            FROM blocks b LEFT JOIN sources s ON s.source_file = b.source_file
           WHERE ${where}
           ORDER BY b.created_at DESC, b.id DESC
@@ -1036,21 +1418,25 @@ var MemoryDb = class {
     ).get(...params).c;
   }
   /**
-   * Build the search SQL shared by search()/explainSearch().
-   * - all tokens >= 3 chars: FTS5 trigram (bm25 ordering);
-   * - mixed: FTS for long tokens + AND-ed LIKE for short tokens;
-   * - all short: LIKE on summary OR topic, deliberately without the blocks_fts join so SQLite
-   *   can use idx_blocks_created (no FTS scan + temp B-tree sort).
-   * @returns {{mode:string, sql:string|null, params:Array<any>, limit:number}}
+   * Read-only detail for the catalog: one stored block (topic + already-redacted summary) plus its
+   * metadata. Never reads raw session messages; that stays the opt-in `memory_expand` path.
+   * @param {string} blockId block id as shown by memory_search/timeline
+   * @param {string|null} source optional substring match on the source file name or project
+   * @returns {{found:boolean,total:number,row:object|null}} newest row and the duplicate count
    */
-  _buildSearch(query, opts = {}) {
-    const limit = Math.max(
-      1,
-      Math.min(MAX_RESULT_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT)
-    );
-    const project = opts.project || null;
-    const tokens = String(query || "").trim().split(/\s+/).filter(Boolean);
-    if (tokens.length === 0) return { mode: "empty", sql: null, params: [], limit };
+  getBlock(blockId, source = null) {
+    this.open();
+    const rows = this.findBlocks(blockId, source, 2);
+    if (!rows.length) return { found: false, total: 0, row: null };
+    return { found: true, total: this.countBlocks(blockId, source), row: rows[0] };
+  }
+  /**
+   * Token-matching WHERE/FROM shared by the blocks search and the timeline/related candidate
+   * queries. Returns null for an empty query (callers decide what "no filter" means).
+   */
+  _buildFilter(query, project = null) {
+    const tokens = String(query || "").trim().split(/\s+/).filter(Boolean).slice(0, MAX_QUERY_TOKENS);
+    if (tokens.length === 0) return null;
     const escapeLike = (s) => s.replace(/[\\%_]/g, (m) => "\\" + m);
     const ftsTokens = tokens.filter((t) => t.length >= TRIGRAM_MIN_LEN);
     const likeTokens = tokens.filter((t) => t.length < TRIGRAM_MIN_LEN);
@@ -1071,24 +1457,44 @@ var MemoryDb = class {
       where += " AND s.project = ?";
       params.push(project);
     }
-    params.push(limit);
     const mode = useFts ? likeTokens.length ? "mixed" : "fts" : "like";
     const from = useFts ? "FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid JOIN sources s ON s.source_file = b.source_file" : "FROM blocks b JOIN sources s ON s.source_file = b.source_file";
-    const rank = useFts ? "bm25(blocks_fts)" : "NULL";
-    const order = useFts ? "ORDER BY bm25(blocks_fts), b.created_at DESC, b.id DESC" : "ORDER BY b.created_at DESC";
+    return { mode, where, params, from, useFts };
+  }
+  /**
+   * Build the search SQL shared by search()/explainSearch().
+   * - all tokens >= 3 chars: FTS5 trigram (bm25 ordering);
+   * - mixed: FTS for long tokens + AND-ed LIKE for short tokens;
+   * - all short: LIKE on summary OR topic, deliberately without the blocks_fts join so SQLite
+   *   can use idx_blocks_created (no FTS scan + temp B-tree sort).
+   * @returns {{mode:string, sql:string|null, params:Array<any>, limit:number}}
+   */
+  _buildSearch(query, opts = {}) {
+    const limit = Math.max(
+      1,
+      Math.min(MAX_RESULT_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT)
+    );
+    const built = this._buildFilter(query, opts.project || null);
+    if (!built) return { mode: "empty", sql: null, params: [], limit };
+    const params = [...built.params, limit];
+    const rank = built.useFts ? "bm25(blocks_fts)" : "NULL";
+    const order = built.useFts ? "ORDER BY bm25(blocks_fts), b.created_at DESC, b.id DESC" : "ORDER BY b.created_at DESC";
     const sql = `
       SELECT b.id, b.source_file AS sourceFile, b.kind AS kind,
-             b.block_id AS blockId, b.tier, b.topic,
+             b.block_id AS blockId, b.run_id AS runId, b.tier, b.topic,
              b.ref_start AS refStart, b.ref_end AS refEnd,
              b.compressed_tokens AS tokens, b.created_at AS createdAt,
-             b.summary, s.project, s.cwd,
+             b.summary, b.active AS active, b.direct_block_ids AS directBlockIds,
+             b.duration_ms AS durationMs, b.generation AS generation,
+             b.survived_count AS survivedCount, b.compress_call_id AS compressCallId,
+             s.project, s.cwd,
              ${rank} AS rank
-      ${from}
-      WHERE ${where}
+      ${built.from}
+      WHERE ${built.where}
       ${order}
       LIMIT ?
     `;
-    return { mode, sql, params, limit };
+    return { mode: built.mode, sql, params, limit };
   }
   /**
    * @param {string} query
@@ -1106,7 +1512,7 @@ var MemoryDb = class {
       logLine(`search error: ${withoutPaths(e.message)} | sql=${built.sql}`);
       rows = [];
     }
-    return { mode: built.mode, rows };
+    return { mode: built.mode, rows: mergeDuplicateRows(rows) };
   }
   /** EXPLAIN QUERY PLAN for the same SQL as search(); used by tests to lock the LIKE plan. */
   explainSearch(query, opts = {}) {
@@ -1114,6 +1520,187 @@ var MemoryDb = class {
     const built = this._buildSearch(query, opts);
     if (built.mode === "empty") return [];
     return this.db.prepare(`EXPLAIN QUERY PLAN ${built.sql}`).all(...built.params);
+  }
+  /**
+   * Timeline view: the complete catalog of matches, ordered by the timeline key (exact time when
+   * present, otherwise a source-local estimate from the numeric block id). `exact` marks rows with a
+   * real `created_at`; an estimated time is for ordering only and rendered as `--:--`. Rows with
+   * neither a time nor an order still appear (in the `unplaced` section). `limit` is an explicit
+   * caller cap, never a silent truncation.
+   */
+  timeline(query, opts = {}) {
+    this.open();
+    const built = this._buildFilter(query, opts.project || null);
+    const from = built ? built.from : "FROM blocks b JOIN sources s ON s.source_file = b.source_file";
+    let where = built ? built.where : "1=1";
+    const params = built ? [...built.params] : [];
+    if (!built && opts.project) {
+      where += " AND s.project = ?";
+      params.push(opts.project);
+    }
+    const sql = `
+      SELECT ${BLOCK_ROW_COLUMNS}, NULL AS rank
+      ${from}
+      WHERE ${where}
+      ORDER BY b.created_at DESC, b.id DESC
+      LIMIT ?
+    `;
+    let rows = [];
+    try {
+      rows = this.db.prepare(sql).all(...params, MAX_TIMELINE_ROWS + 1);
+      if (rows.length > MAX_TIMELINE_ROWS) {
+        return {
+          mode: "timeline",
+          rows: [],
+          listed: 0,
+          total: MAX_TIMELINE_ROWS + 1,
+          hiddenByLimit: 0,
+          note: `too many matches (>${MAX_TIMELINE_ROWS}); narrow with project/from/to`
+        };
+      }
+    } catch (e) {
+      logLine(`timeline error: ${withoutPaths(e.message)}`);
+      rows = [];
+    }
+    let anchor = null;
+    if (opts.block) {
+      const found = this.findBlocks(String(opts.block), opts.source || null, 1);
+      if (!found.length) return { mode: "timeline", rows: [], unknown: 0, total: 0, note: "anchor not found" };
+      anchor = found[0];
+    }
+    const anchorsBySource = /* @__PURE__ */ new Map();
+    for (const r of rows) {
+      if (!Number.isInteger(r.createdAt)) continue;
+      const list = anchorsBySource.get(r.sourceFile) || [];
+      list.push({ seq: blockSeqNum(r.blockId), createdAt: r.createdAt });
+      anchorsBySource.set(r.sourceFile, list);
+    }
+    const windowMs = Number.isInteger(opts.windowMinutes) ? opts.windowMinutes * 6e4 : null;
+    let lo = Number.isInteger(opts.from) ? opts.from : null;
+    let hi = Number.isInteger(opts.to) ? opts.to : null;
+    const sameSourceOnly = anchor && windowMs !== null ? anchor.sourceFile : null;
+    if (anchor && windowMs !== null && Number.isInteger(anchor.createdAt)) {
+      lo = anchor.createdAt - windowMs;
+      hi = anchor.createdAt + windowMs;
+    }
+    const entries = [];
+    for (const r of rows) {
+      if (sameSourceOnly && r.sourceFile !== sameSourceOnly) continue;
+      const key = timelineKey(r, anchorsBySource);
+      if (key.rank === 0 && key.time !== null && (lo !== null || hi !== null)) {
+        if (lo !== null && key.time < lo || hi !== null && key.time > hi) continue;
+      }
+      entries.push({
+        ...r,
+        timelineTime: key.time,
+        estimated: key.estimated,
+        exact: Number.isInteger(r.createdAt),
+        orderRank: key.rank
+      });
+    }
+    entries.sort((a, b) => {
+      if (a.orderRank !== b.orderRank) return a.orderRank - b.orderRank;
+      const at = a.timelineTime ?? 0;
+      const bt = b.timelineTime ?? 0;
+      if (at !== bt) return at - bt;
+      const as = blockSeqNum(a.blockId) ?? 0;
+      const bs = blockSeqNum(b.blockId) ?? 0;
+      if (as !== bs) return as - bs;
+      return (a.id ?? 0) - (b.id ?? 0);
+    });
+    const merged = mergeDuplicateRows(entries);
+    const explicit = Number.isInteger(opts.limit) && opts.limit > 0 ? opts.limit : null;
+    const listed = explicit ? merged.slice(-explicit) : merged;
+    return {
+      mode: "timeline",
+      rows: listed,
+      listed: merged.length,
+      total: rows.length,
+      hiddenByLimit: explicit ? Math.max(0, merged.length - listed.length) : 0
+    };
+  }
+  /**
+   * Related-line view: score other blocks against a seed block by structural evidence first
+   * (compression lineage, same run, source neighbor) and lexical overlap second. Deterministic,
+   * offline, and bounded by RELATED_CANDIDATE_LIMIT; each row carries its `reasons`.
+   */
+  related(query, opts = {}) {
+    this.open();
+    const limit = Math.max(
+      1,
+      Math.min(MAX_RESULT_LIMIT, Number.isInteger(opts.limit) ? opts.limit : DEFAULT_RESULT_LIMIT)
+    );
+    let seed = null;
+    const queryTokens = significantTokens(query || "", 60);
+    if (queryTokens.length === 0) {
+      return { mode: "related", rows: [], note: "related needs a query: the search words anchor the relation" };
+    }
+    if (opts.block) {
+      const found = this.findBlocks(String(opts.block), opts.source || null, 1);
+      seed = found[0] || null;
+    } else {
+      const s = this.search(query, { project: opts.project || null, limit: 1 });
+      seed = s.rows[0] || null;
+    }
+    if (!seed) return { mode: "related", rows: [], note: "seed not found" };
+    const seedEvidence = evidenceSentence(seed, queryTokens);
+    if (!seedEvidence) {
+      return { mode: "related", rows: [], note: "the seed has no sentence containing the query words" };
+    }
+    if (seedEvidence.length < RELATED_TEXT_MIN_CHARS) {
+      return { mode: "related", rows: [], note: "seed evidence sentence is too short for a reliable relation" };
+    }
+    const candidates = /* @__PURE__ */ new Map();
+    const baseSql = `SELECT ${BLOCK_ROW_COLUMNS} FROM blocks b JOIN sources s ON s.source_file = b.source_file WHERE b.id != ? AND ${seed.project ? "s.project = ?" : "b.source_file = ?"} ORDER BY b.created_at DESC, b.id DESC LIMIT ?`;
+    try {
+      const baseParams = seed.project ? [seed.id, seed.project, RELATED_CANDIDATE_LIMIT] : [seed.id, seed.sourceFile, RELATED_CANDIDATE_LIMIT];
+      for (const r of this.db.prepare(baseSql).all(...baseParams)) candidates.set(r.id, r);
+    } catch (e) {
+      logLine(`related candidates error: ${withoutPaths(e.message)}`);
+    }
+    const filter = this._buildFilter(queryTokens.slice(0, 6).join(" "), opts.project || null);
+    if (filter) {
+      const sql = `SELECT ${BLOCK_ROW_COLUMNS} ${filter.from} WHERE b.id != ? AND ${filter.where} ORDER BY b.created_at DESC LIMIT ?`;
+      try {
+        for (const r of this.db.prepare(sql).all(seed.id, ...filter.params, RELATED_CANDIDATE_LIMIT))
+          candidates.set(r.id, r);
+      } catch (e) {
+        logLine(`related token error: ${withoutPaths(e.message)}`);
+      }
+    }
+    const withEvidence = [];
+    for (const r of candidates.values()) {
+      const evidence = evidenceSentence(r, queryTokens);
+      if (!evidence || evidence.length < RELATED_TEXT_MIN_CHARS) continue;
+      withEvidence.push({ ...r, evidence });
+    }
+    const df = /* @__PURE__ */ new Map();
+    for (const r of withEvidence) {
+      for (const t of new Set(contentTokens(r.evidence))) df.set(t, (df.get(t) || 0) + 1);
+    }
+    const N = withEvidence.length || 1;
+    const seedTokens = new Set(contentTokens(seedEvidence));
+    const scored = withEvidence.map((r) => {
+      const struct = structuralScore(seed, r);
+      let score = struct.score;
+      const reasons = [...struct.reasons];
+      const shared = [];
+      for (const t of new Set(contentTokens(r.evidence))) {
+        if (!seedTokens.has(t)) continue;
+        const dfT = df.get(t) || 0;
+        if (dfT >= 2 && dfT / N > RELATED_GENERIC_DF) continue;
+        score += Math.log(1 + N / (1 + dfT));
+        shared.push(t);
+      }
+      if (shared.length) reasons.push(`same-sentence:${shared.slice(0, 4).join(",")}`);
+      return { ...r, score, reasons };
+    }).filter((r) => r.score > 0 && r.reasons.some((x) => x !== "project-window")).sort((a, b) => b.score - a.score || (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id - b.id);
+    return {
+      mode: "related",
+      rows: mergeDuplicateRows(scored).slice(0, limit),
+      seed: { blockId: seed.blockId, project: seed.project, sourceFile: seed.sourceFile },
+      seedEvidence
+    };
   }
   stats() {
     this.open();
@@ -1283,13 +1870,13 @@ async function loadOpencodeSessionMap(source, files) {
     }
     const stmt = odb.prepare("SELECT id, directory, path, project_id FROM session WHERE id = ?");
     for (const file of files) {
-      const base = path.basename(file);
+      const base = fileBase(file);
       if (!base.startsWith("ses_") || !base.endsWith(".json")) continue;
       const sessionId = base.slice(0, -5);
       const row = stmt.get(sessionId);
       if (!row) continue;
       const cwd = row.directory || row.path || null;
-      const project = row.directory ? path.basename(row.directory) : row.path ? path.basename(row.path) : typeof row.project_id === "string" ? row.project_id : null;
+      const project = row.directory ? fileBase(row.directory) : row.path ? fileBase(row.path) : typeof row.project_id === "string" ? row.project_id : null;
       if (cwd || project) map.set(file, { cwd: cwd || null, project: project || null });
     }
   } catch (e) {
@@ -1349,6 +1936,14 @@ async function scanSources(force = false) {
 async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) {
   const listing = await listSourceFiles(source);
   let files = listing.files;
+  files = files.filter((f) => !isAuxiliarySourceFile(f));
+  if (cfg.excludePaths.length) {
+    const needles = cfg.excludePaths.map((s) => s.toLowerCase());
+    files = files.filter((f) => {
+      const rel = path.relative(source.root, f).toLowerCase();
+      return !needles.some((n) => rel.includes(n));
+    });
+  }
   if (listing.errors.length) {
     tally.failed += listing.errors.length;
     const first = listing.errors[0];
@@ -1371,7 +1966,7 @@ async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) 
     if (generation !== sessionGeneration) return;
     let meta;
     if (source.adapter === "pi-sidecar") {
-      meta = { kind: "pi", cwd: null, project: null };
+      meta = { kind: "pi", cwd: source.cwd ?? null, project: source.project ?? null };
     } else if (source.adapter === "opencode-acp") {
       const info = opencodeMap?.get(file);
       meta = { kind: "opencode", cwd: info?.cwd ?? null, project: info?.project ?? null };
@@ -1384,7 +1979,7 @@ async function scanOneSource(source, d, force, resolvePiCwd, generation, tally) 
     }
     const r = await d.ingestSourceFile(file, meta, force, source.adapter === "pi-sidecar" ? resolvePiCwd : null);
     if (r.parsed) tally.scanned++;
-    if (!r.ok && r.error && r.error !== "no source file") {
+    if (!r.ok && !r.skipped && r.error && r.error !== "no source file") {
       tally.failed++;
       if (cfg.debug) log(`scan failed ${file}: ${r.error}`);
     }
@@ -1412,9 +2007,302 @@ function fmtTokens(n) {
 }
 function sourceLabel(row) {
   const kind = row.kind === "opencode" || row.kind === "bili" ? row.kind : "pi";
-  let base = path.basename(row.sourceFile || "");
+  let base = fileBase(row.sourceFile);
   if (kind === "pi" && base.endsWith(".acp.json")) base = base.slice(0, -".acp.json".length);
   return `[${kind}] ${base}`;
+}
+function redactOut(text) {
+  return redactSecrets(text).text;
+}
+function duplicateNote(row) {
+  return row && row.alsoFrom && row.alsoFrom.length ? `Also from: ${row.alsoFrom.join(", ")}
+` : "";
+}
+function blockSeqNum(blockId) {
+  const m = /\d+/.exec(String(blockId ?? ""));
+  return m ? parseInt(m[0], 10) : null;
+}
+function parseDirectBlockIds(raw) {
+  if (typeof raw !== "string" || !raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+function significantTokens(text, max = RELATED_MAX_TOKENS, cjkBigrams = false) {
+  const out = /* @__PURE__ */ new Set();
+  const s = String(text || "");
+  for (const m of s.matchAll(/[A-Za-z0-9_]{3,}/g)) {
+    out.add(m[0].toLowerCase());
+    if (out.size >= max) return [...out];
+  }
+  for (const m of s.matchAll(/[\u4e00-\u9fff]{2,}/g)) {
+    const run = m[0];
+    out.add(run);
+    if (cjkBigrams && run.length > 2) {
+      for (let i = 0; i + 2 <= run.length; i++) {
+        out.add(run.slice(i, i + 2));
+        if (out.size >= max) break;
+      }
+    }
+    if (out.size >= max) break;
+  }
+  return [...out];
+}
+function contentTokens(text) {
+  return significantTokens(text, 60, true).filter((t) => !STOPWORDS.has(t.toLowerCase()));
+}
+var STOPWORDS = /* @__PURE__ */ new Set([
+  "a",
+  "an",
+  "the",
+  "and",
+  "or",
+  "but",
+  "if",
+  "then",
+  "else",
+  "for",
+  "of",
+  "to",
+  "in",
+  "on",
+  "at",
+  "by",
+  "with",
+  "from",
+  "as",
+  "is",
+  "are",
+  "was",
+  "were",
+  "be",
+  "been",
+  "being",
+  "do",
+  "does",
+  "did",
+  "not",
+  "no",
+  "yes",
+  "it",
+  "its",
+  "this",
+  "that",
+  "these",
+  "those",
+  "you",
+  "your",
+  "we",
+  "our",
+  "they",
+  "their",
+  "he",
+  "she",
+  "his",
+  "her",
+  "him",
+  "them",
+  "us",
+  "i",
+  "me",
+  "my",
+  "so",
+  "than",
+  "too",
+  "very",
+  "can",
+  "could",
+  "should",
+  "would",
+  "will",
+  "shall",
+  "may",
+  "might",
+  "must",
+  "have",
+  "has",
+  "had",
+  "here",
+  "there",
+  "when",
+  "where",
+  "which",
+  "who",
+  "whom",
+  "what",
+  "how",
+  "why",
+  "all",
+  "any",
+  "each",
+  "some",
+  "such",
+  "into",
+  "over",
+  "under",
+  "again",
+  "more",
+  "most",
+  "other",
+  "new",
+  "via",
+  "etc",
+  "per",
+  "vs",
+  "\u7684",
+  "\u4E86",
+  "\u5728",
+  "\u548C",
+  "\u662F",
+  "\u4E0E",
+  "\u53CA",
+  "\u6216",
+  "\u5BF9",
+  "\u88AB",
+  "\u628A",
+  "\u5C31",
+  "\u90FD",
+  "\u800C",
+  "\u4E5F",
+  "\u8FD8",
+  "\u4E4B",
+  "\u5176",
+  "\u7B49",
+  "\u6211",
+  "\u4F60",
+  "\u4ED6",
+  "\u5979",
+  "\u5B83",
+  "\u4EEC",
+  "\u8FD9",
+  "\u90A3",
+  "\u6709",
+  "\u65E0",
+  "\u4E3A",
+  "\u4EE5",
+  "\u4E8E",
+  "\u4ECE",
+  "\u5230",
+  "\u4F1A",
+  "\u8981",
+  "\u4E0D",
+  "\u6CA1",
+  "\u5F88",
+  "\u66F4",
+  "\u6700",
+  "\u5E76",
+  "\u4E14",
+  "\u4F46",
+  "\u82E5",
+  "\u5219",
+  "\u5373",
+  "\u53EF",
+  "\u80FD",
+  "\u9700",
+  "\u5E94",
+  "\u8BE5",
+  "\u4E0A",
+  "\u4E0B",
+  "\u4E2D",
+  "\u5185",
+  "\u5916",
+  "\u524D",
+  "\u540E",
+  "\u65F6",
+  "\u4E2A",
+  "\u4E9B",
+  "\u79CD"
+]);
+function splitSentences(text) {
+  return String(text || "").split(/[。！？!?.;\n]+/).map((s) => s.trim()).filter(Boolean);
+}
+function evidenceSentence(row, queryTokens) {
+  const sentences = splitSentences(`${row?.topic || ""} ${row?.summary || ""}`);
+  const hits = [];
+  for (const s of sentences) {
+    const capped = s.slice(0, RELATED_TEXT_MAX_CHARS);
+    const low = capped.toLowerCase();
+    if (queryTokens.some((t) => low.includes(t.toLowerCase()))) hits.push(capped);
+  }
+  return hits.join(" ").slice(0, RELATED_TEXT_MAX_CHARS);
+}
+function structuralScore(seed, row) {
+  const reasons = [];
+  let score = 0;
+  const seedDirect = parseDirectBlockIds(seed.directBlockIds);
+  const rowDirect = parseDirectBlockIds(row.directBlockIds);
+  if (seedDirect.includes(String(row.blockId)) || rowDirect.includes(String(seed.blockId))) {
+    score += 5;
+    reasons.push("lineage");
+  }
+  if (seed.runId && row.runId && seed.runId === row.runId) {
+    score += 2;
+    reasons.push("same-run");
+  }
+  if (seed.sourceFile === row.sourceFile) {
+    const a = blockSeqNum(seed.blockId);
+    const b = blockSeqNum(row.blockId);
+    if (a !== null && b !== null && Math.abs(a - b) <= 1) {
+      score += 1.5;
+      reasons.push("neighbor");
+    }
+  }
+  if (seed.project && row.project === seed.project) {
+    score += 0.5;
+    reasons.push("project-window");
+  }
+  return { score, reasons };
+}
+function mergeDuplicateRows(rows) {
+  const groups = /* @__PURE__ */ new Map();
+  const keyOf = (r) => `${r.kind}\0${r.topic || ""}\0${r.summary || ""}`;
+  for (const r of rows) {
+    const key = keyOf(r);
+    const g = groups.get(key);
+    if (g) {
+      g.sourceFiles.add(r.sourceFile);
+      g.rows.push(r);
+    } else {
+      groups.set(key, { sourceFiles: /* @__PURE__ */ new Set([r.sourceFile]), rows: [r] });
+    }
+  }
+  const out = [];
+  for (const r of rows) {
+    const g = groups.get(keyOf(r));
+    if (g.sourceFiles.size > 1) {
+      if (g.rows[0] !== r) continue;
+      const others = [...new Set(g.rows.filter((x) => x.sourceFile !== r.sourceFile).map((x) => sourceLabel(x)))];
+      out.push({ ...r, duplicateCount: others.length, alsoFrom: others.slice(0, 8) });
+    } else {
+      out.push(r);
+    }
+  }
+  return out;
+}
+function timelineKey(row, anchorsBySource) {
+  if (Number.isInteger(row.createdAt)) return { time: row.createdAt, rank: 0, estimated: false };
+  const seq = blockSeqNum(row.blockId);
+  const anchors = (anchorsBySource.get(row.sourceFile) || []).filter((a2) => a2.seq !== null);
+  if (seq === null || anchors.length === 0) return { time: null, rank: seq === null ? 2 : 1, estimated: true };
+  let prev = null;
+  let next = null;
+  for (const a2 of anchors) {
+    if (a2.seq <= seq && (!prev || a2.seq > prev.seq)) prev = a2;
+    if (a2.seq >= seq && (!next || a2.seq < next.seq)) next = a2;
+  }
+  if (prev && next && next.seq !== prev.seq) {
+    return {
+      time: prev.createdAt + (seq - prev.seq) / (next.seq - prev.seq) * (next.createdAt - prev.createdAt),
+      rank: 0,
+      estimated: true
+    };
+  }
+  const a = prev || next;
+  if (a) return { time: a.createdAt + (prev ? seq - a.seq : a.seq - seq), rank: 0, estimated: true };
+  return { time: null, rank: 1, estimated: true };
 }
 function formatResults(res) {
   const rows = res.rows;
@@ -1428,16 +2316,83 @@ function formatResults(res) {
     const project = r.project || "?";
     const tm = fmtTs(r.createdAt);
     const refs = r.refStart ? ` [${r.refStart}${r.refEnd && r.refEnd !== r.refStart ? "\u2013" + r.refEnd : ""}]` : "";
-    const topic = r.topic ? `Topic: ${r.topic}
+    const topic = r.topic ? `Topic: ${redactOut(r.topic)}
 ` : "";
     let summary = r.summary || "";
     if (summary.length > PREVIEW_CHARS) summary = summary.slice(0, PREVIEW_CHARS) + "\u2026";
-    summary = summary.replace(/\n{3,}/g, "\n\n").trim();
+    summary = redactOut(summary.replace(/\n{3,}/g, "\n\n").trim());
     return `[${i + 1}] project ${project} \xB7 ${tm || "time unknown"} \xB7 ${r.blockId || ""} \xB7 tier${r.tier ?? "?"} \xB7 ${fmtTokens(r.tokens) || "?"} tokens compressed${refs}
 Source: ${sourceLabel(r)}
-${topic}${summary}`;
+${duplicateNote(r)}${topic}${summary}`;
   });
   return head + parts.join("\n\n---\n\n");
+}
+function formatTimeline(res) {
+  const rows = res.rows || [];
+  if (res.note) return `No timeline: ${res.note}.`;
+  if (!rows.length) {
+    return "No timeline entries. Try: 1) a broader query; 2) another project; 3) a wider time window (from/to or windowMinutes).";
+  }
+  const oneLine = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const line = (r, time) => `${time} \xB7 ${r.project || "?"} \xB7 ${r.blockId || "?"} \xB7 tier${r.tier ?? "?"} \xB7 ${redactOut(oneLine(r.topic)) || "(no topic)"}${r.duplicateCount ? ` (+${r.duplicateCount})` : ""}`;
+  const lines = [];
+  const scope = res.listed && res.listed > rows.length ? `${rows.length} of ${res.listed}` : `${rows.length}`;
+  lines.push(`Memory timeline (${scope} entr${rows.length === 1 ? "y" : "ies"}):`);
+  let currentDate = "";
+  for (const r of rows) {
+    if (r.orderRank >= 1) continue;
+    const date = Number.isInteger(r.timelineTime) ? new Date(r.timelineTime).toISOString().slice(0, 10) : "(no date)";
+    if (date !== currentDate) {
+      lines.push(`## ${date}`);
+      currentDate = date;
+    }
+    const time = r.exact && Number.isInteger(r.timelineTime) ? new Date(r.timelineTime).toISOString().slice(11, 16) : "--:--";
+    lines.push(line(r, time));
+  }
+  const unplaced = rows.filter((r) => r.orderRank >= 1);
+  if (unplaced.length) {
+    lines.push("## unplaced (no exact time and no order)");
+    for (const r of unplaced) lines.push(line(r, "--:--"));
+  }
+  if (rows.length > 300) {
+    lines.push("");
+    lines.push(
+      `(${rows.length} entries listed in full; narrow with project/from/to to reduce the size \u2014 entries are never truncated)`
+    );
+  }
+  if (res.hiddenByLimit > 0) {
+    lines.push(`(an explicit limit hid ${res.hiddenByLimit} entries; drop the limit for the full catalog)`);
+  }
+  return lines.join("\n");
+}
+function formatRelated(res) {
+  const rows = res.rows || [];
+  if (res.note) return `No related blocks: ${res.note}.`;
+  if (!rows.length) return "No related blocks found for that seed.";
+  const seed = res.seed ? ` (seed ${res.seed.blockId}${res.seed.project ? ` in ${res.seed.project}` : ""})` : "";
+  const parts = rows.map((r, i) => {
+    const time = fmtTs(r.createdAt) || "time missing";
+    const evidence = redactOut(
+      String(r.evidence || "").replace(/\n{2,}/g, "\n").trim()
+    );
+    return `[${i + 1}] score ${(r.score ?? 0).toFixed(2)} \xB7 ${time} \xB7 project ${r.project || "?"} \xB7 ${r.blockId || ""} \xB7 tier${r.tier ?? "?"}
+Why: ${(r.reasons || []).join(", ") || "related"}
+Source: ${sourceLabel(r)}
+${duplicateNote(r)}Topic: ${redactOut(r.topic || "(no topic)")}
+Evidence: ${evidence}`;
+  });
+  return `Related blocks${seed}: ${rows.length}:
+` + parts.join("\n\n---\n\n");
+}
+function formatBlockDetail(row) {
+  const lines = [
+    `Block ${row.blockId}${row.tier != null ? ` (tier ${row.tier})` : ""} \xB7 project ${row.project || "unknown"}${row.createdAt ? ` \xB7 ${fmtTs(row.createdAt)}` : " \xB7 time unknown"} \xB7 ${fmtTokens(row.tokens) || "?"} tok compressed`,
+    `Source: ${sourceLabel(row)}`
+  ];
+  if (row.topic) lines.push(`Topic: ${redactOut(row.topic)}`);
+  lines.push("");
+  lines.push(redactOut(row.summary || "(no stored summary)"));
+  return lines.join("\n");
 }
 function formatExpansion(row, sessionFile, res, mode) {
   const lines = [
@@ -1445,7 +2400,7 @@ function formatExpansion(row, sessionFile, res, mode) {
     `Source: ${sourceLabel(row)}`,
     // Basename only: the absolute path carries the OS user name and the encoded project directory,
     // and expansion never needs it (the `source` filter takes the session file name or project).
-    `Session: ${path.basename(sessionFile)}`
+    `Session: ${fileBase(sessionFile)}`
   ];
   const kb = (n) => `${Math.round(n / 1024)} KB`;
   lines.push(
@@ -1494,10 +2449,43 @@ var MEMORY_SEARCH_PARAMETERS = {
     },
     limit: {
       type: "number",
-      description: "Max number of results, default 6, max 20"
+      description: "Max number of results, default 6, max 20 (timeline: max 50)"
+    },
+    mode: {
+      type: "string",
+      enum: ["blocks", "timeline", "related"],
+      description: "'blocks' (default) relevance search; 'timeline' returns the complete memory catalog (one line per memory, date-grouped, never truncated); 'related' finds blocks whose sentence containing the query words is related to the seed"
+    },
+    block: {
+      type: "string",
+      description: "Anchor block id for mode 'timeline' or 'related', e.g. 'b2' (from a previous result)"
+    },
+    source: {
+      type: "string",
+      description: "Disambiguate an anchor block id that exists in several sources (substring of the Source label)"
+    },
+    from: { type: "number", description: "Timeline window start as epoch milliseconds" },
+    to: { type: "number", description: "Timeline window end as epoch milliseconds" },
+    windowMinutes: {
+      type: "number",
+      description: "Timeline window around the anchor block, in minutes (requires 'block')"
+    },
+    reasons: { type: "boolean", description: "Include relation reason labels for mode 'related' (always on for now)" }
+  }
+};
+var MEMORY_GET_PARAMETERS = {
+  type: "object",
+  properties: {
+    block: {
+      type: "string",
+      description: "Block id from a memory_search or timeline line, e.g. 'b2'"
+    },
+    source: {
+      type: "string",
+      description: "Optional disambiguator when the same block id exists in several sources (substring of the 'Source:' label or the project)"
     }
   },
-  required: ["query"]
+  required: ["block"]
 };
 var MEMORY_EXPAND_PARAMETERS = {
   type: "object",
@@ -1537,10 +2525,25 @@ function readMemoryExpandParams(raw) {
 }
 function readMemorySearchParams(raw) {
   const value = raw && typeof raw === "object" ? raw : {};
-  const query = typeof value.query === "string" ? value.query : "";
-  const project = typeof value.project === "string" && value.project.trim().length > 0 ? value.project.trim() : null;
+  const query = typeof value.query === "string" ? value.query.slice(0, MAX_QUERY_CHARS) : "";
+  const project = typeof value.project === "string" && value.project.trim().length > 0 ? value.project.trim().slice(0, MAX_PROJECT_LABEL) : null;
   const limit = typeof value.limit === "number" && Number.isInteger(value.limit) ? value.limit : DEFAULT_RESULT_LIMIT;
-  return { query, project, limit };
+  const mode = value.mode === "timeline" ? "timeline" : value.mode === "related" ? "related" : "blocks";
+  const block = typeof value.block === "string" && value.block.trim() ? value.block.trim().slice(0, MAX_ID_FIELD) : null;
+  const source = typeof value.source === "string" && value.source.trim() ? value.source.trim().slice(0, MAX_SOURCE_FIELD) : null;
+  const int = (v) => typeof v === "number" && Number.isInteger(v) ? v : null;
+  return {
+    query,
+    project,
+    limit,
+    mode,
+    block,
+    source,
+    from: int(value.from),
+    to: int(value.to),
+    windowMinutes: int(value.windowMinutes),
+    reasons: value.reasons !== false
+  };
 }
 async function factory(pi) {
   await loadSqlite();
@@ -1552,7 +2555,7 @@ async function factory(pi) {
     logLine(
       cfg.debug ? `session_start file=${sessionFile || "(ephemeral)"} cwd=${ctx.cwd ?? ""}` : (
         // Logs are what users paste into issues: without debug, keep names, not full paths.
-        `session_start file=${sessionFile ? path.basename(sessionFile) : "(ephemeral)"} cwd=${ctx.cwd ? path.basename(ctx.cwd) : ""}`
+        `session_start file=${sessionFile ? fileBase(sessionFile) : "(ephemeral)"} cwd=${ctx.cwd ? fileBase(ctx.cwd) : ""}`
       )
     );
     if (!cfg.scanOnStartup) {
@@ -1569,7 +2572,7 @@ async function factory(pi) {
       await scanCurrentSession(sessionFile, true, ctx.cwd);
       if (generation !== sessionGeneration) return;
       const st = getDb().stats();
-      logLine(`db ready: ${path.basename(st.dbPath)} sources=${st.sources} blocks=${st.blocks}`);
+      logLine(`db ready: ${fileBase(st.dbPath)} sources=${st.sources} blocks=${st.blocks}`);
     }).catch((e) => logLine(`session_start scan error: ${withoutPaths(e.stack || e.message)}`));
     backgroundScan = run;
     void run.finally(() => {
@@ -1616,22 +2619,57 @@ async function factory(pi) {
   pi.registerTool({
     name: "memory_search",
     label: "Memory Search",
-    description: "Search pi's long-term memory store: block summaries produced by ACP compression from allow-listed sources (pi billion-context-pi sidecars, opencode-acp state files, and billion-context sessions) across all allowed projects. Use when the user asks about past work, conclusions, decisions, technical pitfalls, code locations, project context, or content compressed earlier in this session. Query with Chinese or English keywords / phrases; results are relevance-ranked and annotated with source kind, project, file, block and time.",
+    description: "Search pi's long-term memory store: block summaries produced by ACP compression from allow-listed sources (pi billion-context-pi sidecars, opencode-acp state files, and billion-context sessions) across all allowed projects. Modes: 'blocks' (default) relevance search; 'timeline' orders the same matches by time and order (missing times stay blank, unplaceable blocks are reported separately); 'related' finds blocks related to an anchor block or query hit (compression lineage, same run, neighbors, shared terms). Use when the user asks about past work, conclusions, decisions, technical pitfalls, code locations, project context, or content compressed earlier in this session. Query with Chinese or English keywords / phrases; results are relevance-ranked and annotated with source kind, project, file, block and time.",
     promptSnippet: "Search pi's accumulated memory of past sessions (ACP compression summaries across allowed sources)",
     promptGuidelines: [
       "Use memory_search when the user asks about past work, conclusions, decisions, or context from earlier sessions or from earlier in this session after compression.",
-      "For Chinese queries shorter than 3 characters, memory_search falls back to substring matching automatically \u2014 still pass the query as-is."
+      "For Chinese queries shorter than 3 characters, memory_search falls back to substring matching automatically \u2014 still pass the query as-is.",
+      "Use mode 'timeline' for a chronological catalog of matches (one line per memory, full, never truncated); follow a line with memory_get to read that block's stored summary.",
+      "Use mode 'related' with a query (the search words) to find blocks whose sentence containing those words is related; pass 'block' to anchor on a specific block."
     ],
     parameters: paramsSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       try {
         await scanSources();
-        const { query, project, limit } = readMemorySearchParams(params);
-        const res = getDb().search(query, { project, limit });
+        const p = readMemorySearchParams(params);
+        const db2 = getDb();
+        if (p.mode === "timeline") {
+          const res2 = db2.timeline(p.query, {
+            project: p.project,
+            limit: p.limit,
+            block: p.block,
+            source: p.source,
+            from: p.from,
+            to: p.to,
+            windowMinutes: p.windowMinutes
+          });
+          return {
+            content: [{ type: "text", text: formatTimeline(res2) }],
+            details: {
+              mode: "timeline",
+              hits: res2.rows.length,
+              unknown: res2.unknown,
+              dbPath: fileBase(cfg.dbPath)
+            }
+          };
+        }
+        if (p.mode === "related") {
+          const res2 = db2.related(p.query, {
+            project: p.project,
+            limit: p.limit,
+            block: p.block,
+            source: p.source
+          });
+          return {
+            content: [{ type: "text", text: formatRelated(res2) }],
+            details: { mode: "related", hits: res2.rows.length, dbPath: fileBase(cfg.dbPath) }
+          };
+        }
+        const res = db2.search(p.query, { project: p.project, limit: p.limit });
         const text = formatResults(res);
         return {
           content: [{ type: "text", text }],
-          details: { mode: res.mode, hits: res.rows.length, dbPath: path.basename(cfg.dbPath) }
+          details: { mode: res.mode, hits: res.rows.length, dbPath: fileBase(cfg.dbPath) }
         };
       } catch (e) {
         logLine(`memory_search error: ${withoutPaths(e.stack || e.message)}`);
@@ -1642,7 +2680,63 @@ async function factory(pi) {
               text: `memory_search failed: ${withoutPaths(e.message) || "unknown error"} (the extension log has the full trace)`
             }
           ],
-          details: { mode: "error", hits: 0, dbPath: path.basename(cfg.dbPath) }
+          details: { mode: "error", hits: 0, dbPath: fileBase(cfg.dbPath) }
+        };
+      }
+    }
+  });
+  pi.registerTool({
+    name: "memory_get",
+    label: "Memory Get",
+    description: "Open one memory line from a memory_search or timeline result and read its stored summary by block id. Read-only and always available: it returns the already-redacted stored topic+summary, never raw session messages (use the opt-in memory_expand for originals).",
+    promptSnippet: "Open one memory line (block id) and read its stored summary",
+    promptGuidelines: [
+      "After a timeline/catalog line, call memory_get with its block id to read the stored summary; pass 'source' when the id exists in several sources."
+    ],
+    parameters: MEMORY_GET_PARAMETERS,
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      try {
+        const value = params && typeof params === "object" ? params : {};
+        const block = typeof value.block === "string" ? value.block.trim() : "";
+        const source = typeof value.source === "string" && value.source.trim() ? value.source.trim() : null;
+        if (!block) {
+          return {
+            content: [{ type: "text", text: "memory_get: 'block' is required." }],
+            details: { mode: "error", hits: 0 }
+          };
+        }
+        const res = getDb().getBlock(block, source);
+        if (!res.found) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `memory_get: no stored block '${block}'${source ? ` matching '${source}'` : ""}.`
+              }
+            ],
+            details: { mode: "missing", hits: 0 }
+          };
+        }
+        if (res.total > 1) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `memory_get: ${res.total} blocks share the id '${block}'. Pass 'source' to pick one. Newest: ${formatBlockDetail(res.row)}`
+              }
+            ],
+            details: { mode: "ambiguous", hits: res.total }
+          };
+        }
+        return {
+          content: [{ type: "text", text: formatBlockDetail(res.row) }],
+          details: { mode: "block", hits: 1, dbPath: fileBase(cfg.dbPath) }
+        };
+      } catch (e) {
+        logLine(`memory_get error: ${withoutPaths(e.stack || e.message)}`);
+        return {
+          content: [{ type: "text", text: `memory_get failed: ${withoutPaths(e.message) || "unknown error"}` }],
+          details: { mode: "error", hits: 0 }
         };
       }
     }
@@ -1684,7 +2778,7 @@ async function factory(pi) {
           }
           if (rows.length > 1) {
             const list = rows.map(
-              (r) => `- ${r.blockId} \xB7 project ${r.project || "?"} \xB7 ${fmtTs(r.createdAt) || "time unknown"} \xB7 ${path.basename(r.sourceFile)}`
+              (r) => `- ${r.blockId} \xB7 project ${r.project || "?"} \xB7 ${fmtTs(r.createdAt) || "time unknown"} \xB7 ${fileBase(r.sourceFile)}`
             ).join("\n");
             return {
               content: [
@@ -1698,6 +2792,33 @@ ${list}`
             };
           }
           const row = rows[0];
+          if (row.kind === "bili") {
+            const res2 = await expandStoredBlock({
+              file: row.sourceFile,
+              blockId: row.blockId,
+              mode: p.mode,
+              select: p.select,
+              maxChars: Math.min(cfg.expandMaxChars, p.chars ?? cfg.expandMaxChars),
+              maxMessages: Math.min(cfg.expandMaxMessages, p.limit ?? cfg.expandMaxMessages),
+              maxReadBytes: cfg.expandMaxReadBytes,
+              redact: redactSecrets
+            });
+            log(
+              `expand ${row.blockId} stored mode=${p.mode} entries=${res2.entries.length} returned=${res2.returnedChars}`
+            );
+            return {
+              content: [{ type: "text", text: formatExpansion(row, row.sourceFile, res2, p.mode) }],
+              details: {
+                mode: p.mode,
+                block: row.blockId,
+                entries: res2.entries.length,
+                found: res2.entries.filter((e) => e.found).length,
+                chars: res2.returnedChars,
+                truncated: res2.truncated,
+                source: "block-contents"
+              }
+            };
+          }
           if (!String(row.sourceFile).endsWith(".acp.json")) {
             return {
               content: [

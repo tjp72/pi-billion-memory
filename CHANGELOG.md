@@ -7,12 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Model-facing output (`memory_search` results, `related` evidence, `memory_get`, and the timeline
+  topic) is re-passed through the secret filter as defense-in-depth, so a row ingested before the
+  current filter cannot surface a value that would be redacted today. Stored rows are not rewritten
+  (delete `*.db*` and rescan to scrub durably).
+- Hardening for untrusted input: upstream metadata (project label, `producer`,
+  `compress_call_id`, lineage ids) is length-capped and `generation` accepts only `young`/`old`;
+  the query is length/token capped; the full timeline catalog refuses (with a hint) above 20000
+  rows instead of silently truncating or exhausting memory.
+
+## [0.6.0] - 2026-10-18
+
 ### Added
 
 - `bili-session` adapter: indexes billion-context proxy session files
   (`<host>_<hash>.json`, blocks under `payload.state.blocks`, e.g. WorkBuddy/codebuddy sessions).
-  The project name is the file's `<host>` segment; bili blocks are stored as not expandable, like
-  opencode state files.
+  The project name is the file's `<host>` segment, or the envelope's own `upstreamOrigin`/`protocol`
+  when present; bili blocks are stored as not expandable, like opencode state files.
+- Upstream lifecycle/lineage metadata is now stored when the source provides it: `active`,
+  `direct_block_ids` (compression lineage), `duration_ms`, `generation`, `survived_count`, and
+  `compress_call_id`; `sources` also records `format_version`/`producer`. A force rescan refreshes
+  these fields in place without touching stored summaries.
+- `memory_search` gains a `mode`: `timeline` returns the complete memory catalog (one line per
+  memory — time, project, block id, tier, topic — date-grouped, never truncated, unplaced rows
+  included), and `related` compares the sentence containing the query words in each block (with
+  conservative stopwords and a data-driven IDF gate against generic-token noise) and shows that
+  evidence sentence. The default `blocks` behavior is unchanged. A new read-only `memory_get` tool
+  opens a catalog/search line and returns the stored, already-redacted summary (never raw messages).
+- Optional expansion (`expandEnabled`) now also works for billion-context sessions: `memory_expand`
+  reads the envelope's own `payload.blockContents` (full/one manifest) instead of the host session
+  log. It stays two-step, bounded, redacted and read-only.
+- Identical memories copied across source files (fork/copy artifacts) merge into a single result
+  that lists the alternate sources; blocks from the same source are never collapsed, so multi-tier
+  parent/child pairs survive.
+- `related` compares a bounded text window (minimum 20, maximum 800 characters) at sentence level,
+  drops candidates with no query-word sentence or no evidence, and never deletes content words;
+  generic tokens are demoted by the IDF gate. A new `excludePaths` config skips test/temp source
+  paths across every adapter.
 
 ### Changed
 
@@ -21,6 +54,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Upgraded the pi compatibility test target from `@earendil-works/pi-coding-agent` 0.85.1 to
   1.3.0; the extension continues to use only public extension APIs. This also picks up `undici`
   8.10.2 and its security fixes.
+- Adapters now honor upstream format versions: billion-context-pi sidecars carry `schemaVersion`
+  (missing = v1) and billion-context session envelopes carry `version` (1-3). An unknown **newer**
+  version is skipped and logged once, never rewritten, and never advances the watermark.
+- Auxiliary store files that live next to session files (`.content-store.json`, `*.fb.json`,
+  SQLite files) are skipped without being read, so a broad allow-list glob cannot turn them into
+  repeating failed sources.
+- Block expansion now reads the session only until the referenced messages are found and falls
+  back to a tail window when the references sit near the end of a long file; the byte budget is
+  unchanged. `pi-sidecar` allow-list entries also accept optional `project`/`cwd` hints that skip
+  the lazy session-header read.
 
 ## [0.5.2] - 2026-09-10
 

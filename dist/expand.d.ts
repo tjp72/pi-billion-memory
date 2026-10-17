@@ -116,3 +116,22 @@ export interface ExpandOptions {
     /** Test seam for the file read. */
     readFile?: (file: string, maxBytes: number) => Promise<ReadResult>;
 }
+/** Options for reading a billion-context block's own original text. */
+export interface StoredBlockOptions {
+    /** billion-context session envelope file (holds `payload.blockContents`). */
+    file: string;
+    /** Block id as stored (`b1`, `b2`, ...). */
+    blockId: string;
+    mode: "list" | "full";
+    select?: number[] | null;
+    maxChars: number;
+    maxMessages: number;
+    maxReadBytes: number;
+    /** Injected redaction filter applied to rendered text before it is returned. */
+    redact?: (text: string) => {
+        text: string;
+        hits: number;
+    };
+    /** Test seam for the file read. */
+    readFile?: (file: string, maxBytes: number) => Promise<ReadResult>;
+}

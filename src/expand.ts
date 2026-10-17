@@ -229,20 +229,120 @@ export async function readCapped(file: string, maxBytes: number): Promise<ReadRe
 }
 
 /**
+ * Read only until every wanted message id has been seen, then stop. Falls back to a tail window
+ * when the wanted ids live near the end of a long file, so expand never reads the whole session
+ * just to resolve a few references. The total bytes read stay within `maxBytes` (head + tail share
+ * the budget).
+ */
+async function readSelectedMessages(file: string, maxBytes: number, wanted: Set<string>): Promise<SessionRead> {
+  const { promises: fsp } = await import("node:fs");
+  const messages = new Map<string, any>();
+  const cap = Math.max(0, Math.floor(maxBytes));
+  const found = new Set<string>();
+  const CHUNK = 1024 * 1024;
+  let handle;
+  try {
+    handle = await fsp.open(file, "r");
+  } catch (e) {
+    if (e && ["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EISDIR"].includes(e.code)) {
+      return { messages, bytesRead: 0, totalBytes: 0, truncated: false, missing: true };
+    }
+    throw e;
+  }
+  try {
+    const { size } = await handle.stat();
+    let pos = 0;
+    let bytesRead = 0;
+    let leftover = "";
+    const ingestLine = (rawLine: string) => {
+      const raw = rawLine.trim();
+      if (!raw) return;
+      let line: any;
+      try {
+        line = JSON.parse(raw);
+      } catch {
+        return; // tolerate a partially written or non-JSON line
+      }
+      if (!line || typeof line !== "object") return;
+      if (line.type !== "message" && line.type !== "custom_message") return;
+      if (typeof line.id !== "string" || !line.id) return;
+      messages.set(line.id, line);
+      if (wanted.has(line.id)) found.add(line.id);
+    };
+    const consume = (chunk: string) => {
+      leftover += chunk;
+      let at = leftover.indexOf("\n");
+      while (at >= 0) {
+        ingestLine(leftover.slice(0, at));
+        leftover = leftover.slice(at + 1);
+        at = leftover.indexOf("\n");
+      }
+    };
+    // Head pass: stop the moment every wanted id is indexed. When the file is larger than the
+    // budget, only half is spent on the head so a tail window still fits (references often come
+    // from the newest part of a long session).
+    const headLimit = size > cap ? Math.max(1, Math.floor(cap / 2)) : cap;
+    while (pos < size && bytesRead < headLimit && found.size < wanted.size) {
+      const want = Math.min(CHUNK, headLimit - bytesRead, size - pos);
+      const buffer = Buffer.allocUnsafe(want);
+      const { bytesRead: n } = await handle.read(buffer, 0, want, pos);
+      if (n <= 0) break;
+      pos += n;
+      bytesRead += n;
+      consume(buffer.subarray(0, n).toString("utf8"));
+    }
+    // Tail pass: the remaining ids may sit near the end of a file whose head is bigger than the
+    // budget. Read the last window we can still afford instead of the skipped middle.
+    if (found.size < wanted.size && pos < size && bytesRead < cap) {
+      const tailLen = Math.min(cap - bytesRead, size - pos);
+      const tailStart = size - tailLen;
+      const buffer = Buffer.allocUnsafe(tailLen);
+      const { bytesRead: n } = await handle.read(buffer, 0, tailLen, tailStart);
+      if (n > 0) {
+        bytesRead += n;
+        pos += n;
+        let text = buffer.subarray(0, n).toString("utf8");
+        // Drop the leading fragment unless the tail starts at a line boundary.
+        const nl = text.indexOf("\n");
+        if (tailStart > 0 && nl >= 0) text = text.slice(nl + 1);
+        consume(text);
+      }
+    }
+    // Complete-line semantics: an unread trailing fragment may simply be a missing entry, not a
+    // truncation. Report truncation only when there is unread data and some wanted id is unresolved.
+    const { size: after } = await handle.stat();
+    const truncated = found.size < wanted.size && (bytesRead >= cap || pos < after);
+    return { messages, bytesRead, totalBytes: after, truncated, missing: false };
+  } finally {
+    try {
+      await handle.close();
+    } catch {
+      // Never let a close failure mask the real read error.
+    }
+  }
+}
+
+/**
  * Read a session `.jsonl` up to `maxReadBytes` and index its message entries by id.
  *
  * The read is physically byte-capped (see {@link readCapped}): expansion must not become a way to
  * stream a whole session file into memory. When the cap cuts the file mid-line the trailing
  * fragment is dropped, so a truncated read can only lose messages, never corrupt them. A session
  * file that has been deleted, rotated, renamed, or cannot be opened is not an error: every
- * reference in it is reported as missing instead of failing the call.
+ * reference in it is reported as missing instead of failing the call. When `wantedIds` is given
+ * (and no test `readFile` seam is used) the reader stops as soon as those ids are found.
  * @internal
  */
 export async function readSessionMessages(
   sessionFile: string,
   maxReadBytes: number,
   readFile: (file: string, maxBytes: number) => Promise<ReadResult> = readCapped,
+  wantedIds: Set<string> | null = null,
 ): Promise<SessionRead> {
+  const wanted = wantedIds instanceof Set ? wantedIds : new Set<string>(wantedIds || []);
+  if (readFile === readCapped && wanted.size > 0) {
+    return readSelectedMessages(sessionFile, maxReadBytes, wanted);
+  }
   const messages = new Map<string, any>();
   const cap = Math.max(0, Math.floor(maxReadBytes));
   let read: ReadResult;
@@ -366,7 +466,12 @@ export async function expandBlock(opts: ExpandOptions): Promise<ExpandResult> {
   if (opts.mode === "full" && select.length === 0) {
     throw new Error('mode "full" requires a non-empty select (run mode "list" first and pick indices)');
   }
-  const read = await readSessionMessages(opts.sessionFile, opts.maxReadBytes, opts.readFile);
+  const wantedBase = new Set<string>();
+  for (const ref of opts.msgIds) {
+    const { base } = splitMessageId(ref);
+    if (base && !isSyntheticRef(base)) wantedBase.add(base);
+  }
+  const read = await readSessionMessages(opts.sessionFile, opts.maxReadBytes, opts.readFile, wantedBase);
   const entries: ExpandEntry[] = [];
   const renderedByIndex = new Map<number, RenderedMessage>();
 
@@ -473,5 +578,158 @@ export async function expandBlock(opts: ExpandOptions): Promise<ExpandResult> {
   // Truncated means "something the caller asked for is not in the text": a budget cap or dropped
   // entries. A trimmed entry must not clear an earlier cap flag, so this is only ever set.
   base.truncated = capTrimmed || skipped > 0 || returned < requestedCount;
+  return base;
+}
+
+/** Options for reading a billion-context block's own original text. */
+export interface StoredBlockOptions {
+  /** billion-context session envelope file (holds `payload.blockContents`). */
+  file: string;
+  /** Block id as stored (`b1`, `b2`, ...). */
+  blockId: string;
+  mode: "list" | "full";
+  select?: number[] | null;
+  maxChars: number;
+  maxMessages: number;
+  maxReadBytes: number;
+  /** Injected redaction filter applied to rendered text before it is returned. */
+  redact?: (text: string) => { text: string; hits: number };
+  /** Test seam for the file read. */
+  readFile?: (file: string, maxBytes: number) => Promise<ReadResult>;
+}
+
+function blockView(v: unknown): { text: string; count: number } | null {
+  if (!v || typeof v !== "object") return null;
+  const view = v as Record<string, unknown>;
+  if (typeof view.text !== "string") return null;
+  return { text: view.text, count: Number.isInteger(view.count) ? (view.count as number) : 1 };
+}
+
+/**
+ * Recovery source for billion-context sessions: their own `payload.blockContents` keeps the
+ * original text of each compressed block, independent of the host's session log. Opt-in like
+ * every expansion: read-only, two-step, bounded, redacted by the caller, and never a search path.
+ * @internal
+ */
+export async function expandStoredBlock(opts: StoredBlockOptions): Promise<ExpandResult> {
+  const cap = Math.max(0, Math.floor(opts.maxReadBytes));
+  const empty = (missing: boolean): ExpandResult => ({
+    entries: [],
+    text: null,
+    truncated: false,
+    availableChars: 0,
+    returnedChars: 0,
+    skippedMessages: 0,
+    readTruncated: false,
+    bytesRead: 0,
+    totalBytes: 0,
+    sessionMissing: missing,
+  });
+  let read: ReadResult;
+  try {
+    read = await (opts.readFile ?? readCapped)(opts.file, cap);
+  } catch (e) {
+    if (e && ["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EISDIR"].includes(e.code)) return empty(true);
+    throw e;
+  }
+  const readTruncated = read.buffer.length < read.totalBytes;
+  let data: any = null;
+  try {
+    data = JSON.parse(read.buffer.toString("utf8"));
+  } catch {
+    // A capped read can cut a large envelope mid-JSON; report it as unreadable within the budget.
+  }
+  const content = data?.payload?.blockContents?.[opts.blockId];
+  const full = blockView(content?.full);
+  const one = blockView(content?.one);
+  const entries: ExpandEntry[] = [];
+  const bodies = new Map<number, string>();
+  let index = 0;
+  const push = (label: string, view: { text: string; count: number } | null) => {
+    index++;
+    if (view) {
+      entries.push({
+        index,
+        ref: label,
+        messageId: label,
+        callId: null,
+        role: "block",
+        chars: view.text.length,
+        found: true,
+      });
+      bodies.set(index, view.text);
+    } else {
+      entries.push({ index, ref: label, messageId: label, callId: null, role: null, chars: 0, found: false });
+    }
+  };
+  push("full", full);
+  if (one) push("one", one);
+  const availableChars = entries.reduce((n, e) => n + e.chars, 0);
+  const base: ExpandResult = {
+    entries,
+    text: null,
+    truncated: false,
+    availableChars,
+    returnedChars: 0,
+    skippedMessages: 0,
+    readTruncated,
+    bytesRead: read.buffer.length,
+    totalBytes: read.totalBytes,
+    sessionMissing: false,
+  };
+  if (opts.mode === "list") return base;
+  const select = Array.isArray(opts.select) ? opts.select.filter((n) => Number.isInteger(n) && n > 0) : [];
+  if (select.length === 0) {
+    throw new Error('mode "full" requires a non-empty select (run mode "list" first and pick indices)');
+  }
+  const wanted = new Set(select);
+  const maxChars = Math.max(0, Math.floor(opts.maxChars));
+  const maxMessages = Math.max(1, Math.floor(opts.maxMessages));
+  const chunks: string[] = [];
+  let used = 0;
+  let returned = 0;
+  let skipped = 0;
+  let capTrimmed = false;
+  for (const entry of entries) {
+    if (!wanted.has(entry.index)) continue;
+    if (!entry.found) {
+      skipped++;
+      continue;
+    }
+    if (returned >= maxMessages) {
+      skipped++;
+      continue;
+    }
+    let body = bodies.get(entry.index) ?? "";
+    if (opts.redact) body = opts.redact(body).text;
+    const header = `### [${entry.index}] block ${entry.ref} · ${body.length} chars\n`;
+    const sep = chunks.length ? 2 : 0;
+    const room = maxChars - used - sep;
+    if (room <= 0) {
+      skipped++;
+      continue;
+    }
+    if (header.length + body.length <= room) {
+      chunks.push(`${header}${body}`);
+      used += sep + header.length + body.length;
+      returned++;
+      continue;
+    }
+    const marker = `\n[entry truncated at ${maxChars} chars]`;
+    const bodyRoom = room - header.length - marker.length;
+    if (bodyRoom > 0) {
+      chunks.push(`${header}${body.slice(0, bodyRoom)}${marker}`);
+      used += sep + header.length + bodyRoom + marker.length;
+    } else {
+      chunks.push(body.slice(0, room));
+      used += sep + room;
+    }
+    returned++;
+    capTrimmed = true;
+  }
+  base.text = chunks.join("\n\n");
+  base.returnedChars = base.text.length;
+  base.skippedMessages = skipped;
+  base.truncated = capTrimmed || skipped > 0;
   return base;
 }

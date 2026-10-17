@@ -42,6 +42,7 @@ try {
     "on:agent_settled",
     "on:session_shutdown",
     "tool:memory_search",
+    "tool:memory_get",
     "command:memory",
   ];
   assert.deepEqual(registrations, expected, `unexpected registrations: ${registrations.join(", ")}`);
