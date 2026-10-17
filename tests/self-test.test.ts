@@ -495,6 +495,83 @@ check(
   (await internals.scanSources(false)).failed === 0,
 );
 
+// --- billion-context envelope v1/v2 metadata + lifecycle/lineage fields -----------
+const bcV2 = path.join(biliRoot, "example.test_v2.json");
+fs.writeFileSync(
+  bcV2,
+  JSON.stringify({
+    version: 2,
+    id: "pfa-v2",
+    payload: {
+      meta: { protocol: "openai", upstreamOrigin: "zhipu" },
+      state: {
+        blocks: [
+          {
+            blockId: "b2",
+            runId: "r2",
+            tier: 2,
+            topic: "v2",
+            summary: "bcV2Marker",
+            compressedTokens: 5,
+            createdAt: T2,
+            active: true,
+            directBlockIds: ["b1"],
+            durationMs: 1234,
+            generation: "young",
+            survivedCount: 2,
+            compressCallId: "call_1",
+          },
+        ],
+      },
+    },
+  }),
+);
+const bcV1 = path.join(biliRoot, "example.test_v1.json");
+fs.writeFileSync(
+  bcV1,
+  JSON.stringify({
+    version: 1,
+    id: "pfa-v1",
+    payload: {
+      upstreamOrigin: "anthropic",
+      state: {
+        blocks: [
+          {
+            blockId: "b1",
+            runId: "r1",
+            tier: 1,
+            topic: "v1",
+            summary: "bcV1Marker",
+            compressedTokens: 4,
+            createdAt: T2,
+          },
+        ],
+      },
+    },
+  }),
+);
+await internals.scanSources(false);
+const qV2 = db.search("bcV2Marker");
+const qV1 = db.search("bcV1Marker");
+check("bc envelope v2 reads meta.upstreamOrigin as project", qV2.rows.length === 1 && qV2.rows[0].project === "zhipu");
+check(
+  "bc envelope v2 lifecycle/lineage fields are stored",
+  qV2.rows[0].active === 1 &&
+    qV2.rows[0].directBlockIds === '["b1"]' &&
+    qV2.rows[0].durationMs === 1234 &&
+    qV2.rows[0].generation === "young" &&
+    qV2.rows[0].survivedCount === 2 &&
+    qV2.rows[0].compressCallId === "call_1",
+);
+check(
+  "bc envelope v1 flat upstreamOrigin is read as project",
+  qV1.rows.length === 1 && qV1.rows[0].project === "anthropic",
+);
+check(
+  "sources record the upstream format version",
+  db.db.prepare("SELECT format_version FROM sources WHERE source_file = ?").get(bcV2).format_version === 2,
+);
+
 // --- Durable prune: tombstones + watermark ledger ---------------------------------
 const pruneDb = new internals.MemoryDb(path.join(tmp, "prune.db"));
 const pruneSess = path.join(tmp, "--home-dev-Prune--", "prune.jsonl");

@@ -11,8 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `bili-session` adapter: indexes billion-context proxy session files
   (`<host>_<hash>.json`, blocks under `payload.state.blocks`, e.g. WorkBuddy/codebuddy sessions).
-  The project name is the file's `<host>` segment; bili blocks are stored as not expandable, like
-  opencode state files.
+  The project name is the file's `<host>` segment, or the envelope's own `upstreamOrigin`/`protocol`
+  when present; bili blocks are stored as not expandable, like opencode state files.
+- Upstream lifecycle/lineage metadata is now stored when the source provides it: `active`,
+  `direct_block_ids` (compression lineage), `duration_ms`, `generation`, `survived_count`, and
+  `compress_call_id`; `sources` also records `format_version`/`producer`. A force rescan refreshes
+  these fields in place without touching stored summaries.
 
 ### Changed
 

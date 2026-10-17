@@ -62,6 +62,11 @@ affiliated with, endorsed by, or a fork of**
   durable ledger; `UNIQUE(source_file, block_id)` + `INSERT OR IGNORE` dedupes
   blocks. `prune()` writes tombstones so a later rescan cannot resurrect
   pruned blocks.
+- **Upstream lifecycle metadata**: when the source records it, each block also
+  keeps `active`, `direct_block_ids` (compression lineage), `duration_ms`,
+  `generation`, `survived_count`, and `compress_call_id`; sources keep
+  `format_version`/`producer`. A force rescan refreshes these in place without
+  touching stored summaries.
 - **Chinese-friendly search**: FTS5 `trigram` for queries of 3+ characters;
   AND-ed `LIKE` against `summary OR topic` for shorter queries; a mixed mode
   combines both. No LLM translation or keyword generation.

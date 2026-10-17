@@ -290,6 +290,7 @@ var DEFAULT_CFG = {
 var MAX_TOPIC_CHARS = 200;
 var PREVIEW_CHARS = 600;
 var MAX_MSG_IDS = 4e3;
+var MAX_DIRECT_BLOCKS = 1e3;
 var EXPAND_MANIFEST_MAX = 300;
 var DEFAULT_RESULT_LIMIT = 6;
 var MAX_RESULT_LIMIT = 20;
@@ -655,6 +656,17 @@ function collectMsgIds(block) {
   }
   return out.length ? out : null;
 }
+function blockMetaFields(b) {
+  const direct = Array.isArray(b?.directBlockIds) ? b.directBlockIds.filter((x) => typeof x === "string" && x !== "").slice(0, MAX_DIRECT_BLOCKS) : [];
+  return {
+    active: typeof b?.active === "boolean" ? b.active ? 1 : 0 : null,
+    directBlockIds: direct.length ? JSON.stringify(direct) : null,
+    durationMs: toInt(b?.durationMs),
+    generation: typeof b?.generation === "string" && b.generation ? b.generation : null,
+    survivedCount: toInt(b?.survivedCount),
+    compressCallId: typeof b?.compressCallId === "string" && b.compressCallId ? b.compressCallId : null
+  };
+}
 function normalizePiBlocks(data) {
   if (!data || typeof data !== "object" || !Array.isArray(data.blocks)) return null;
   const out = [];
@@ -667,6 +679,7 @@ function normalizePiBlocks(data) {
       tier: Number.isInteger(b.tier) ? b.tier : null,
       topic: typeof b.topic === "string" && b.topic ? b.topic.slice(0, MAX_TOPIC_CHARS) : null,
       summary: b.summary,
+      ...blockMetaFields(b),
       msgIds: collectMsgIds(b),
       refStart: typeof b.startRef === "string" ? b.startRef : null,
       refEnd: typeof b.endRef === "string" ? b.endRef : null,
@@ -692,6 +705,7 @@ function normalizeOpencodeBlocks(data) {
         MAX_TOPIC_CHARS
       ) || null,
       summary: cleanOpencodeSummary(b.summary),
+      ...blockMetaFields(b),
       msgIds: collectMsgIds(b),
       refStart: typeof b.startId === "string" ? b.startId : null,
       refEnd: typeof b.endId === "string" ? b.endId : null,
@@ -710,6 +724,15 @@ function biliHost(sourceFile) {
   const idx = base.lastIndexOf("_");
   return idx > 0 ? base.slice(0, idx) : base || "unknown";
 }
+function biliProject(data, sourceFile) {
+  const payload = data?.payload ?? {};
+  const meta = payload?.meta ?? {};
+  const origin = meta.upstreamOrigin ?? payload.upstreamOrigin ?? data?.upstreamOrigin;
+  if (typeof origin === "string" && origin.trim()) return origin.trim();
+  const protocol = meta.protocol ?? payload.protocol ?? data?.protocol;
+  if (typeof protocol === "string" && protocol.trim()) return protocol.trim();
+  return biliHost(sourceFile);
+}
 function normalizeBiliBlocks(data) {
   const blocks = data?.payload?.state?.blocks;
   if (!Array.isArray(blocks)) return null;
@@ -723,6 +746,7 @@ function normalizeBiliBlocks(data) {
       tier: toInt(b.tier),
       topic: typeof b.topic === "string" && b.topic ? b.topic.slice(0, MAX_TOPIC_CHARS) : null,
       summary: b.summary,
+      ...blockMetaFields(b),
       msgIds: null,
       refStart: typeof b.startRef === "string" ? b.startRef : null,
       refEnd: typeof b.endRef === "string" ? b.endRef : null,
@@ -773,7 +797,9 @@ var MemoryDb = class {
         last_mtime_ms  INTEGER DEFAULT 0,     -- source file mtime of last successful scan
         last_size      INTEGER DEFAULT 0,
         first_seen_at  INTEGER,
-        updated_at     INTEGER
+        updated_at     INTEGER,
+        format_version INTEGER,               -- upstream format version (schemaVersion / envelope version)
+        producer       TEXT                   -- upstream producer string when present
       );
       CREATE TABLE IF NOT EXISTS blocks(
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -789,6 +815,12 @@ var MemoryDb = class {
         compressed_tokens INTEGER,
         created_at        INTEGER,            -- block.createdAt / block.createdAt (ms)
         msg_ids           TEXT,               -- JSON array of raw message ids (NULL = not expandable)
+        active            INTEGER,            -- 1/0 from the source; NULL = unknown
+        direct_block_ids  TEXT,               -- JSON array of lineage block ids (NULL = unknown)
+        duration_ms       INTEGER,            -- block duration when the source records it
+        generation        TEXT,               -- 'young' | 'old' (NULL = unknown)
+        survived_count    INTEGER,
+        compress_call_id  TEXT,
         UNIQUE(source_file, block_id)
       );
       CREATE INDEX IF NOT EXISTS idx_blocks_source ON blocks(source_file);
@@ -816,6 +848,23 @@ var MemoryDb = class {
     const blockCols = this.db.prepare("PRAGMA table_info(blocks)").all();
     const addedMsgIds = !blockCols.some((c) => c.name === "msg_ids");
     if (addedMsgIds) this.db.exec("ALTER TABLE blocks ADD COLUMN msg_ids TEXT;");
+    for (const [name, type] of [
+      ["active", "INTEGER"],
+      ["direct_block_ids", "TEXT"],
+      ["duration_ms", "INTEGER"],
+      ["generation", "TEXT"],
+      ["survived_count", "INTEGER"],
+      ["compress_call_id", "TEXT"]
+    ]) {
+      if (!blockCols.some((c) => c.name === name)) this.db.exec(`ALTER TABLE blocks ADD COLUMN ${name} ${type};`);
+    }
+    const sourceCols = this.db.prepare("PRAGMA table_info(sources)").all();
+    for (const [name, type] of [
+      ["format_version", "INTEGER"],
+      ["producer", "TEXT"]
+    ]) {
+      if (!sourceCols.some((c) => c.name === name)) this.db.exec(`ALTER TABLE sources ADD COLUMN ${name} ${type};`);
+    }
     this.db.exec(`
       INSERT OR IGNORE INTO source_watermarks(source_file, last_mtime_ms, last_size, updated_at)
       SELECT source_file, last_mtime_ms, last_size, updated_at
@@ -944,6 +993,9 @@ var MemoryDb = class {
       );
       return { ok: true, parsed: false, skipped: true, total: 0, inserted: 0, mtimeMs, size };
     }
+    const formatVersion = kind === "pi" ? typeof data?.schemaVersion === "number" && Number.isInteger(data.schemaVersion) ? data.schemaVersion : 1 : kind === "bili" ? typeof data?.version === "number" && Number.isInteger(data.version) ? data.version : 1 : null;
+    const producer = typeof data?.producer === "string" && data.producer ? data.producer : null;
+    if (kind === "bili") project = biliProject(data, sourceFile);
     const blocks = kind === "pi" ? normalizePiBlocks(data) : kind === "bili" ? normalizeBiliBlocks(data) : normalizeOpencodeBlocks(data);
     if (blocks === null) {
       return {
@@ -966,16 +1018,18 @@ var MemoryDb = class {
     this.db.exec("BEGIN");
     try {
       this.db.prepare(
-        `INSERT INTO sources(source_file, kind, project, cwd, last_mtime_ms, last_size, first_seen_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO sources(source_file, kind, project, cwd, last_mtime_ms, last_size, first_seen_at, updated_at, format_version, producer)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(source_file) DO UPDATE SET
              kind = excluded.kind,
              project = excluded.project,
              cwd = excluded.cwd,
              last_mtime_ms = excluded.last_mtime_ms,
              last_size = excluded.last_size,
-             updated_at = excluded.updated_at`
-      ).run(sourceFile, kind, project, cwd, mtimeMs, size, now, now);
+             updated_at = excluded.updated_at,
+             format_version = excluded.format_version,
+             producer = excluded.producer`
+      ).run(sourceFile, kind, project, cwd, mtimeMs, size, now, now, formatVersion, producer);
       this.db.prepare(
         `INSERT INTO source_watermarks(source_file, last_mtime_ms, last_size, updated_at)
            VALUES (?, ?, ?, ?)
@@ -986,13 +1040,18 @@ var MemoryDb = class {
       ).run(sourceFile, mtimeMs, size, now);
       const ins = this.db.prepare(
         `INSERT OR IGNORE INTO blocks
-           (source_file, kind, block_id, run_id, tier, topic, summary, ref_start, ref_end, compressed_tokens, created_at, msg_ids)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           (source_file, kind, block_id, run_id, tier, topic, summary, ref_start, ref_end, compressed_tokens, created_at, msg_ids, active, direct_block_ids, duration_ms, generation, survived_count, compress_call_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE NOT EXISTS (SELECT 1 FROM block_tombstones WHERE source_file = ? AND block_id = ?)`
       );
       const updMsgIds = this.db.prepare(
         `UPDATE blocks SET msg_ids = ?
           WHERE source_file = ? AND block_id = ? AND (msg_ids IS NOT ?)`
+      );
+      const updMeta = this.db.prepare(
+        `UPDATE blocks SET
+           active = ?, direct_block_ids = ?, duration_ms = ?, generation = ?, survived_count = ?, compress_call_id = ?
+         WHERE source_file = ? AND block_id = ?`
       );
       for (const b of blocks) {
         if (!b || typeof b.summary !== "string") continue;
@@ -1015,11 +1074,29 @@ var MemoryDb = class {
           b.compressedTokens,
           b.createdAt,
           msgIdsJson,
+          b.active ?? null,
+          b.directBlockIds ?? null,
+          b.durationMs ?? null,
+          b.generation ?? null,
+          b.survivedCount ?? null,
+          b.compressCallId ?? null,
           sourceFile,
           b.blockId
         );
         if (r.changes > 0) inserted++;
-        else if (updMsgIds.run(msgIdsJson, sourceFile, b.blockId, msgIdsJson).changes > 0) refreshed++;
+        else {
+          if (updMsgIds.run(msgIdsJson, sourceFile, b.blockId, msgIdsJson).changes > 0) refreshed++;
+          updMeta.run(
+            b.active ?? null,
+            b.directBlockIds ?? null,
+            b.durationMs ?? null,
+            b.generation ?? null,
+            b.survivedCount ?? null,
+            b.compressCallId ?? null,
+            sourceFile,
+            b.blockId
+          );
+        }
       }
       this.db.exec("COMMIT");
     } catch (e) {
@@ -1051,7 +1128,10 @@ var MemoryDb = class {
                 b.block_id AS blockId, b.tier, b.topic, b.summary,
                 b.ref_start AS refStart, b.ref_end AS refEnd,
                 b.compressed_tokens AS tokens, b.created_at AS createdAt,
-                b.msg_ids AS msgIds, s.project, s.cwd
+                b.msg_ids AS msgIds, b.active AS active, b.direct_block_ids AS directBlockIds,
+                b.duration_ms AS durationMs, b.generation AS generation,
+                b.survived_count AS survivedCount, b.compress_call_id AS compressCallId,
+                s.project, s.cwd
            FROM blocks b LEFT JOIN sources s ON s.source_file = b.source_file
           WHERE ${where}
           ORDER BY b.created_at DESC, b.id DESC
@@ -1120,7 +1200,10 @@ var MemoryDb = class {
              b.block_id AS blockId, b.tier, b.topic,
              b.ref_start AS refStart, b.ref_end AS refEnd,
              b.compressed_tokens AS tokens, b.created_at AS createdAt,
-             b.summary, s.project, s.cwd,
+             b.summary, b.active AS active, b.direct_block_ids AS directBlockIds,
+             b.duration_ms AS durationMs, b.generation AS generation,
+             b.survived_count AS survivedCount, b.compress_call_id AS compressCallId,
+             s.project, s.cwd,
              ${rank} AS rank
       ${from}
       WHERE ${where}

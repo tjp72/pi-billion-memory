@@ -52,6 +52,10 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
 - **增量且持久**：每个源文件用 `mtime + size` 水位线记录进度；
   `UNIQUE(source_file, block_id)` + `INSERT OR IGNORE` 去重；`prune()` 会写
   tombstone，后续 rescan 不会复活已删除的块。
+- **上游生命周期元数据**：源文件提供时，块还会保存 `active`、
+  `direct_block_ids`（压缩谱系）、`duration_ms`、`generation`、
+  `survived_count`、`compress_call_id`；源记录保存 `format_version`/`producer`。
+  强制 rescan 可原地刷新这些字段，不改动已存摘要。
 - **中文友好搜索**：3 个字符及以上使用 FTS5 `trigram`；1–2 个字符使用
   `LIKE` 对 `summary OR topic` 做 AND 匹配；长短混合查询两种模式并用。
   不调用 LLM 翻译或生成关键词。
