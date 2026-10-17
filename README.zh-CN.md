@@ -63,7 +63,7 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
 - **Node.js >= 22.19.0**（内置 `node:sqlite`；推荐并测试了 Node 24）。
   `node:sqlite` 在 Node 中仍标记为实验性，启动时可能打印
   `ExperimentalWarning`；对本扩展来说可以忽略。
-- **pi coding agent >= 0.85.1**（使用公开扩展 API；已测试 0.85.1）。
+- **pi coding agent >= 0.85.1**（使用公开扩展 API；已测试 1.3.0）。
 - 至少一个启用的压缩源：
   - [billion-context-pi](https://github.com/ranxianglei/billion-context-pi)
     （pi sidecar，**推荐**），

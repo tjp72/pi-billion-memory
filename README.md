@@ -76,7 +76,7 @@ affiliated with, endorsed by, or a fork of**
   tested). `node:sqlite` is still marked experimental in Node, so Node may
   print an `ExperimentalWarning` at startup; this is expected and safe to
   ignore for this extension.
-- **pi coding agent >= 0.85.1** (tested with 0.85.1; the extension uses only
+- **pi coding agent >= 0.85.1** (tested with 1.3.0; the extension uses only
   public extension APIs).
 - At least one enabled compression source:
   - [billion-context-pi](https://github.com/ranxianglei/billion-context-pi)

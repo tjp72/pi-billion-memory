@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `CONTRIBUTING.md` documents the `main` branch-protection rule and how to lift force-push
   protection for the length of a deliberate history rewrite.
+- Upgraded the pi compatibility test target from `@earendil-works/pi-coding-agent` 0.85.1 to
+  1.3.0; the extension continues to use only public extension APIs. This also picks up `undici`
+  8.10.2 and its security fixes.
 
 ## [0.5.2] - 2026-09-10
 
