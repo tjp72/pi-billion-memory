@@ -83,16 +83,18 @@ affiliated with, endorsed by, or a fork of**
   `related` compares the **sentence containing the query words** in each block
   (stopwords and data-driven IDF suppress generic-token noise; compression
   lineage/run/neighbor are structural evidence) and shows that evidence
-  sentence; `concepts` lists the concept vocabulary. Timeline bounds (`from`/`to`)
+  sentence; `concepts` lists the concepts you configured. Timeline bounds (`from`/`to`)
   accept ISO 8601 strings (date-only = that local day) or epoch ms, and are
   displayed in local time; `limit: 0` returns the full catalog, a positive limit
   keeps the newest N and reports the real total. Follow a catalog line with
   `memory_get` to read the stored summary.
 - **Concept search**: pass `concept` — one name that expands to the concrete
-  terms the corpus actually uses (e.g. `prompt cache`, `cache-integrity`, or a
-  custom name from config). All terms are searched, hits are merged, ranked by
-  how many distinct terms matched, and list `Matched terms`. `mode: "concepts"`
-  shows the vocabulary; `"concepts": {"name": ["term", …]}` adds your own.
+  terms the corpus actually uses. The vocabulary is **yours**: define it under
+  `"concepts": {"name": ["term", …]}` in `pi-billion-memory.json` (the
+  extension ships no built-in vocabulary, and personal vocabulary is never
+  committed). All terms are searched, hits are merged, ranked by how many
+  distinct terms matched, and list `Matched terms`. `mode: "concepts"` shows
+  what you defined.
 - **Requirement decomposition**: `decompose: true` splits a conjunctive query
   (`，`, `；`, `and`, …) into clauses and searches each one separately, grouping
   the hits per clause instead of ANDing every token into a single query.
@@ -353,9 +355,9 @@ Run `/memory sources` to confirm, then `/memory rescan`.
 - `memory_search` accepts `query`, optional `project`, optional `limit`
   (default 6, max 20), and returns matching blocks with `source`, `project`,
   `topic`, `tier`, `createdAt`, `compressedTokens`, and a preview.
-- `concept` searches every term of a named concept (built-in vocabulary or the
-  `concepts` config key) and merges the hits; `mode: "concepts"` prints the
-  vocabulary with its terms. `decompose: true` searches each clause of a
+- `concept` searches every term of a concept defined in the `concepts` config
+  key and merges the hits; `mode: "concepts"` prints the configured concepts
+  with their terms. `decompose: true` searches each clause of a
   conjunctive query separately.
 - `mode: "timeline"` accepts `from`/`to` as ISO 8601 strings (a date-only value
   means local midnight/day end) or epoch ms; an unparsable bound is an error, not

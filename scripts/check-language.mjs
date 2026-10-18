@@ -17,10 +17,9 @@
  *
  *   allowed  tests/**                 fixtures exercise Chinese retrieval
  *            src/cjk.ts              Chinese tokens, regexes, delimiters — data, no prose
- *            src/concepts.data.ts    concept terms — search payload, no prose
  *
- * Those two source files are named explicitly rather than pattern-matched, so adding a new Chinese
- * data module is a visible edit to this list instead of an accident.
+ * That source file is named explicitly rather than pattern-matched, so adding a new Chinese data
+ * module is a visible edit to this list instead of an accident.
  *
  * Exit codes: 0 clean, 1 findings.
  */
@@ -31,7 +30,7 @@ import fs from "node:fs";
 /** CJK ideographs, CJK punctuation, and fullwidth forms. */
 const CJK = /[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]/g;
 
-const ALLOWED_FILES = new Set(["src/cjk.ts", "src/concepts.data.ts"]);
+const ALLOWED_FILES = new Set(["src/cjk.ts"]);
 
 const ALLOWED_PREFIXES = ["tests/"];
 

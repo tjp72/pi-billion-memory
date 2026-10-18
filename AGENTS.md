@@ -27,6 +27,11 @@ Concretely:
 - Privacy fixes must also scrub **git history** (see §6), not just the working tree.
 - The allow-list file (`~/.pi/pi-billion-memory.sources.jsonl`) is user-local data and is never
   committed; the repository only contains neutral documentation/examples of it.
+- **Vocabulary is runtime user data**: concept terms, aliases, and any retired/deprecated term
+  list live in the user's `~/.pi/pi-billion-memory.json` (or the local DB) — never in this
+  repository. The extension ships **no** built-in vocabulary, and no session-derived word list may
+  be hardcoded in code, tests, docs, or commit messages. Deprecated terms are a runtime hint, not
+  repository content.
 - **Ingestion secret filter**: every block's `topic`/`summary` must pass through
   `redactSecrets()` before the `blocks` insert. The filter is best-effort and covers common
   credential assignments, provider token prefixes, JWTs, PEM private keys, auth headers,
@@ -196,8 +201,8 @@ The design is deliberately minimal; preserve these properties:
 - **Timeline bounds and the concept layer**: `from`/`to` go through `parseTimeParam` (ISO 8601
   strings or epoch ms; an invalid value throws instead of silently dropping the filter), and
   `limit: 0` means the full catalog while a positive limit keeps the newest N. `concept` resolves
-  label → id → alias via `findConcept` and searches every term of the vocabulary
-  (`src/concepts.ts` plus the `concepts` config key, capped by `MAX_CUSTOM_CONCEPTS`); hits are
+  label → id → alias via `findConcept` and searches every term of the user's `concepts` config
+  (capped by `MAX_CUSTOM_CONCEPTS`); the extension ships no vocabulary (AGENTS §1). Hits are
   merged and reported with the terms that matched. `decompose` splits only on explicit conjunctive
   punctuation, and each clause is an independent bounded search — never a second LLM pass.
 - **memory_get**: read-only, always registered; returns one stored block's topic+summary by id
