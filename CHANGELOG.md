@@ -5,7 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.1] - 2026-10-18
+
+### Added
+
+- **Concept vocabulary**: `memory_search` takes a `concept` name that expands to the
+  concrete terms the corpus actually uses (built-in `src/concepts.ts` plus the
+  `concepts` config key), searches every term, merges the hits, ranks by how many
+  distinct terms matched, and reports `Matched terms`; `mode: "concepts"` lists the
+  vocabulary.
+- **Requirement decomposition**: `decompose: true` splits a conjunctive query
+  (Chinese commas/semicolons, `and`) into clauses and searches each clause
+  separately, grouping the hits per clause.
+- `timeline` accepts `from`/`to` as ISO 8601 strings (date-only = the local day) as
+  well as epoch milliseconds; an unparsable bound is rejected instead of ignored.
+
+### Changed
+
+- `timeline` renders local time (the header states `times local UTC±hh:mm`), tags
+  non-pi entries with `[opencode]`/`[bili]`, and reports `listed`/`total` with merged
+  duplicates; `limit: 0` returns the full catalog and a positive limit keeps the
+  newest N instead of silently slicing.
 
 ## [0.6.0] - 2026-10-18
 

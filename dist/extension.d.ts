@@ -11,4 +11,10 @@ export declare function withoutPaths(text: string): string;
  * kept and the rest only contribute their source labels.
  */
 export declare function mergeDuplicateRows(rows: any): any[];
+/**
+ * Parse a timeline bound: epoch milliseconds or an ISO 8601 string. A date-only value means the
+ * local start (from) or end (to) of that day, matching the local time the timeline prints. Invalid
+ * values throw an actionable error instead of being silently ignored.
+ */
+export declare function parseTimeParam(v: unknown, param: "from" | "to"): number | null;
 export default function factory(pi: ExtensionAPI): Promise<{}>;

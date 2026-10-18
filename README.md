@@ -83,7 +83,19 @@ affiliated with, endorsed by, or a fork of**
   `related` compares the **sentence containing the query words** in each block
   (stopwords and data-driven IDF suppress generic-token noise; compression
   lineage/run/neighbor are structural evidence) and shows that evidence
-  sentence. Follow a catalog line with `memory_get` to read the stored summary.
+  sentence; `concepts` lists the concept vocabulary. Timeline bounds (`from`/`to`)
+  accept ISO 8601 strings (date-only = that local day) or epoch ms, and are
+  displayed in local time; `limit: 0` returns the full catalog, a positive limit
+  keeps the newest N and reports the real total. Follow a catalog line with
+  `memory_get` to read the stored summary.
+- **Concept search**: pass `concept` — one name that expands to the concrete
+  terms the corpus actually uses (e.g. `prompt cache`, `cache-integrity`, or a
+  custom name from config). All terms are searched, hits are merged, ranked by
+  how many distinct terms matched, and list `Matched terms`. `mode: "concepts"`
+  shows the vocabulary; `"concepts": {"name": ["term", …]}` adds your own.
+- **Requirement decomposition**: `decompose: true` splits a conjunctive query
+  (`，`, `；`, `and`, …) into clauses and searches each one separately, grouping
+  the hits per clause instead of ANDing every token into a single query.
 - **Read one memory**: `memory_get` opens a catalog/search line by block id and
   returns the stored (already-redacted) topic + summary; it never reads raw
   session messages.
@@ -341,6 +353,14 @@ Run `/memory sources` to confirm, then `/memory rescan`.
 - `memory_search` accepts `query`, optional `project`, optional `limit`
   (default 6, max 20), and returns matching blocks with `source`, `project`,
   `topic`, `tier`, `createdAt`, `compressedTokens`, and a preview.
+- `concept` searches every term of a named concept (built-in vocabulary or the
+  `concepts` config key) and merges the hits; `mode: "concepts"` prints the
+  vocabulary with its terms. `decompose: true` searches each clause of a
+  conjunctive query separately.
+- `mode: "timeline"` accepts `from`/`to` as ISO 8601 strings (a date-only value
+  means local midnight/day end) or epoch ms; an unparsable bound is an error, not
+  a silently ignored filter. `limit: 0` returns the full catalog, a positive
+  limit keeps the newest N and adds `listed`/`total` accounting.
 - Queries of **3+ characters** use the FTS5 `trigram` index, which matches
   Chinese substrings, mixed Chinese/English text, and code identifiers.
 - Queries of **1–2 characters** use AND-ed `LIKE` matches against both

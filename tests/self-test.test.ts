@@ -2091,6 +2091,96 @@ check(
 );
 internals._setConfig({ excludePaths: [] });
 
+// --- v0.6.1: timeline bounds, limit semantics, concept vocabulary -------------------
+const tlIsoFrom = new Date(tlT0 + 60 * 60 * 1000).toISOString();
+const tlIsoTo = new Date(tlT0 + 3 * 3600000).toISOString();
+const tlWindow = db.timeline("timeLineMarker", { project: "Timeline", from: tlIsoFrom, to: tlIsoTo });
+check(
+  "timeline honors ISO 8601 from/to bounds (the bound used to be dropped)",
+  tlWindow.rows
+    .filter((r) => r.orderRank === 0)
+    .map((r) => r.blockId)
+    .join(",") === "b11,b12" && tlWindow.total === 3,
+);
+const tl2 = db.timeline("timeLineMarker", { project: "Timeline", limit: 2 });
+check(
+  "an explicit timeline limit keeps the newest entries and reports the full total",
+  tl2.total === 4 && tl2.hiddenByLimit === 2 && tl2.rows.map((r) => r.blockId).join(",") === "b12,bX",
+);
+check("the timeline header states the local time zone once", internals.formatTimeline(tl).includes("times local UTC"));
+check(
+  "the limit hint points at limit: 0 instead of drop the limit",
+  internals.formatTimeline(tl2).includes("pass limit: 0"),
+);
+
+const isoFrom = internals.parseTimeParam("2026-10-13T12:00+0800", "from");
+check("from accepts an ISO 8601 string with an offset", isoFrom === Date.parse("2026-10-13T12:00+0800"));
+check(
+  "a date-only from is local midnight",
+  internals.parseTimeParam("2026-10-13", "from") === new Date(2026, 9, 13, 0, 0, 0, 0).getTime(),
+);
+check(
+  "a date-only to is the end of the local day",
+  internals.parseTimeParam("2026-10-13", "to") === new Date(2026, 9, 13, 23, 59, 59, 999).getTime(),
+);
+let badFrom = null;
+try {
+  internals.parseTimeParam("not-a-date", "from");
+} catch (e) {
+  badFrom = String(e.message);
+}
+check(
+  "an unparsable from is rejected instead of silently dropped",
+  typeof badFrom === "string" && badFrom.includes("ISO 8601"),
+);
+let secFrom = null;
+try {
+  internals.parseTimeParam(1760000000, "from");
+} catch (e) {
+  secFrom = String(e.message);
+}
+check(
+  "epoch seconds are rejected with a milliseconds hint",
+  typeof secFrom === "string" && secFrom.includes("milliseconds"),
+);
+
+const catalog = internals.conceptCatalog(null);
+check(
+  "the built-in vocabulary covers the kernel-governance concept",
+  catalog.length >= 10 && catalog.some((c) => c.id === "compression-kernel" && c.terms.includes("压缩")),
+);
+check(
+  "a concept resolves by label, id and alias",
+  internals.findConcept("memory layer", null)?.entry.id === "memory-layer" &&
+    internals.findConcept("memory-layer", null)?.entry.id === "memory-layer" &&
+    internals.findConcept("retrieval", null)?.entry.id === "memory-layer" &&
+    internals.findConcept("compaction", null)?.entry.id === "compression-kernel",
+);
+const cs = db.searchConcept("memory layer", { project: "ProjA", limit: 6 });
+check(
+  "concept search merges the hits of every term in the vocabulary",
+  cs.mode === "concept" && cs.rows.length >= 1 && cs.rows[0].matchedTerms.length >= 1,
+);
+check("concept results report which terms matched", internals.formatResults(cs).includes("Matched terms:"));
+check(
+  "an unknown concept reports the catalog instead of returning empty",
+  db.searchConcept("no-such-concept", {}).unknown === true,
+);
+const conceptsText = internals.formatConcepts(catalog);
+check(
+  "mode 'concepts' lists labels and their terms",
+  conceptsText.includes("compression kernel") && conceptsText.includes("terms:"),
+);
+internals._setConfig({ concepts: { "test-concept": ["记忆插件", "FTS5"] } });
+const csCustom = db.searchConcept("test-concept", { project: "ProjA", limit: 6 });
+check("a custom configured concept is searched", csCustom.mode === "concept" && csCustom.rows.length >= 1);
+internals._setConfig({ concepts: {} });
+check(
+  "decompose splits a conjunctive requirement set into clauses",
+  internals.splitClauses("压缩摘要可检索，原文可展开；索引版本化").length === 3 &&
+    internals.splitClauses("single clause").length === 1,
+);
+
 // --- cleanup --------------------------------------------------------------------
 // Windows locks a database file while a handle is open, so the unlink below fails with EBUSY.
 // configureForTests() replaces the connection, which means the `db` captured above can be a stale

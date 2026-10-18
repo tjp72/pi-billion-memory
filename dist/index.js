@@ -471,6 +471,210 @@ async function expandStoredBlock(opts) {
   return base;
 }
 
+// src/cjk.ts
+var CJK_STOPWORDS = [
+  "\u7684",
+  "\u4E86",
+  "\u5728",
+  "\u548C",
+  "\u662F",
+  "\u4E0E",
+  "\u53CA",
+  "\u6216",
+  "\u5BF9",
+  "\u88AB",
+  "\u628A",
+  "\u5C31",
+  "\u90FD",
+  "\u800C",
+  "\u4E5F",
+  "\u8FD8",
+  "\u4E4B",
+  "\u5176",
+  "\u7B49",
+  "\u6211",
+  "\u4F60",
+  "\u4ED6",
+  "\u5979",
+  "\u5B83",
+  "\u4EEC",
+  "\u8FD9",
+  "\u90A3",
+  "\u6709",
+  "\u65E0",
+  "\u4E3A",
+  "\u4EE5",
+  "\u4E8E",
+  "\u4ECE",
+  "\u5230",
+  "\u4F1A",
+  "\u8981",
+  "\u4E0D",
+  "\u6CA1",
+  "\u5F88",
+  "\u66F4",
+  "\u6700",
+  "\u5E76",
+  "\u4E14",
+  "\u4F46",
+  "\u82E5",
+  "\u5219",
+  "\u5373",
+  "\u53EF",
+  "\u80FD",
+  "\u9700",
+  "\u5E94",
+  "\u8BE5",
+  "\u4E0A",
+  "\u4E0B",
+  "\u4E2D",
+  "\u5185",
+  "\u5916",
+  "\u524D",
+  "\u540E",
+  "\u65F6",
+  "\u4E2A",
+  "\u4E9B",
+  "\u79CD"
+];
+var CREDENTIAL_NOUNS = "(?:\u5BC6\u7801|\u53E3\u4EE4|\u5BC6\u94A5|\u4EE4\u724C|\u79C1\u94A5|\u8BBF\u95EE\u5BC6\u94A5|api\u5BC6\u94A5)";
+var CREDENTIAL_LINK = "(?:\u662F|\u4E3A|[:=\uFF1A])";
+var VALUE_STOP = "\uFF0C\uFF1B";
+var CHINESE_SECRET_RE = new RegExp(
+  `(${CREDENTIAL_NOUNS})\\s*${CREDENTIAL_LINK}\\s*["']?([^\\s"'${VALUE_STOP},;]{4,})`,
+  "gi"
+);
+var SENTENCE_DELIMITERS = /[。！？!?.;\n]+/;
+var CLAUSE_SEPARATORS = /[,，;；。、]+|\s+(?:and|且|以及|并且)\s+/i;
+
+// src/concepts.data.ts
+var CONCEPT_DATA = [
+  {
+    id: "compression-kernel",
+    label: "compression kernel",
+    aliases: ["compression", "compaction", "summarizer"],
+    terms: ["\u538B\u7F29", "compress", "compaction", "summary", "\u6458\u8981", "fold", "spill", "tier", "\u84B8\u998F", "\u5757\u8FB9\u754C", "ref-tag"]
+  },
+  {
+    id: "cache-integrity",
+    label: "prompt cache",
+    aliases: ["cache", "prefix cache", "cache hit"],
+    terms: ["\u7F13\u5B58", "cache", "\u524D\u7F00", "prefix", "\u547D\u4E2D\u7387", "schema", "system_hash", "\u5931\u914D"]
+  },
+  {
+    id: "injection-pointer",
+    label: "injection pointer",
+    aliases: ["injection", "context injection", "pointer"],
+    terms: ["\u6CE8\u5165", "inject", "\u6307\u9488", "pointer", "\u767D\u540D\u5355", "whitelist", "interjection"]
+  },
+  {
+    id: "guard-chain",
+    label: "write guard",
+    aliases: ["guard", "permission gate", "guard chain"],
+    terms: ["\u5B88\u536B", "guard", "\u6743\u9650\u77E9\u9635", "\u786E\u8BA4", "confirm", "\u62E6\u622A", "sandbox"]
+  },
+  {
+    id: "forensics",
+    label: "incident forensics",
+    aliases: ["forensics", "incident", "postmortem"],
+    terms: ["\u53D6\u8BC1", "forensic", "400", "\u5D29\u6E83", "crash", "\u6839\u56E0", "\u65E5\u5FD7", "wire"]
+  },
+  {
+    id: "ab-bench",
+    label: "A/B bench",
+    aliases: ["A/B", "bench", "ablation"],
+    terms: ["A/B", "\u53F0\u67B6", "arm", "\u81C2", "\u53F0\u8D26", "ledger", "dry run", "\u5BF9\u7167"]
+  },
+  {
+    id: "memory-layer",
+    label: "memory layer",
+    aliases: ["memory", "memory search", "retrieval"],
+    terms: ["\u8BB0\u5FC6", "memory", "sidecar", "FTS5", "SQLite", "\u5165\u5E93", "ingest", "timeline"]
+  },
+  {
+    id: "governance",
+    label: "governance",
+    aliases: ["process", "working agreement", "review process"],
+    terms: ["\u6CBB\u7406", "governance", "AGENTS.md", "DoD", "worktree", "review", "plan"]
+  },
+  {
+    id: "release-engineering",
+    label: "release engineering",
+    aliases: ["release", "shipping", "versioning"],
+    terms: ["\u53D1\u5E03", "release", "tag", "CI", "publish", "dist", "\u6821\u9A8C"]
+  },
+  {
+    id: "cross-repo",
+    label: "cross-repo migration",
+    aliases: ["cross-repo", "cross repo", "repo migration"],
+    terms: ["\u8DE8\u4ED3", "\u8DE8\u4ED3\u8FC1\u79FB", "cross-repo", "repo migration", "monorepo"]
+  }
+];
+
+// src/concepts.ts
+var MAX_CONCEPT_TERMS = 24;
+var MAX_CONCEPT_TERM_CHARS = 64;
+var MAX_CONCEPT_LABEL_CHARS = 120;
+var MAX_CUSTOM_CONCEPTS = 50;
+var BUILTIN_CONCEPTS = CONCEPT_DATA;
+function norm(s) {
+  return typeof s === "string" ? s.trim().toLowerCase().replace(/[\s_-]+/g, " ") : "";
+}
+function cleanTerm(v) {
+  if (typeof v !== "string") return null;
+  const t = v.replace(/\s+/g, " ").trim().slice(0, MAX_CONCEPT_TERM_CHARS);
+  return t ? t : null;
+}
+function slug(s) {
+  const base = norm(s).replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/^-+|-+$/g, "").slice(0, MAX_CONCEPT_LABEL_CHARS);
+  return base || "concept";
+}
+function matchEntry(entry, key) {
+  const k = norm(key);
+  if (!k) return false;
+  return [entry.id, entry.label, ...entry.aliases].some((x) => norm(x) === k);
+}
+function conceptCatalog(custom) {
+  const list = BUILTIN_CONCEPTS.map((c) => ({
+    ...c,
+    aliases: [...c.aliases],
+    terms: [...c.terms]
+  }));
+  if (!custom || typeof custom !== "object" || Array.isArray(custom)) return list;
+  let added = 0;
+  for (const [key, value] of Object.entries(custom)) {
+    if (!Array.isArray(value)) continue;
+    const terms = value.map(cleanTerm).filter(Boolean);
+    if (!terms.length) continue;
+    const k = String(key || "").trim().slice(0, MAX_CONCEPT_LABEL_CHARS);
+    if (!k) continue;
+    const existing = list.find((c) => matchEntry(c, k));
+    if (existing) {
+      for (const t of terms) if (!existing.terms.includes(t)) existing.terms.push(t);
+      if (existing.terms.length > MAX_CONCEPT_TERMS) existing.terms = existing.terms.slice(0, MAX_CONCEPT_TERMS);
+      continue;
+    }
+    if (added >= MAX_CUSTOM_CONCEPTS) break;
+    list.push({ id: slug(k), label: k, aliases: [], terms: [...new Set(terms)].slice(0, MAX_CONCEPT_TERMS) });
+    added++;
+  }
+  return list;
+}
+function findConcept(name, custom) {
+  const n = norm(name);
+  if (!n) return null;
+  const list = conceptCatalog(custom);
+  const exactId = list.find((c) => norm(c.id) === n);
+  if (exactId) return { entry: exactId, terms: [...exactId.terms] };
+  const exactName = list.find((c) => norm(c.label) === n || c.aliases.some((a) => norm(a) === n));
+  if (exactName) return { entry: exactName, terms: [...exactName.terms] };
+  const partial = list.filter(
+    (c) => norm(c.label).includes(n) || norm(c.id).includes(n) || c.aliases.some((a) => norm(a).includes(n))
+  );
+  if (partial.length !== 1) return null;
+  return { entry: partial[0], terms: [...partial[0].terms] };
+}
+
 // src/extension.ts
 var HOME = os.homedir();
 var PI_DIR = path.join(HOME, ".pi");
@@ -506,7 +710,9 @@ var DEFAULT_CFG = {
   /** Hard cap on messages rendered by one `memory_expand` call. */
   expandMaxMessages: 200,
   /** Hard cap on bytes read from a session file by one `memory_expand` call. */
-  expandMaxReadBytes: 32 * 1024 * 1024
+  expandMaxReadBytes: 32 * 1024 * 1024,
+  /** Extra concept vocabulary for `memory_search` (`{ "name": ["term", ...] }`). */
+  concepts: {}
 };
 var MAX_TOPIC_CHARS = 200;
 var PREVIEW_CHARS = 600;
@@ -584,6 +790,15 @@ function sanitizeCfg(over) {
     out.expandMaxMessages = over.expandMaxMessages;
   if (Number.isInteger(over.expandMaxReadBytes) && over.expandMaxReadBytes > 0)
     out.expandMaxReadBytes = over.expandMaxReadBytes;
+  if (over.concepts && typeof over.concepts === "object" && !Array.isArray(over.concepts)) {
+    const clean = {};
+    for (const [key, value] of Object.entries(over.concepts)) {
+      if (!Array.isArray(value)) continue;
+      const terms = value.filter((t) => typeof t === "string" && t.trim() !== "").map((t) => t.trim().slice(0, 64)).slice(0, 24);
+      if (terms.length && key.trim()) clean[key.trim().slice(0, 120)] = terms;
+    }
+    out.concepts = clean;
+  }
   return out;
 }
 var cfg = { ...DEFAULT_CFG };
@@ -650,7 +865,6 @@ var SECRET_KEY_NAMES = [
 var SECRET_KEY_PREFIX = `(?<![A-Za-z0-9])((?:${SECRET_KEY_NAMES}))(?![A-Za-z0-9_-])`;
 var QUOTED_SECRET_RE = new RegExp(`${SECRET_KEY_PREFIX}(["']?)(\\s*[:=]\\s*)(["'])([^"']{4,})\\4`, "gi");
 var UNQUOTED_SECRET_RE = new RegExp(`${SECRET_KEY_PREFIX}(["']?)(\\s*[:=]\\s*)([^\\s"',;]{6,})`, "gi");
-var CHINESE_SECRET_RE = /((?:密码|口令|密钥|令牌|私钥|访问密钥|api密钥))\s*(?:是|为|[:=：])\s*["']?([^\s"'，；,;]{4,})/gi;
 var URL_RE = /\b(?:(?:https?|ftp|file|ssh|git|wss?|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis):\/\/|www\.)[^\s<>"'`]*[A-Za-z0-9/#=?_~%&+-]/gi;
 var SECRET_PATTERNS = [
   { re: QUOTED_SECRET_RE, to: "$1$2$3$4[REDACTED]$4" },
@@ -1578,6 +1792,8 @@ var MemoryDb = class {
     const windowMs = Number.isInteger(opts.windowMinutes) ? opts.windowMinutes * 6e4 : null;
     let lo = Number.isInteger(opts.from) ? opts.from : null;
     let hi = Number.isInteger(opts.to) ? opts.to : null;
+    if (lo === null && opts.from !== void 0 && opts.from !== null) lo = parseTimeParam(opts.from, "from");
+    if (hi === null && opts.to !== void 0 && opts.to !== null) hi = parseTimeParam(opts.to, "to");
     const sameSourceOnly = anchor && windowMs !== null ? anchor.sourceFile : null;
     if (anchor && windowMs !== null && Number.isInteger(anchor.createdAt)) {
       lo = anchor.createdAt - windowMs;
@@ -1598,6 +1814,7 @@ var MemoryDb = class {
         orderRank: key.rank
       });
     }
+    const total = entries.length;
     entries.sort((a, b) => {
       if (a.orderRank !== b.orderRank) return a.orderRank - b.orderRank;
       const at = a.timelineTime ?? 0;
@@ -1615,9 +1832,47 @@ var MemoryDb = class {
       mode: "timeline",
       rows: listed,
       listed: merged.length,
-      total: rows.length,
+      total,
       hiddenByLimit: explicit ? Math.max(0, merged.length - listed.length) : 0
     };
+  }
+  /**
+   * Concept search: resolve one name against the vocabulary, run every term and merge the hits.
+   * A block that matches more distinct terms ranks first, then the most recent; each row carries
+   * the terms that hit it so the caller can see why it matched.
+   */
+  searchConcept(name, opts = {}) {
+    this.open();
+    const found = findConcept(String(name || ""), cfg.concepts);
+    if (!found) {
+      return { mode: "concept", unknown: true, name: String(name || ""), rows: [], total: 0 };
+    }
+    const limit = Math.max(
+      1,
+      Math.min(50, Number.isInteger(opts.limit) && opts.limit > 0 ? opts.limit : DEFAULT_RESULT_LIMIT)
+    );
+    const byKey = /* @__PURE__ */ new Map();
+    for (const term of found.terms) {
+      const res = this.search(term, { project: opts.project || null, limit: MAX_RESULT_LIMIT });
+      for (const row of res.rows) {
+        const key = `${row.sourceFile}\0${row.blockId}\0${row.kind || ""}`;
+        const hit = byKey.get(key);
+        if (hit) {
+          hit.matchedTerms.add(term);
+          continue;
+        }
+        byKey.set(key, { ...row, matchedTerms: /* @__PURE__ */ new Set([term]) });
+      }
+    }
+    const ranked = [...byKey.values()].sort((a, b) => {
+      if (b.matchedTerms.size !== a.matchedTerms.size) return b.matchedTerms.size - a.matchedTerms.size;
+      const at = Number.isInteger(a.createdAt) ? a.createdAt : 0;
+      const bt = Number.isInteger(b.createdAt) ? b.createdAt : 0;
+      if (at !== bt) return bt - at;
+      return String(a.blockId).localeCompare(String(b.blockId));
+    });
+    const rows = ranked.slice(0, limit).map((r) => ({ ...r, matchedTerms: [...r.matchedTerms] }));
+    return { mode: "concept", concept: found.entry, terms: found.terms, rows, total: ranked.length };
   }
   /**
    * Related-line view: score other blocks against a seed block by structural evidence first
@@ -1993,13 +2248,27 @@ async function scanCurrentSession(sessionFile, force = false, cwd = null) {
   const d = getDb();
   return d.ingestSidecarFile(sessionFile, cwd || null, force);
 }
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
 function fmtTs(ms) {
   if (!Number.isInteger(ms)) return "";
-  try {
-    return new Date(ms).toISOString().replace("T", " ").slice(0, 16);
-  } catch {
-    return "";
-  }
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return "";
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+function fmtDate(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+function fmtClock(ms) {
+  const d = new Date(ms);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+function tzLabel() {
+  const off = -(/* @__PURE__ */ new Date()).getTimezoneOffset();
+  const abs = Math.abs(off);
+  return `UTC${off >= 0 ? "+" : "-"}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
 }
 function fmtTokens(n) {
   if (!Number.isInteger(n)) return "";
@@ -2152,72 +2421,10 @@ var STOPWORDS = /* @__PURE__ */ new Set([
   "etc",
   "per",
   "vs",
-  "\u7684",
-  "\u4E86",
-  "\u5728",
-  "\u548C",
-  "\u662F",
-  "\u4E0E",
-  "\u53CA",
-  "\u6216",
-  "\u5BF9",
-  "\u88AB",
-  "\u628A",
-  "\u5C31",
-  "\u90FD",
-  "\u800C",
-  "\u4E5F",
-  "\u8FD8",
-  "\u4E4B",
-  "\u5176",
-  "\u7B49",
-  "\u6211",
-  "\u4F60",
-  "\u4ED6",
-  "\u5979",
-  "\u5B83",
-  "\u4EEC",
-  "\u8FD9",
-  "\u90A3",
-  "\u6709",
-  "\u65E0",
-  "\u4E3A",
-  "\u4EE5",
-  "\u4E8E",
-  "\u4ECE",
-  "\u5230",
-  "\u4F1A",
-  "\u8981",
-  "\u4E0D",
-  "\u6CA1",
-  "\u5F88",
-  "\u66F4",
-  "\u6700",
-  "\u5E76",
-  "\u4E14",
-  "\u4F46",
-  "\u82E5",
-  "\u5219",
-  "\u5373",
-  "\u53EF",
-  "\u80FD",
-  "\u9700",
-  "\u5E94",
-  "\u8BE5",
-  "\u4E0A",
-  "\u4E0B",
-  "\u4E2D",
-  "\u5185",
-  "\u5916",
-  "\u524D",
-  "\u540E",
-  "\u65F6",
-  "\u4E2A",
-  "\u4E9B",
-  "\u79CD"
+  ...CJK_STOPWORDS
 ]);
 function splitSentences(text) {
-  return String(text || "").split(/[。！？!?.;\n]+/).map((s) => s.trim()).filter(Boolean);
+  return String(text || "").split(SENTENCE_DELIMITERS).map((s) => s.trim()).filter(Boolean);
 }
 function evidenceSentence(row, queryTokens) {
   const sentences = splitSentences(`${row?.topic || ""} ${row?.summary || ""}`);
@@ -2309,7 +2516,7 @@ function formatResults(res) {
   if (rows.length === 0) {
     return "No memory matches. Try: 1) shorter / more common keywords; 2) drop the project filter; 3) if a compression happened moments ago, retry later (ingestion follows scan timing). The store only contains ACP block summaries from allow-listed sources (pi billion-context-pi sidecars, opencode-acp state files, and billion-context sessions).";
   }
-  const modeLabel = res.mode === "like" ? " (short-query LIKE mode)" : res.mode === "mixed" ? " (mixed trigram + LIKE mode)" : " (trigram relevance sort)";
+  const modeLabel = res.mode === "like" ? " (short-query LIKE mode)" : res.mode === "mixed" ? " (mixed trigram + LIKE mode)" : res.mode === "concept" ? " (concept vocabulary)" : " (trigram relevance sort)";
   const head = `Memory hits: ${rows.length}${modeLabel}:
 `;
   const parts = rows.map((r, i) => {
@@ -2323,7 +2530,8 @@ function formatResults(res) {
     summary = redactOut(summary.replace(/\n{3,}/g, "\n\n").trim());
     return `[${i + 1}] project ${project} \xB7 ${tm || "time unknown"} \xB7 ${r.blockId || ""} \xB7 tier${r.tier ?? "?"} \xB7 ${fmtTokens(r.tokens) || "?"} tokens compressed${refs}
 Source: ${sourceLabel(r)}
-${duplicateNote(r)}${topic}${summary}`;
+${duplicateNote(r)}${r.matchedTerms ? `Matched terms: ${r.matchedTerms.join(", ")}
+` : ""}${topic}${summary}`;
   });
   return head + parts.join("\n\n---\n\n");
 }
@@ -2334,19 +2542,22 @@ function formatTimeline(res) {
     return "No timeline entries. Try: 1) a broader query; 2) another project; 3) a wider time window (from/to or windowMinutes).";
   }
   const oneLine = (s) => String(s || "").replace(/\s+/g, " ").trim();
-  const line = (r, time) => `${time} \xB7 ${r.project || "?"} \xB7 ${r.blockId || "?"} \xB7 tier${r.tier ?? "?"} \xB7 ${redactOut(oneLine(r.topic)) || "(no topic)"}${r.duplicateCount ? ` (+${r.duplicateCount})` : ""}`;
+  const line = (r, time) => `${time} \xB7 ${r.project || "?"} \xB7 ${r.blockId || "?"}${r.kind === "opencode" ? " [opencode]" : r.kind === "bili" ? " [bili]" : ""} \xB7 tier${r.tier ?? "?"} \xB7 ${redactOut(oneLine(r.topic)) || "(no topic)"}${r.duplicateCount ? ` (+${r.duplicateCount})` : ""}`;
   const lines = [];
-  const scope = res.listed && res.listed > rows.length ? `${rows.length} of ${res.listed}` : `${rows.length}`;
-  lines.push(`Memory timeline (${scope} entr${rows.length === 1 ? "y" : "ies"}):`);
+  const listed = Number.isInteger(res.listed) ? res.listed : rows.length;
+  const total = Number.isInteger(res.total) ? res.total : listed;
+  const mergedNote = total > listed ? `, ${total - listed} duplicate${total - listed === 1 ? "" : "s"} merged` : "";
+  const scope = rows.length === listed ? `${listed}` : `${rows.length} of ${listed}`;
+  lines.push(`Memory timeline (${scope} entr${listed === 1 ? "y" : "ies"}${mergedNote}; times local ${tzLabel()}):`);
   let currentDate = "";
   for (const r of rows) {
     if (r.orderRank >= 1) continue;
-    const date = Number.isInteger(r.timelineTime) ? new Date(r.timelineTime).toISOString().slice(0, 10) : "(no date)";
+    const date = Number.isInteger(r.timelineTime) ? fmtDate(r.timelineTime) : "(no date)";
     if (date !== currentDate) {
       lines.push(`## ${date}`);
       currentDate = date;
     }
-    const time = r.exact && Number.isInteger(r.timelineTime) ? new Date(r.timelineTime).toISOString().slice(11, 16) : "--:--";
+    const time = r.exact && Number.isInteger(r.timelineTime) ? fmtClock(r.timelineTime) : "--:--";
     lines.push(line(r, time));
   }
   const unplaced = rows.filter((r) => r.orderRank >= 1);
@@ -2361,8 +2572,25 @@ function formatTimeline(res) {
     );
   }
   if (res.hiddenByLimit > 0) {
-    lines.push(`(an explicit limit hid ${res.hiddenByLimit} entries; drop the limit for the full catalog)`);
+    lines.push(
+      `(an explicit limit hid ${res.hiddenByLimit} entries and keeps the newest N; pass limit: 0 for the full catalog)`
+    );
   }
+  return lines.join("\n");
+}
+function formatConcepts(list) {
+  const entries = list || [];
+  if (!entries.length) return "No concepts defined.";
+  const lines = [`Concept vocabulary (${entries.length}):`];
+  for (const c of entries) {
+    lines.push("");
+    lines.push(`${c.label}  (${c.id})${c.aliases && c.aliases.length ? ` \xB7 aka ${c.aliases.join(", ")}` : ""}`);
+    lines.push(`  terms: ${c.terms.join(", ")}`);
+  }
+  lines.push("");
+  lines.push(
+    `Search a concept with memory_search + concept '<label|id|alias>'; add your own vocabulary with "concepts": { "name": ["term", ...] } in pi-billion-memory.json.`
+  );
   return lines.join("\n");
 }
 function formatRelated(res) {
@@ -2449,12 +2677,20 @@ var MEMORY_SEARCH_PARAMETERS = {
     },
     limit: {
       type: "number",
-      description: "Max number of results, default 6, max 20 (timeline: max 50)"
+      description: "Max results to return. blocks/related: default 6, max 20. timeline: omitted or 0 = the full catalog, a positive limit keeps the newest N entries"
     },
     mode: {
       type: "string",
-      enum: ["blocks", "timeline", "related"],
-      description: "'blocks' (default) relevance search; 'timeline' returns the complete memory catalog (one line per memory, date-grouped, never truncated); 'related' finds blocks whose sentence containing the query words is related to the seed"
+      enum: ["blocks", "timeline", "related", "concepts"],
+      description: "'blocks' (default) relevance search; 'timeline' returns the complete memory catalog (one line per memory, date-grouped, never truncated); 'related' finds blocks whose sentence containing the query words is related to the seed; 'concepts' lists the concept vocabulary (one name -> the concrete terms it expands to)"
+    },
+    concept: {
+      type: "string",
+      description: "Search a concept instead of literal keywords: the name is resolved against the built-in vocabulary (see mode 'concepts') and every term is searched, merging hits; blocks matching more distinct terms rank first. Example: 'prompt cache' or 'cache-integrity'"
+    },
+    decompose: {
+      type: "boolean",
+      description: "Split the query into clauses on clause punctuation (ASCII or fullwidth comma, semicolon, full stop) or on a coordinating conjunction, and search each clause separately, reporting one grouped section per clause; useful for multi-part requirements"
     },
     block: {
       type: "string",
@@ -2464,8 +2700,14 @@ var MEMORY_SEARCH_PARAMETERS = {
       type: "string",
       description: "Disambiguate an anchor block id that exists in several sources (substring of the Source label)"
     },
-    from: { type: "number", description: "Timeline window start as epoch milliseconds" },
-    to: { type: "number", description: "Timeline window end as epoch milliseconds" },
+    from: {
+      type: ["number", "string"],
+      description: "Timeline window start: epoch milliseconds or an ISO 8601 string such as '2026-10-13', '2026-10-13T12:00' or '2026-10-13T12:00+0800' (a date-only value means local midnight)"
+    },
+    to: {
+      type: ["number", "string"],
+      description: "Timeline window end: epoch milliseconds or an ISO 8601 string (a date-only value means the end of that local day)"
+    },
     windowMinutes: {
       type: "number",
       description: "Timeline window around the anchor block, in minutes (requires 'block')"
@@ -2523,14 +2765,43 @@ function readMemoryExpandParams(raw) {
   const chars = typeof value.chars === "number" && Number.isInteger(value.chars) && value.chars > 0 ? value.chars : null;
   return { block, source, mode, select, limit, chars };
 }
+function parseTimeParam(v, param) {
+  if (v === void 0 || v === null || v === "") return null;
+  if (typeof v === "number") {
+    if (!Number.isInteger(v)) throw new Error(`'${param}' must be epoch milliseconds or an ISO 8601 string`);
+    if (v > 0 && v < 1e11)
+      throw new Error(`'${param}' looks like seconds; pass epoch milliseconds (e.g. 1760000000000)`);
+    return v;
+  }
+  if (typeof v !== "string") throw new Error(`'${param}' must be epoch milliseconds or an ISO 8601 string`);
+  const s = v.trim();
+  if (!s) return null;
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (dateOnly) {
+    const d = new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]));
+    if (Number.isNaN(d.getTime())) throw new Error(`'${s}' is not a valid date`);
+    if (param === "to") d.setHours(23, 59, 59, 999);
+    return d.getTime();
+  }
+  const ms = Date.parse(s);
+  if (Number.isNaN(ms))
+    throw new Error(
+      `'${s.slice(0, 40)}' is not a valid time; use epoch milliseconds or ISO 8601 (e.g. 2026-10-13T12:00+0800)`
+    );
+  return ms;
+}
+function splitClauses(query) {
+  return String(query || "").split(CLAUSE_SEPARATORS).map((s) => s.replace(/\s+/g, " ").trim()).filter((s) => s.length >= 2).slice(0, 6);
+}
 function readMemorySearchParams(raw) {
   const value = raw && typeof raw === "object" ? raw : {};
   const query = typeof value.query === "string" ? value.query.slice(0, MAX_QUERY_CHARS) : "";
   const project = typeof value.project === "string" && value.project.trim().length > 0 ? value.project.trim().slice(0, MAX_PROJECT_LABEL) : null;
-  const limit = typeof value.limit === "number" && Number.isInteger(value.limit) ? value.limit : DEFAULT_RESULT_LIMIT;
-  const mode = value.mode === "timeline" ? "timeline" : value.mode === "related" ? "related" : "blocks";
+  const limit = typeof value.limit === "number" && Number.isInteger(value.limit) && value.limit >= 0 ? value.limit : DEFAULT_RESULT_LIMIT;
+  const mode = value.mode === "timeline" ? "timeline" : value.mode === "related" ? "related" : value.mode === "concepts" ? "concepts" : "blocks";
   const block = typeof value.block === "string" && value.block.trim() ? value.block.trim().slice(0, MAX_ID_FIELD) : null;
   const source = typeof value.source === "string" && value.source.trim() ? value.source.trim().slice(0, MAX_SOURCE_FIELD) : null;
+  const concept = typeof value.concept === "string" && value.concept.trim() ? value.concept.trim().slice(0, 120) : null;
   const int = (v) => typeof v === "number" && Number.isInteger(v) ? v : null;
   return {
     query,
@@ -2539,10 +2810,12 @@ function readMemorySearchParams(raw) {
     mode,
     block,
     source,
-    from: int(value.from),
-    to: int(value.to),
+    from: parseTimeParam(value.from, "from"),
+    to: parseTimeParam(value.to, "to"),
     windowMinutes: int(value.windowMinutes),
-    reasons: value.reasons !== false
+    reasons: value.reasons !== false,
+    concept,
+    decompose: value.decompose === true
   };
 }
 async function factory(pi) {
@@ -2625,7 +2898,10 @@ async function factory(pi) {
       "Use memory_search when the user asks about past work, conclusions, decisions, or context from earlier sessions or from earlier in this session after compression.",
       "For Chinese queries shorter than 3 characters, memory_search falls back to substring matching automatically \u2014 still pass the query as-is.",
       "Use mode 'timeline' for a chronological catalog of matches (one line per memory, full, never truncated); follow a line with memory_get to read that block's stored summary.",
-      "Use mode 'related' with a query (the search words) to find blocks whose sentence containing those words is related; pass 'block' to anchor on a specific block."
+      "Use mode 'related' with a query (the search words) to find blocks whose sentence containing those words is related; pass 'block' to anchor on a specific block.",
+      "For a concept (one name that expands to the concrete terms the corpus uses, e.g. prompt cache) pass the 'concept' parameter; mode 'concepts' lists the built-in vocabulary and its terms.",
+      "For a multi-part requirement set decompose: true so each clause is searched separately and the hits are grouped per clause.",
+      "In timeline mode pass limit: 0 for the full catalog; a positive limit keeps the newest N entries. from/to accept ISO 8601 strings (date-only = local day)."
     ],
     parameters: paramsSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -2633,6 +2909,36 @@ async function factory(pi) {
         await scanSources();
         const p = readMemorySearchParams(params);
         const db2 = getDb();
+        if (p.mode === "concepts") {
+          const catalog = conceptCatalog(cfg.concepts);
+          return {
+            content: [{ type: "text", text: formatConcepts(catalog) }],
+            details: { mode: "concepts", hits: catalog.length, dbPath: fileBase(cfg.dbPath) }
+          };
+        }
+        if (p.concept) {
+          const res2 = db2.searchConcept(p.concept, { project: p.project, limit: p.limit });
+          if (res2.unknown) {
+            const known = conceptCatalog(cfg.concepts).map((c) => c.label).join(", ");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Unknown concept '${p.concept}'. Known concepts: ${known}. Use mode 'concepts' for the full vocabulary and its terms.`
+                }
+              ],
+              details: { mode: "concept", hits: 0, unknown: true, dbPath: fileBase(cfg.dbPath) }
+            };
+          }
+          const head = `Concept: ${res2.concept.label} (${res2.concept.id}) \xB7 ${res2.terms.length} terms \xB7 ${res2.total} matching memories
+Terms: ${res2.terms.join(", ")}
+
+`;
+          return {
+            content: [{ type: "text", text: head + formatResults(res2) }],
+            details: { mode: "concept", hits: res2.rows.length, dbPath: fileBase(cfg.dbPath) }
+          };
+        }
         if (p.mode === "timeline") {
           const res2 = db2.timeline(p.query, {
             project: p.project,
@@ -2664,6 +2970,22 @@ async function factory(pi) {
             content: [{ type: "text", text: formatRelated(res2) }],
             details: { mode: "related", hits: res2.rows.length, dbPath: fileBase(cfg.dbPath) }
           };
+        }
+        if (p.decompose) {
+          const clauses = splitClauses(p.query);
+          if (clauses.length > 1) {
+            const per = Math.max(1, Math.ceil(Math.max(1, p.limit) / 2));
+            const parts = clauses.map(
+              (c) => `## ${c}
+` + formatResults(db2.search(c, { project: p.project, limit: per }))
+            );
+            return {
+              content: [{ type: "text", text: `Decomposed into ${clauses.length} clauses:
+
+` + parts.join("\n\n") }],
+              details: { mode: "decompose", hits: clauses.length, dbPath: fileBase(cfg.dbPath) }
+            };
+          }
         }
         const res = db2.search(p.query, { project: p.project, limit: p.limit });
         const text = formatResults(res);

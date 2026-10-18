@@ -193,6 +193,13 @@ The design is deliberately minimal; preserve these properties:
   generic tokens with a data-driven IDF gate (never deleting content words), keeps compression
   lineage (`direct_block_ids`)/`run_id`/neighbor as structural evidence, drops zero-evidence
   candidates, and shows the evidence sentence. All modes stay offline, bounded, and dependency-free.
+- **Timeline bounds and the concept layer**: `from`/`to` go through `parseTimeParam` (ISO 8601
+  strings or epoch ms; an invalid value throws instead of silently dropping the filter), and
+  `limit: 0` means the full catalog while a positive limit keeps the newest N. `concept` resolves
+  label → id → alias via `findConcept` and searches every term of the vocabulary
+  (`src/concepts.ts` plus the `concepts` config key, capped by `MAX_CUSTOM_CONCEPTS`); hits are
+  merged and reported with the terms that matched. `decompose` splits only on explicit conjunctive
+  punctuation, and each clause is an independent bounded search — never a second LLM pass.
 - **memory_get**: read-only, always registered; returns one stored block's topic+summary by id
   (never raw session messages) with the same ambiguity handling as expansion.
 - **No silent data loss**: `prune()` (manual, via `/memory prune <days>`) is the only deletion

@@ -13,6 +13,10 @@ jobs:
   test:
     name: Node ${{ matrix.node }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # The privacy keyword list is a secret: §1 requires it to stay out of the tree. When it is
+    # unset the scan still enforces its structural rules (home paths, emails, tokens).
+    env:
+      PBM_PRIVACY_TERMS: ${{ secrets.PBM_PRIVACY_TERMS }}
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +34,14 @@ jobs:
 
       - name: Install
         run: npm ci --legacy-peer-deps
+
+      # Named separately so a privacy or language failure is visible as its own red check
+      # instead of being buried in the composite gate.
+      - name: Privacy scan (AGENTS.md §1)
+        run: npm run privacy:scan
+
+      - name: Language check (AGENTS.md §2)
+        run: npm run language:check
 
       - name: Check
         run: npm run check

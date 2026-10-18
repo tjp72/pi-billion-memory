@@ -66,8 +66,16 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
 - **记忆线模式**：`memory_search` 支持 `mode`。`blocks`（默认）按相关性排序；
   `timeline` 返回**完整目录**（一行一条：时间、项目、块号、tier、topic，按日期分组，
   永不截断）；`related` 比较每个块中**包含搜索词的那句话**（停用词 + 数据驱动 IDF
-  抑制泛词噪声，压缩谱系/同一次压缩/相邻作为结构证据），并展示该证据句。
-  目录行可用 `memory_get` 打开读取已存摘要。
+  抑制泛词噪声，压缩谱系/同一次压缩/相邻作为结构证据），并展示该证据句；
+  `concepts` 列出概念词表。timeline 的 `from`/`to` 接受 ISO 8601（只写日期 = 当天
+  本地零点/当天结束）或 epoch 毫秒，显示为本地时间；`limit: 0` 返回完整目录，
+  正数只保留最新 N 条并报告真实总数。目录行可用 `memory_get` 打开读取已存摘要。
+- **概念检索**：传 `concept`——一个名字展开成语料里实际使用的多个词
+  （如 `压缩内核治理`、`compression-kernel`，或配置里的自定义名）。所有词分别检索、
+  结果合并，按命中的不同词数排序，并列出 `Matched terms`。`mode: "concepts"`
+  显示词表；`"concepts": {"name": ["词", …]}` 可加自定义概念。
+- **需求拆解**：`decompose: true` 把并列式查询（`，`、`；`、`和`、`and` 等）
+  拆成子句分别检索，按子句分组返回，而不是把所有词 AND 进一条查询。
 - **读取单条记忆**：`memory_get` 按块号打开目录/搜索中的一行，返回已脱敏的
   topic + summary；不读取原始 session 消息。
 - **重复内容合并**：被 fork/复制到不同源文件的完全相同记忆只显示一条，并列出
@@ -292,6 +300,11 @@ bili sessions (<host>_<hash>.json)┘                              (SQLite + FTS
 - `memory_search` 接受 `query`、可选的 `project`、可选的 `limit`（默认 6，
   最大 20），返回匹配块的 `source`、`project`、`topic`、`tier`、`createdAt`、
   `compressedTokens` 和预览；
+- `concept` 检索一个概念的全部词（内置词表或 `concepts` 配置），合并结果；
+  `mode: "concepts"` 打印词表与词；`decompose: true` 把并列查询拆成子句分别检索；
+- `mode: "timeline"` 的 `from`/`to` 接受 ISO 8601（只写日期 = 本地当天零点/
+  当天结束）或 epoch 毫秒；无法解析的边界会报错而不是被静默忽略。`limit: 0`
+  返回完整目录，正数保留最新 N 条并附带 `listed`/`total` 计数；
 - **3 个字符及以上**的查询使用 FTS5 `trigram` 索引，可匹配中文子串、中英混合
   文本和代码标识符；
 - **1–2 个字符**的查询使用 `LIKE` 对 `summary` 和 `topic` 做 AND 匹配；

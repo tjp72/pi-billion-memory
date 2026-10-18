@@ -18,6 +18,8 @@ node_modules/
 *.log
 *.log.*
 *.sources.jsonl
+# Local privacy keyword list (AGENTS.md §1: the concrete list is never committed)
+.privacy-terms
 pi-billion-memory.json
 *.bak
 

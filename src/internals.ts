@@ -1,5 +1,6 @@
 // Test-only entry point. The published extension entry is src/index.ts.
 export { default } from "./extension.js";
+import { conceptCatalog, findConcept } from "./concepts.js";
 import {
   expandBlock,
   expandStoredBlock,
@@ -26,6 +27,9 @@ import {
   formatTimeline,
   formatRelated,
   formatBlockDetail,
+  formatConcepts,
+  splitClauses,
+  parseTimeParam,
   mergeDuplicateRows,
   redactSecrets,
   withoutPaths,
@@ -64,6 +68,11 @@ export const internals = {
   formatTimeline,
   formatRelated,
   formatBlockDetail,
+  formatConcepts,
+  splitClauses,
+  parseTimeParam,
+  conceptCatalog,
+  findConcept,
   mergeDuplicateRows,
   redactSecrets,
   withoutPaths,
