@@ -989,18 +989,18 @@ check(
   relShortSeed.note === "seed evidence sentence is too short for a reliable relation",
 );
 
-// --- memory_get: read one stored summary (no raw messages) ---------------------------
+// --- block detail: read one stored summary (no raw messages) ---------------------------
 const got = db.getBlock("bS", "RelProj");
 check(
-  "memory_get returns the stored summary, not raw session text",
+  "block detail returns the stored summary, not raw session text",
   got.found && got.total === 1 && got.row.summary.includes("relatedMinMaxSeedMarker"),
 );
 const gotText = internals.formatBlockDetail(got.row);
 check(
-  "memory_get formatter renders the block header and summary",
+  "block detail formatter renders the block header and summary",
   gotText.includes("Block bS") && gotText.includes("relatedMinMaxSeedMarker"),
 );
-check("memory_get reports a missing block", db.getBlock("nope", null).found === false);
+check("block detail reports a missing block", db.getBlock("nope", null).found === false);
 
 // --- output-time redaction (legacy rows predate the current filter) ------------------
 const legacySecret = "sk-" + "A".repeat(32);
@@ -2205,11 +2205,142 @@ check(
     Object.keys(depClamped.deprecated)[0].length <= 64 &&
     depClamped.deprecated.bad === undefined,
 );
+internals._setConfig({ stopwords: ["themarker"] });
+const keptTokens = internals.contentTokens("themarker alphamarker");
+check(
+  "configured stopwords are dropped from related-evidence tokens",
+  keptTokens.includes("alphamarker") && !keptTokens.includes("themarker"),
+);
+const stopClamped = internals.sanitizeCfg({ stopwords: ["TheMarker", "themarker", 7, ""] });
+check(
+  "sanitizeCfg dedupes stopwords case-insensitively and drops non-strings",
+  stopClamped.stopwords.length === 1 && stopClamped.stopwords[0] === "TheMarker",
+);
+internals._setConfig({ stopwords: [] });
+check(
+  "the bundle ships no stopwords (tokens are kept by default)",
+  internals.contentTokens("themarker").includes("themarker") && internals.MAX_STOPWORDS === 500,
+);
+// --- v0.6.3: concept table file, bounded detail, timeline preview ---------------------------
+const tbl = internals.parseConceptTable({
+  concepts: { "c-one": ["alpha", "ALPHA", "beta", 42, ""], "c-two": ["gamma"] },
+  deprecated: { old: "new", gone: "", bad: 7 },
+  filtered: ["the", "the", "", 5],
+  evidence: { alpha: 3, beta: -1, x: "y" },
+  scope: { project: "p", n: 2, nested: { x: 1 } },
+  watermark: { rows: 10 },
+});
+check(
+  "a table keeps keywords per concept, deduplicated and bounded",
+  tbl.concepts["c-one"].length === 2 && tbl.concepts["c-one"][0] === "alpha" && tbl.concepts["c-two"][0] === "gamma",
+);
+check(
+  "a table keeps replacements and empty retired entries",
+  tbl.deprecated.old === "new" && tbl.deprecated.gone === "",
+);
+check("a table's filtered list is bounded strings", tbl.filtered.length === 1 && tbl.filtered[0] === "the");
+check("a table's evidence keeps non-negative counts only", tbl.evidence.alpha === 3 && tbl.evidence.beta === undefined);
+check(
+  "a table's scope keeps scalars only (no nested objects)",
+  tbl.scope.project === "p" && tbl.scope.n === 2 && tbl.scope.nested === undefined,
+);
+const tblDir = fs.mkdtempSync(path.join(os.tmpdir(), "pbm-concepts-"));
+const tblFile = path.join(tblDir, "concepts.json");
+fs.writeFileSync(tblFile, JSON.stringify({ concepts: { "c-three": ["delta"] }, deprecated: { old: "new" } }));
+internals._setConfig({ conceptsFile: tblFile, concepts: { "c-four": ["epsilon"] } });
+const mergedVocab = internals.effectiveVocabulary();
+check(
+  "the concepts file is loaded and merged with inline concepts",
+  mergedVocab.source === "config+file" &&
+    mergedVocab.concepts["c-three"][0] === "delta" &&
+    mergedVocab.concepts["c-four"][0] === "epsilon",
+);
+check(
+  "inline concepts win over a file label with the same name",
+  (() => {
+    internals._setConfig({ conceptsFile: tblFile, concepts: { "c-three": ["zeta"] } });
+    return internals.effectiveVocabulary().concepts["c-three"][0] === "zeta";
+  })(),
+);
+fs.writeFileSync(tblFile, "{not json");
+internals._setConfig({ conceptsFile: tblFile, concepts: {} });
+const brokenVocab = internals.effectiveVocabulary();
+check(
+  "a broken concepts file degrades to an empty table with a note",
+  Object.keys(brokenVocab.concepts).length === 0 && typeof brokenVocab.error === "string",
+);
+internals._setConfig({ conceptsFile: path.join(tblDir, "missing.json"), concepts: {} });
+check("a missing concepts file degrades instead of throwing", internals.effectiveVocabulary().error !== null);
+internals._setConfig({ conceptsFile: "", concepts: {} });
+check(
+  "timeline preview keeps the first sentence",
+  internals.timelinePreview("First sentence. Second one.") === "First sentence.",
+);
+check("timeline preview is bounded", internals.timelinePreview("x".repeat(400)).length <= 121);
+const previewRow = {
+  project: "ProjA",
+  blockId: "b1h",
+  tier: 1,
+  topic: "topic",
+  summary: "Alpha did a thing. Then more.",
+};
+const previewOn = internals.formatTimeline({
+  rows: [{ ...previewRow, timelineTime: Date.now(), exact: true, orderRank: 0 }],
+  listed: 1,
+  total: 1,
+  preview: true,
+});
+const previewOff = internals.formatTimeline({
+  rows: [{ ...previewRow, timelineTime: Date.now(), exact: true, orderRank: 0 }],
+  listed: 1,
+  total: 1,
+});
+check(
+  "timeline preview renders only when requested",
+  previewOn.includes(" — Alpha did a thing.") && !previewOff.includes(" — "),
+);
+
 check(
   "decompose splits a conjunctive requirement set into clauses",
   internals.splitClauses("压缩摘要可检索，原文可展开；索引版本化").length === 3 &&
     internals.splitClauses("single clause").length === 1,
 );
+
+// --- elevation plan -----------------------------------------------------------------
+{
+  const plan = (rows, watermark = null, stale = null) =>
+    internals.formatElevationPlan({
+      scope: "all projects",
+      rows,
+      windows: Math.ceil(rows / internals.ELEVATION_WINDOW_ROWS),
+      brake: rows > internals.ELEVATION_ROWS_BRAKE,
+      capped: false,
+      watermark,
+      stale,
+      conceptsFile: null,
+    });
+  const okPlan = plan(800, { lastCreatedAt: "2026-10-01T00:00", lastBlockSeq: 42 }, 120);
+  check(
+    "elevation plan renders the budget and the vocabulary watermark",
+    okPlan.includes("4 window(s) of 200 rows") &&
+      okPlan.includes("6 window(s) left") &&
+      okPlan.includes("watermark 2026-10-01T00:00") &&
+      okPlan.includes("block 42") &&
+      okPlan.includes("120 row(s) newer"),
+  );
+  const brakePlan = plan(2001);
+  check(
+    "elevation plan trips the hard brake above 2,000 rows",
+    brakePlan.includes("STOP") && brakePlan.includes("ask the user"),
+  );
+  const emptyPlan = plan(0);
+  check(
+    "elevation plan degrades for an empty library and no vocabulary",
+    emptyPlan.includes("0 merged row(s)") &&
+      emptyPlan.includes("no conceptsFile") &&
+      emptyPlan.includes("not configured"),
+  );
+}
 
 // --- cleanup --------------------------------------------------------------------
 // Windows locks a database file while a handle is open, so the unlink below fails with EBUSY.

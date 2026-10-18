@@ -171,3 +171,122 @@ export function deprecatedHints(deprecated?: Record<string, unknown> | null, tex
   if (!hits.length) return "";
   return ["Vocabulary hints (runtime config, not repository content):", ...hits.map((h) => `- ${h}`)].join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// Concept table file (generated at runtime for one scope; never repository content)
+// ---------------------------------------------------------------------------
+
+/** Caps for a concept table produced by the elevation workflow. */
+export const MAX_TABLE_CONCEPTS = 200;
+export const MAX_TABLE_KEYWORDS = 10;
+export const MAX_TABLE_FILTERED = 200;
+/** A table file larger than this is ignored (the extension never loads unbounded JSON). */
+export const MAX_TABLE_BYTES = 1024 * 1024;
+
+export interface ConceptTable {
+  concepts: Record<string, string[]>;
+  deprecated: Record<string, string>;
+  filtered: string[];
+  evidence: Record<string, number>;
+  scope: Record<string, unknown> | null;
+  watermark: Record<string, unknown> | null;
+}
+
+function scalarRecord(raw: unknown): Record<string, unknown> | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out: Record<string, unknown> = {};
+  let n = 0;
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (n >= 20) break;
+    const key = String(k).trim().slice(0, 60);
+    if (!key) continue;
+    if (typeof v === "string") out[key] = v.slice(0, 200);
+    else if (typeof v === "number" && Number.isFinite(v)) out[key] = v;
+    else if (typeof v === "boolean") out[key] = v;
+    else continue;
+    n++;
+  }
+  return n ? out : null;
+}
+
+/**
+ * Parse one concept table (`concepts`, `deprecated`, `filtered`, `evidence`, `scope`,
+ * `watermark`). Bounded and shape-checked: unknown keys are ignored, and nothing is coerced
+ * into a search term that the file did not contain.
+ * @internal
+ */
+export function parseConceptTable(raw: unknown): ConceptTable {
+  const empty: ConceptTable = {
+    concepts: {},
+    deprecated: {},
+    filtered: [],
+    evidence: {},
+    scope: null,
+    watermark: null,
+  };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return empty;
+  const src = raw as Record<string, unknown>;
+
+  const concepts: Record<string, string[]> = {};
+  if (src.concepts && typeof src.concepts === "object" && !Array.isArray(src.concepts)) {
+    for (const [rawLabel, rawTerms] of Object.entries(src.concepts as Record<string, unknown>)) {
+      if (Object.keys(concepts).length >= MAX_TABLE_CONCEPTS) break;
+      const label = String(rawLabel).trim().slice(0, MAX_CONCEPT_LABEL_CHARS);
+      if (!label) continue;
+      const terms: string[] = [];
+      const seen = new Set<string>();
+      for (const rawTerm of Array.isArray(rawTerms) ? rawTerms : []) {
+        const term = cleanTerm(rawTerm);
+        if (!term) continue;
+        const key = term.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        terms.push(term);
+        if (terms.length >= MAX_TABLE_KEYWORDS) break;
+      }
+      if (terms.length) concepts[label] = terms;
+    }
+  }
+
+  const deprecated: Record<string, string> = {};
+  if (src.deprecated && typeof src.deprecated === "object" && !Array.isArray(src.deprecated)) {
+    for (const [rawKey, rawValue] of Object.entries(src.deprecated as Record<string, unknown>)) {
+      if (Object.keys(deprecated).length >= MAX_DEPRECATED_TERMS) break;
+      const key = String(rawKey).trim().slice(0, MAX_CONCEPT_TERM_CHARS);
+      if (!key) continue;
+      if (rawValue !== null && rawValue !== undefined && typeof rawValue !== "string") continue;
+      deprecated[key] = typeof rawValue === "string" ? rawValue.trim().slice(0, MAX_CONCEPT_TERM_CHARS) : "";
+    }
+  }
+
+  const filtered: string[] = [];
+  if (Array.isArray(src.filtered)) {
+    const seen = new Set<string>();
+    for (const rawWord of src.filtered) {
+      const word = cleanTerm(rawWord);
+      if (!word || seen.has(word.toLowerCase())) continue;
+      seen.add(word.toLowerCase());
+      filtered.push(word);
+      if (filtered.length >= MAX_TABLE_FILTERED) break;
+    }
+  }
+
+  const evidence: Record<string, number> = {};
+  if (src.evidence && typeof src.evidence === "object" && !Array.isArray(src.evidence)) {
+    for (const [rawKey, rawValue] of Object.entries(src.evidence as Record<string, unknown>)) {
+      if (Object.keys(evidence).length >= 500) break;
+      const key = String(rawKey).trim().slice(0, MAX_CONCEPT_TERM_CHARS);
+      if (!key || typeof rawValue !== "number" || !Number.isFinite(rawValue) || rawValue < 0) continue;
+      evidence[key] = Math.floor(rawValue);
+    }
+  }
+
+  return {
+    concepts,
+    deprecated,
+    filtered,
+    evidence,
+    scope: scalarRecord(src.scope),
+    watermark: scalarRecord(src.watermark),
+  };
+}

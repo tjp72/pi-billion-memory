@@ -69,7 +69,7 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
   抑制泛词噪声，压缩谱系/同一次压缩/相邻作为结构证据），并展示该证据句；
   `concepts` 列出你配置的概念。timeline 的 `from`/`to` 接受 ISO 8601（只写日期 = 当天
   本地零点/当天结束）或 epoch 毫秒，显示为本地时间；`limit: 0` 返回完整目录，
-  正数只保留最新 N 条并报告真实总数。目录行可用 `memory_get` 打开读取已存摘要。
+  正数只保留最新 N 条并报告真实总数。目录行可用 `block` + `detail: true` 打开读取已存摘要。
 - **概念检索**：传 `concept`——一个名字展开成语料里实际使用的多个词。
   词表由你在 `pi-billion-memory.json` 的 `"concepts": {"名字": ["词", …]}` 中定义
   （扩展不内置任何词表，个人词表也不进仓库）。所有词分别检索、结果合并，
@@ -79,8 +79,8 @@ ACP 插件会把长对话压缩成摘要。本扩展从**白名单允许的压�
   `mode: "concepts"` 也会列出这张表。扩展只读不写：词表由你维护，且永远不进本仓库。
 - **需求拆解**：`decompose: true` 把并列式查询（`，`、`；`、`和`、`and` 等）
   拆成子句分别检索，按子句分组返回，而不是把所有词 AND 进一条查询。
-- **读取单条记忆**：`memory_get` 按块号打开目录/搜索中的一行，返回已脱敏的
-  topic + summary；不读取原始 session 消息。
+- **读取单条记忆**：`memory_search` 传 `block` + `detail: true` 打开目录/搜索中的
+  一行，返回已脱敏的 topic + summary；不读取原始 session 消息。
 - **重复内容合并**：被 fork/复制到不同源文件的完全相同记忆只显示一条，并列出
   其它出处；同一源内的多层级父子块不会被合并。
 - **惰性项目解析**：只有在 sidecar 需要（重新）入库时才读取 pi session 文件的
@@ -160,6 +160,7 @@ pi list
 - `/memory sources` — 查看当前白名单；
 - `/memory rescan` — 强制全量重新扫描；
 - `/memory prune <days>` — 持久删除 N 天前的块；
+- `/memory elevation [query]` — 打印 `docs/ELEVATION.md` 词表工作流的工作包（行数、窗口数、预算刹车、水位线）；仅数字，不拉取块正文。
 - 让模型调用 `memory_search`，例如问“我之前在做什么？”。
 
 ### 卸载
@@ -254,6 +255,13 @@ bili sessions (<host>_<hash>.json)┘                              (SQLite + FTS
 - `expandMaxReadBytes`：单次 `memory_expand` 读取 session 文件的字节数硬上限
   （默认 33554432，即 32 MB）。文件以有界分块方式打开读取，不会先把整个大文件
   读进内存再切片；
+- `concepts`：内联概念词表（`{"名字": ["词", …]}`），默认为空；
+- `deprecated`：废弃词表（`{"旧词": "新词", "废词": ""}`），只用于提示；
+- `stopwords`：related 模式取证据词时丢弃的功能词/填充词。属用户数据：包内不内置任何
+  词表，留空则保留全部词；
+- `conceptsFile`：可选的 JSON 词表文件（由 elevation 流程生成，含 `concepts`、
+  `deprecated`、`filtered`、`scope`、`watermark`）。只读、展开 `~`、按 mtime+size
+  缓存、上限 1 MB；同名概念以内联 `concepts` 为准；
 
 ## 白名单源
 
@@ -307,7 +315,11 @@ bili sessions (<host>_<hash>.json)┘                              (SQLite + FTS
   `mode: "concepts"` 打印配置的概念与词；`decompose: true` 把并列查询拆成子句分别检索；
 - `mode: "timeline"` 的 `from`/`to` 接受 ISO 8601（只写日期 = 本地当天零点/
   当天结束）或 epoch 毫秒；无法解析的边界会报错而不是被静默忽略。`limit: 0`
-  返回完整目录，正数保留最新 N 条并附带 `listed`/`total` 计数；
+  返回完整目录，正数保留最新 N 条并附带 `listed`/`total` 计数；`preview: true`
+  为每行追加一句有界摘要，但仅对不超过 80 条的窗口生效；
+- `block` + `detail: true` 读取单个已存块的 topic+summary；同一 id 出现在多个
+  来源时用 `source` 指定。`mode: "concepts"` 还会报告词表来源（`config`/
+  `file`/`config+file`）、scope/watermark、关键词数与过滤词数；
 - **3 个字符及以上**的查询使用 FTS5 `trigram` 索引，可匹配中文子串、中英混合
   文本和代码标识符；
 - **1–2 个字符**的查询使用 `LIKE` 对 `summary` 和 `topic` 做 AND 匹配；

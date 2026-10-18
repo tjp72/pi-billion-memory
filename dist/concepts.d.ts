@@ -42,3 +42,17 @@ export declare function findConcept(name: string, custom?: Record<string, unknow
 export declare const MAX_DEPRECATED_TERMS = 200;
 /** Normalize a vocabulary term for matching: lowercase, collapsed whitespace/hyphens/underscores. */
 export declare function normTerm(s: unknown): string;
+/** Caps for a concept table produced by the elevation workflow. */
+export declare const MAX_TABLE_CONCEPTS = 200;
+export declare const MAX_TABLE_KEYWORDS = 10;
+export declare const MAX_TABLE_FILTERED = 200;
+/** A table file larger than this is ignored (the extension never loads unbounded JSON). */
+export declare const MAX_TABLE_BYTES: number;
+export interface ConceptTable {
+    concepts: Record<string, string[]>;
+    deprecated: Record<string, string>;
+    filtered: string[];
+    evidence: Record<string, number>;
+    scope: Record<string, unknown> | null;
+    watermark: Record<string, unknown> | null;
+}

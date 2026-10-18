@@ -11,77 +11,6 @@
  * examples, or labels here; put those in the English module that consumes them.
  */
 
-/**
- * Function words dropped from related-evidence tokens. Only function words belong here: content
- * words (even short ones) are kept, because removing them damages the evidence sentence. Tokens
- * that are merely ubiquitous for one query are demoted by the data-driven DF gate instead.
- */
-export const CJK_STOPWORDS: readonly string[] = [
-  "的",
-  "了",
-  "在",
-  "和",
-  "是",
-  "与",
-  "及",
-  "或",
-  "对",
-  "被",
-  "把",
-  "就",
-  "都",
-  "而",
-  "也",
-  "还",
-  "之",
-  "其",
-  "等",
-  "我",
-  "你",
-  "他",
-  "她",
-  "它",
-  "们",
-  "这",
-  "那",
-  "有",
-  "无",
-  "为",
-  "以",
-  "于",
-  "从",
-  "到",
-  "会",
-  "要",
-  "不",
-  "没",
-  "很",
-  "更",
-  "最",
-  "并",
-  "且",
-  "但",
-  "若",
-  "则",
-  "即",
-  "可",
-  "能",
-  "需",
-  "应",
-  "该",
-  "上",
-  "下",
-  "中",
-  "内",
-  "外",
-  "前",
-  "后",
-  "时",
-  "个",
-  "些",
-  "种",
-];
-
 /** Credential nouns that a Chinese secret assignment may use as its key. */
 const CREDENTIAL_NOUNS = "(?:密码|口令|密钥|令牌|私钥|访问密钥|api密钥)";
 
@@ -92,8 +21,8 @@ const CREDENTIAL_LINK = "(?:是|为|[:=：])";
 const VALUE_STOP = "，；";
 
 /**
- * `密码：xxx` / `令牌是 xxx` — a Chinese credential assignment. Group 1 is the label, group 2 the
- * value, so the replacement is `$1: [REDACTED]`.
+ * Chinese credential assignment (e.g. a label followed by a colon and a value). Group 1 is the
+ * label, group 2 the value, so the replacement is `$1: [REDACTED]`.
  */
 export const CHINESE_SECRET_RE = new RegExp(
   `(${CREDENTIAL_NOUNS})\\s*${CREDENTIAL_LINK}\\s*["']?([^\\s"'${VALUE_STOP},;]{4,})`,

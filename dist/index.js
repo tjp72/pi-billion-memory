@@ -472,71 +472,6 @@ async function expandStoredBlock(opts) {
 }
 
 // src/cjk.ts
-var CJK_STOPWORDS = [
-  "\u7684",
-  "\u4E86",
-  "\u5728",
-  "\u548C",
-  "\u662F",
-  "\u4E0E",
-  "\u53CA",
-  "\u6216",
-  "\u5BF9",
-  "\u88AB",
-  "\u628A",
-  "\u5C31",
-  "\u90FD",
-  "\u800C",
-  "\u4E5F",
-  "\u8FD8",
-  "\u4E4B",
-  "\u5176",
-  "\u7B49",
-  "\u6211",
-  "\u4F60",
-  "\u4ED6",
-  "\u5979",
-  "\u5B83",
-  "\u4EEC",
-  "\u8FD9",
-  "\u90A3",
-  "\u6709",
-  "\u65E0",
-  "\u4E3A",
-  "\u4EE5",
-  "\u4E8E",
-  "\u4ECE",
-  "\u5230",
-  "\u4F1A",
-  "\u8981",
-  "\u4E0D",
-  "\u6CA1",
-  "\u5F88",
-  "\u66F4",
-  "\u6700",
-  "\u5E76",
-  "\u4E14",
-  "\u4F46",
-  "\u82E5",
-  "\u5219",
-  "\u5373",
-  "\u53EF",
-  "\u80FD",
-  "\u9700",
-  "\u5E94",
-  "\u8BE5",
-  "\u4E0A",
-  "\u4E0B",
-  "\u4E2D",
-  "\u5185",
-  "\u5916",
-  "\u524D",
-  "\u540E",
-  "\u65F6",
-  "\u4E2A",
-  "\u4E9B",
-  "\u79CD"
-];
 var CREDENTIAL_NOUNS = "(?:\u5BC6\u7801|\u53E3\u4EE4|\u5BC6\u94A5|\u4EE4\u724C|\u79C1\u94A5|\u8BBF\u95EE\u5BC6\u94A5|api\u5BC6\u94A5)";
 var CREDENTIAL_LINK = "(?:\u662F|\u4E3A|[:=\uFF1A])";
 var VALUE_STOP = "\uFF0C\uFF1B";
@@ -634,6 +569,96 @@ function deprecatedHints(deprecated, text) {
   if (!hits.length) return "";
   return ["Vocabulary hints (runtime config, not repository content):", ...hits.map((h) => `- ${h}`)].join("\n");
 }
+var MAX_TABLE_CONCEPTS = 200;
+var MAX_TABLE_KEYWORDS = 10;
+var MAX_TABLE_FILTERED = 200;
+var MAX_TABLE_BYTES = 1024 * 1024;
+function scalarRecord(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out = {};
+  let n = 0;
+  for (const [k, v] of Object.entries(raw)) {
+    if (n >= 20) break;
+    const key = String(k).trim().slice(0, 60);
+    if (!key) continue;
+    if (typeof v === "string") out[key] = v.slice(0, 200);
+    else if (typeof v === "number" && Number.isFinite(v)) out[key] = v;
+    else if (typeof v === "boolean") out[key] = v;
+    else continue;
+    n++;
+  }
+  return n ? out : null;
+}
+function parseConceptTable(raw) {
+  const empty = {
+    concepts: {},
+    deprecated: {},
+    filtered: [],
+    evidence: {},
+    scope: null,
+    watermark: null
+  };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return empty;
+  const src = raw;
+  const concepts = {};
+  if (src.concepts && typeof src.concepts === "object" && !Array.isArray(src.concepts)) {
+    for (const [rawLabel, rawTerms] of Object.entries(src.concepts)) {
+      if (Object.keys(concepts).length >= MAX_TABLE_CONCEPTS) break;
+      const label = String(rawLabel).trim().slice(0, MAX_CONCEPT_LABEL_CHARS);
+      if (!label) continue;
+      const terms = [];
+      const seen = /* @__PURE__ */ new Set();
+      for (const rawTerm of Array.isArray(rawTerms) ? rawTerms : []) {
+        const term = cleanTerm(rawTerm);
+        if (!term) continue;
+        const key = term.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        terms.push(term);
+        if (terms.length >= MAX_TABLE_KEYWORDS) break;
+      }
+      if (terms.length) concepts[label] = terms;
+    }
+  }
+  const deprecated = {};
+  if (src.deprecated && typeof src.deprecated === "object" && !Array.isArray(src.deprecated)) {
+    for (const [rawKey, rawValue] of Object.entries(src.deprecated)) {
+      if (Object.keys(deprecated).length >= MAX_DEPRECATED_TERMS) break;
+      const key = String(rawKey).trim().slice(0, MAX_CONCEPT_TERM_CHARS);
+      if (!key) continue;
+      if (rawValue !== null && rawValue !== void 0 && typeof rawValue !== "string") continue;
+      deprecated[key] = typeof rawValue === "string" ? rawValue.trim().slice(0, MAX_CONCEPT_TERM_CHARS) : "";
+    }
+  }
+  const filtered = [];
+  if (Array.isArray(src.filtered)) {
+    const seen = /* @__PURE__ */ new Set();
+    for (const rawWord of src.filtered) {
+      const word = cleanTerm(rawWord);
+      if (!word || seen.has(word.toLowerCase())) continue;
+      seen.add(word.toLowerCase());
+      filtered.push(word);
+      if (filtered.length >= MAX_TABLE_FILTERED) break;
+    }
+  }
+  const evidence = {};
+  if (src.evidence && typeof src.evidence === "object" && !Array.isArray(src.evidence)) {
+    for (const [rawKey, rawValue] of Object.entries(src.evidence)) {
+      if (Object.keys(evidence).length >= 500) break;
+      const key = String(rawKey).trim().slice(0, MAX_CONCEPT_TERM_CHARS);
+      if (!key || typeof rawValue !== "number" || !Number.isFinite(rawValue) || rawValue < 0) continue;
+      evidence[key] = Math.floor(rawValue);
+    }
+  }
+  return {
+    concepts,
+    deprecated,
+    filtered,
+    evidence,
+    scope: scalarRecord(src.scope),
+    watermark: scalarRecord(src.watermark)
+  };
+}
 
 // src/extension.ts
 var HOME = os.homedir();
@@ -674,10 +699,21 @@ var DEFAULT_CFG = {
   /** Extra concept vocabulary for `memory_search` (`{ "name": ["term", ...] }`). */
   concepts: {},
   /**
+   * Optional concept table file produced by the elevation workflow
+   * (`{ "concepts": {...}, "deprecated": {...}, "filtered": [...], "scope": {...}, "watermark": {...} }`).
+   * Read-only user data, loaded on demand (mtime+size cached); inline `concepts` wins on conflicts.
+   */
+  conceptsFile: "",
+  /**
    * Deprecated vocabulary: `{ "old term": "replacement" }` (empty string = no replacement).
    * Runtime user data, read-only here; the extension never writes the config file.
    */
-  deprecated: {}
+  deprecated: {},
+  /**
+   * Words dropped from related-evidence tokens (function words and pure filler). User data: the
+   * extension ships no list, so related mode simply keeps everything when this is empty.
+   */
+  stopwords: []
 };
 var MAX_TOPIC_CHARS = 200;
 var PREVIEW_CHARS = 600;
@@ -694,6 +730,14 @@ var MAX_CWD_HINT = 1024;
 var MAX_QUERY_CHARS = 512;
 var MAX_QUERY_TOKENS = 32;
 var MAX_TIMELINE_ROWS = 2e4;
+var TIMELINE_PREVIEW_MAX_ROWS = 80;
+var ELEVATION_WINDOW_ROWS = 200;
+var ELEVATION_WINDOW_LIMIT = 10;
+var ELEVATION_ROWS_BRAKE = ELEVATION_WINDOW_ROWS * ELEVATION_WINDOW_LIMIT;
+var TIMELINE_PREVIEW_CHARS = 120;
+var MAX_CONCEPT_FILE_CHARS = 500;
+var MAX_STOPWORDS = 500;
+var MAX_STOPWORD_CHARS = 64;
 var EXPAND_MANIFEST_MAX = 300;
 var DEFAULT_RESULT_LIMIT = 6;
 var MAX_RESULT_LIMIT = 20;
@@ -764,6 +808,9 @@ function sanitizeCfg(over) {
     }
     out.concepts = clean;
   }
+  if (typeof over.conceptsFile === "string") {
+    out.conceptsFile = expandHome(over.conceptsFile.trim()).slice(0, MAX_CONCEPT_FILE_CHARS);
+  }
   if (over.deprecated && typeof over.deprecated === "object" && !Array.isArray(over.deprecated)) {
     const clean = {};
     let added = 0;
@@ -777,7 +824,74 @@ function sanitizeCfg(over) {
     }
     out.deprecated = clean;
   }
+  if (Array.isArray(over.stopwords)) {
+    const seen = /* @__PURE__ */ new Set();
+    const clean = [];
+    for (const raw of over.stopwords) {
+      if (clean.length >= MAX_STOPWORDS) break;
+      if (typeof raw !== "string") continue;
+      const word = raw.trim().slice(0, MAX_STOPWORD_CHARS);
+      const key = word.toLowerCase();
+      if (!word || seen.has(key)) continue;
+      seen.add(key);
+      clean.push(word);
+    }
+    out.stopwords = clean;
+  }
   return out;
+}
+function loadConceptTable() {
+  const file = cfg.conceptsFile;
+  if (!file) {
+    conceptTableCache = null;
+    return null;
+  }
+  try {
+    const st = fs.statSync(file);
+    if (conceptTableCache && conceptTableCache.path === file && conceptTableCache.mtimeMs === st.mtimeMs && conceptTableCache.size === st.size) {
+      return conceptTableCache;
+    }
+    if (st.size > MAX_TABLE_BYTES) {
+      const error = `conceptsFile is larger than ${MAX_TABLE_BYTES} B; ignored`;
+      logLine(error);
+      conceptTableCache = { path: file, mtimeMs: st.mtimeMs, size: st.size, table: parseConceptTable(null), error };
+      return conceptTableCache;
+    }
+    const table = parseConceptTable(JSON.parse(fs.readFileSync(file, "utf8")));
+    conceptTableCache = { path: file, mtimeMs: st.mtimeMs, size: st.size, table, error: null };
+    return conceptTableCache;
+  } catch (e) {
+    const error = `conceptsFile unreadable (${fileBase(file)}): ${withoutPaths(e.message) || "unknown error"}`;
+    let mtimeMs = 0;
+    let size = 0;
+    try {
+      const st = fs.statSync(file);
+      mtimeMs = st.mtimeMs;
+      size = st.size;
+    } catch {
+    }
+    if (mtimeMs === 0 && size === 0 && conceptTableCache && conceptTableCache.path === file && conceptTableCache.error) {
+      return conceptTableCache;
+    }
+    conceptTableCache = { path: file, mtimeMs, size, table: parseConceptTable(null), error };
+    logLine(error);
+    return conceptTableCache;
+  }
+}
+function effectiveVocabulary() {
+  const loaded = loadConceptTable();
+  const fileConcepts = loaded ? loaded.table.concepts : {};
+  const fileDeprecated = loaded ? loaded.table.deprecated : {};
+  const inlineConcepts = cfg.concepts && typeof cfg.concepts === "object" ? cfg.concepts : {};
+  const inlineDeprecated = cfg.deprecated && typeof cfg.deprecated === "object" ? cfg.deprecated : {};
+  const concepts = { ...fileConcepts, ...inlineConcepts };
+  const deprecated = { ...fileDeprecated, ...inlineDeprecated };
+  const fileHas = Boolean(
+    loaded && Object.keys(fileConcepts).length + Object.keys(fileDeprecated).length + (loaded.table.filtered?.length ?? 0) > 0
+  );
+  const inlineHas = Object.keys(inlineConcepts).length + Object.keys(inlineDeprecated).length > 0;
+  const source = inlineHas ? fileHas ? "config+file" : "config" : loaded ? "file" : "config";
+  return { concepts, deprecated, table: loaded ? loaded.table : null, error: loaded ? loaded.error : null, source };
 }
 var cfg = { ...DEFAULT_CFG };
 try {
@@ -1811,7 +1925,8 @@ var MemoryDb = class {
       rows: listed,
       listed: merged.length,
       total,
-      hiddenByLimit: explicit ? Math.max(0, merged.length - listed.length) : 0
+      hiddenByLimit: explicit ? Math.max(0, merged.length - listed.length) : 0,
+      preview: opts.preview === true && listed.length <= TIMELINE_PREVIEW_MAX_ROWS
     };
   }
   /**
@@ -1821,7 +1936,8 @@ var MemoryDb = class {
    */
   searchConcept(name, opts = {}) {
     this.open();
-    const found = findConcept(String(name || ""), cfg.concepts);
+    const vocabulary = opts.concepts && typeof opts.concepts === "object" ? opts.concepts : effectiveVocabulary().concepts;
+    const found = findConcept(String(name || ""), vocabulary);
     if (!found) {
       return { mode: "concept", unknown: true, name: String(name || ""), rows: [], total: 0 };
     }
@@ -2005,6 +2121,7 @@ var MemoryDb = class {
   }
 };
 var db = null;
+var conceptTableCache = null;
 var sessionGeneration = 0;
 var dbClosed = false;
 var backgroundScan = null;
@@ -2299,108 +2416,18 @@ function significantTokens(text, max = RELATED_MAX_TOKENS, cjkBigrams = false) {
   return [...out];
 }
 function contentTokens(text) {
-  return significantTokens(text, 60, true).filter((t) => !STOPWORDS.has(t.toLowerCase()));
+  const words = stopwordSet();
+  return significantTokens(text, 60, true).filter((t) => !words.has(t.toLowerCase()));
 }
-var STOPWORDS = /* @__PURE__ */ new Set([
-  "a",
-  "an",
-  "the",
-  "and",
-  "or",
-  "but",
-  "if",
-  "then",
-  "else",
-  "for",
-  "of",
-  "to",
-  "in",
-  "on",
-  "at",
-  "by",
-  "with",
-  "from",
-  "as",
-  "is",
-  "are",
-  "was",
-  "were",
-  "be",
-  "been",
-  "being",
-  "do",
-  "does",
-  "did",
-  "not",
-  "no",
-  "yes",
-  "it",
-  "its",
-  "this",
-  "that",
-  "these",
-  "those",
-  "you",
-  "your",
-  "we",
-  "our",
-  "they",
-  "their",
-  "he",
-  "she",
-  "his",
-  "her",
-  "him",
-  "them",
-  "us",
-  "i",
-  "me",
-  "my",
-  "so",
-  "than",
-  "too",
-  "very",
-  "can",
-  "could",
-  "should",
-  "would",
-  "will",
-  "shall",
-  "may",
-  "might",
-  "must",
-  "have",
-  "has",
-  "had",
-  "here",
-  "there",
-  "when",
-  "where",
-  "which",
-  "who",
-  "whom",
-  "what",
-  "how",
-  "why",
-  "all",
-  "any",
-  "each",
-  "some",
-  "such",
-  "into",
-  "over",
-  "under",
-  "again",
-  "more",
-  "most",
-  "other",
-  "new",
-  "via",
-  "etc",
-  "per",
-  "vs",
-  ...CJK_STOPWORDS
-]);
+function stopwordSet() {
+  const list = Array.isArray(cfg.stopwords) ? cfg.stopwords : [];
+  const key = list.join("\0");
+  if (!stopwordCache || stopwordCache.key !== key) {
+    stopwordCache = { key, set: new Set(list.map((w) => String(w).toLowerCase())) };
+  }
+  return stopwordCache.set;
+}
+var stopwordCache = null;
 function splitSentences(text) {
   return String(text || "").split(SENTENCE_DELIMITERS).map((s) => s.trim()).filter(Boolean);
 }
@@ -2513,6 +2540,13 @@ ${duplicateNote(r)}${r.matchedTerms ? `Matched terms: ${r.matchedTerms.join(", "
   });
   return head + parts.join("\n\n---\n\n");
 }
+function timelinePreview(summary) {
+  const text = redactOut(String(summary || "")).replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  const cut = text.search(SENTENCE_DELIMITERS);
+  const first = cut >= 0 ? text.slice(0, cut + 1) : text;
+  return first.length > TIMELINE_PREVIEW_CHARS ? first.slice(0, TIMELINE_PREVIEW_CHARS - 1) + "\u2026" : first;
+}
 function formatTimeline(res) {
   const rows = res.rows || [];
   if (res.note) return `No timeline: ${res.note}.`;
@@ -2520,7 +2554,10 @@ function formatTimeline(res) {
     return "No timeline entries. Try: 1) a broader query; 2) another project; 3) a wider time window (from/to or windowMinutes).";
   }
   const oneLine = (s) => String(s || "").replace(/\s+/g, " ").trim();
-  const line = (r, time) => `${time} \xB7 ${r.project || "?"} \xB7 ${r.blockId || "?"}${r.kind === "opencode" ? " [opencode]" : r.kind === "bili" ? " [bili]" : ""} \xB7 tier${r.tier ?? "?"} \xB7 ${redactOut(oneLine(r.topic)) || "(no topic)"}${r.duplicateCount ? ` (+${r.duplicateCount})` : ""}`;
+  const line = (r, time) => {
+    const preview = res.preview ? timelinePreview(r.summary) : "";
+    return `${time} \xB7 ${r.project || "?"} \xB7 ${r.blockId || "?"}${r.kind === "opencode" ? " [opencode]" : r.kind === "bili" ? " [bili]" : ""} \xB7 tier${r.tier ?? "?"} \xB7 ${redactOut(oneLine(r.topic)) || "(no topic)"}${r.duplicateCount ? ` (+${r.duplicateCount})` : ""}${preview ? ` \u2014 ${preview}` : ""}`;
+  };
   const lines = [];
   const listed = Number.isInteger(res.listed) ? res.listed : rows.length;
   const total = Number.isInteger(res.total) ? res.total : listed;
@@ -2556,7 +2593,7 @@ function formatTimeline(res) {
   }
   return lines.join("\n");
 }
-function formatConcepts(list, deprecated) {
+function formatConcepts(list, deprecated, meta) {
   const entries = list || [];
   const dep = deprecated && typeof deprecated === "object" && !Array.isArray(deprecated) ? Object.entries(deprecated) : [];
   if (!entries.length && !dep.length) {
@@ -2571,6 +2608,16 @@ function formatConcepts(list, deprecated) {
   if (dep.length) {
     lines.push("", `Deprecated terms (${dep.length}):`);
     for (const [k, v] of dep) lines.push(`  ${k} \u2192 ${typeof v === "string" && v ? v : "(no replacement)"}`);
+  }
+  if (meta) {
+    lines.push("");
+    lines.push(`Source: ${meta.source || "config"}`);
+    if (meta.file) lines.push(`File: ${meta.file}`);
+    if (meta.error) lines.push(`Note: ${meta.error}`);
+    if (meta.scope) lines.push(`Scope: ${JSON.stringify(meta.scope).slice(0, 200)}`);
+    if (meta.watermark) lines.push(`Watermark: ${JSON.stringify(meta.watermark).slice(0, 200)}`);
+    if (typeof meta.keywords === "number") lines.push(`Keywords: ${meta.keywords}`);
+    if (typeof meta.filtered === "number") lines.push(`Filtered words: ${meta.filtered}`);
   }
   lines.push("");
   lines.push(
@@ -2605,6 +2652,25 @@ function formatBlockDetail(row) {
   if (row.topic) lines.push(`Topic: ${redactOut(row.topic)}`);
   lines.push("");
   lines.push(redactOut(row.summary || "(no stored summary)"));
+  return lines.join("\n");
+}
+function formatElevationPlan(plan) {
+  const budget = plan.brake ? `STOP \u2014 ${plan.rows.toLocaleString()} rows is past the hard brake (${ELEVATION_ROWS_BRAKE.toLocaleString()} rows / ${ELEVATION_WINDOW_LIMIT} windows); ask the user before a whole-library pass.` : `OK \u2014 ${Math.max(0, ELEVATION_WINDOW_LIMIT - plan.windows)} window(s) left before the brake (${ELEVATION_ROWS_BRAKE.toLocaleString()} rows).`;
+  const wm = plan.watermark ? plan.watermark.lastCreatedAt != null ? `watermark ${typeof plan.watermark.lastCreatedAt === "number" ? fmtTs(plan.watermark.lastCreatedAt) : plan.watermark.lastCreatedAt}` + (plan.watermark.lastBlockSeq != null ? ` \xB7 block ${plan.watermark.lastBlockSeq}` : "") : "watermark unset" : "not configured";
+  const lines = [
+    `Elevation plan \u2014 scope: ${plan.scope}`,
+    ``,
+    `Library: ${plan.rows.toLocaleString()} merged row(s) \u2192 ${plan.windows} window(s) of ${ELEVATION_WINDOW_ROWS} rows` + (plan.capped ? " (count capped by the timeline ceiling)" : ""),
+    `Budget: ${budget}`,
+    `Vocabulary: ${plan.conceptsFile ? fileBase(plan.conceptsFile) : "no conceptsFile in pi-billion-memory.json"} \xB7 ${wm}` + (plan.stale != null ? ` \xB7 ${plan.stale} row(s) newer than the watermark` : ""),
+    ``,
+    `Next steps`,
+    `1. Read the next window: memory_search mode 'timeline' (start from the watermark date); preview: true is honoured only for windows of \u2264 ${TIMELINE_PREVIEW_MAX_ROWS} rows.`,
+    `2. Deconstruct \u2192 cluster \u2192 keywordize \u2192 filter (rules K1\u2013K6, docs/ELEVATION.md).`,
+    `3. Verify every candidate keyword with a scoped search before recording it.`,
+    `4. Record concepts / deprecated / filtered in pi-billion-memory.json \u2014 user data, never commit it.`,
+    `5. Repeat until the brake trips, then ask the user.`
+  ];
   return lines.join("\n");
 }
 function formatExpansion(row, sessionFile, res, mode) {
@@ -2679,7 +2745,15 @@ var MEMORY_SEARCH_PARAMETERS = {
     },
     block: {
       type: "string",
-      description: "Anchor block id for mode 'timeline' or 'related', e.g. 'b2' (from a previous result)"
+      description: "Block id from a timeline or search line (with 'detail: true' it opens that block's stored summary); also the anchor for mode 'timeline' or 'related', e.g. 'b2'"
+    },
+    detail: {
+      type: "boolean",
+      description: "Read one stored block: requires 'block' (from a timeline or search line) and returns its redacted topic+summary; pass 'source' when the id exists in several sources"
+    },
+    preview: {
+      type: "boolean",
+      description: `Timeline only: add a bounded first sentence of each summary; honoured only for windows of at most ${TIMELINE_PREVIEW_MAX_ROWS} entries (larger windows stay compact)`
     },
     source: {
       type: "string",
@@ -2699,20 +2773,6 @@ var MEMORY_SEARCH_PARAMETERS = {
     },
     reasons: { type: "boolean", description: "Include relation reason labels for mode 'related' (always on for now)" }
   }
-};
-var MEMORY_GET_PARAMETERS = {
-  type: "object",
-  properties: {
-    block: {
-      type: "string",
-      description: "Block id from a memory_search or timeline line, e.g. 'b2'"
-    },
-    source: {
-      type: "string",
-      description: "Optional disambiguator when the same block id exists in several sources (substring of the 'Source:' label or the project)"
-    }
-  },
-  required: ["block"]
 };
 var MEMORY_EXPAND_PARAMETERS = {
   type: "object",
@@ -2800,7 +2860,9 @@ function readMemorySearchParams(raw) {
     windowMinutes: int(value.windowMinutes),
     reasons: value.reasons !== false,
     concept,
-    decompose: value.decompose === true
+    decompose: value.decompose === true,
+    detail: value.detail === true,
+    preview: value.preview === true
   };
 }
 async function factory(pi) {
@@ -2882,10 +2944,10 @@ async function factory(pi) {
     promptGuidelines: [
       "Use memory_search when the user asks about past work, conclusions, decisions, or context from earlier sessions or from earlier in this session after compression.",
       "For Chinese queries shorter than 3 characters, memory_search falls back to substring matching automatically \u2014 still pass the query as-is.",
-      "Use mode 'timeline' for a chronological catalog of matches (one line per memory, full, never truncated); follow a line with memory_get to read that block's stored summary.",
+      "Use mode 'timeline' for a chronological catalog of matches (one line per memory, full, never truncated); open a line's stored summary with the same tool: block '<id>' + detail: true (pass 'source' when the id exists in several sources).",
       "Use mode 'related' with a query (the search words) to find blocks whose sentence containing those words is related; pass 'block' to anchor on a specific block.",
       "For a concept (one name that expands to the concrete terms the corpus uses) pass the 'concept' parameter; concepts come from the `concepts` config key - the extension ships none - and mode 'concepts' lists them.",
-      "Keep the shared vocabulary current: when the corpus names a mechanism differently from the user, record the mapping under `concepts` in pi-billion-memory.json; when a term is renamed or retired, record it under `deprecated` with its replacement (empty = none). Vocabulary is runtime user data - never commit it, and never hardcode project or personal terms in the repository.",
+      "Vocabulary is user data: record concept mappings under `concepts` and renamed/retired terms under `deprecated` in pi-billion-memory.json; never commit vocabulary, and never hardcode project or personal terms in the repository.",
       "For a multi-part requirement set decompose: true so each clause is searched separately and the hits are grouped per clause.",
       "In timeline mode pass limit: 0 for the full catalog; a positive limit keeps the newest N entries. from/to accept ISO 8601 strings (date-only = local day)."
     ],
@@ -2894,19 +2956,73 @@ async function factory(pi) {
       try {
         await scanSources();
         const p = readMemorySearchParams(params);
-        const vhint = deprecatedHints(cfg.deprecated, p.concept || p.query);
+        const vocab = effectiveVocabulary();
+        const vhint = deprecatedHints(vocab.deprecated, [p.concept, p.query].filter(Boolean).join(" "));
         const db2 = getDb();
-        if (p.mode === "concepts") {
-          const catalog = conceptCatalog(cfg.concepts);
+        if (p.detail) {
+          if (!p.block) {
+            return {
+              content: [
+                { type: "text", text: "memory_search: 'detail: true' needs 'block' (from a timeline or search line)." }
+              ],
+              details: { mode: "error", hits: 0, dbPath: fileBase(cfg.dbPath) }
+            };
+          }
+          const res2 = db2.getBlock(p.block, p.source);
+          if (!res2.found) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `memory_search: no stored block '${p.block}'${p.source ? ` matching '${p.source}'` : ""}.`
+                }
+              ],
+              details: { mode: "missing", hits: 0, dbPath: fileBase(cfg.dbPath) }
+            };
+          }
+          if (res2.total > 1) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `memory_search: ${res2.total} blocks share the id '${p.block}'. Pass 'source' to pick one. Newest: ${formatBlockDetail(res2.row)}`
+                }
+              ],
+              details: { mode: "ambiguous", hits: res2.total, dbPath: fileBase(cfg.dbPath) }
+            };
+          }
           return {
-            content: [{ type: "text", text: formatConcepts(catalog, cfg.deprecated) }],
+            content: [{ type: "text", text: formatBlockDetail(res2.row) }],
+            details: { mode: "block", hits: 1, dbPath: fileBase(cfg.dbPath) }
+          };
+        }
+        if (p.mode === "concepts") {
+          const catalog = conceptCatalog(vocab.concepts);
+          return {
+            content: [
+              {
+                type: "text",
+                text: formatConcepts(catalog, vocab.deprecated, {
+                  source: vocab.source,
+                  file: cfg.conceptsFile ? fileBase(cfg.conceptsFile) : null,
+                  error: vocab.error,
+                  scope: vocab.table?.scope || null,
+                  watermark: vocab.table?.watermark || null,
+                  keywords: Object.values(vocab.concepts).reduce(
+                    (n, terms) => n + (Array.isArray(terms) ? terms.length : 0),
+                    0
+                  ),
+                  filtered: vocab.table?.filtered.length ?? 0
+                })
+              }
+            ],
             details: { mode: "concepts", hits: catalog.length, dbPath: fileBase(cfg.dbPath) }
           };
         }
         if (p.concept) {
-          const res2 = db2.searchConcept(p.concept, { project: p.project, limit: p.limit });
+          const res2 = db2.searchConcept(p.concept, { project: p.project, limit: p.limit, concepts: vocab.concepts });
           if (res2.unknown) {
-            const known = conceptCatalog(cfg.concepts).map((c) => c.label).join(", ");
+            const known = conceptCatalog(vocab.concepts).map((c) => c.label).join(", ");
             return {
               content: [
                 {
@@ -2934,10 +3050,11 @@ Terms: ${res2.terms.join(", ")}
             source: p.source,
             from: p.from,
             to: p.to,
-            windowMinutes: p.windowMinutes
+            windowMinutes: p.windowMinutes,
+            preview: p.preview
           });
           return {
-            content: [{ type: "text", text: formatTimeline(res2) }],
+            content: [{ type: "text", text: formatTimeline(res2) + (vhint ? "\n\n" + vhint : "") }],
             details: {
               mode: "timeline",
               hits: res2.rows.length,
@@ -2954,7 +3071,7 @@ Terms: ${res2.terms.join(", ")}
             source: p.source
           });
           return {
-            content: [{ type: "text", text: formatRelated(res2) }],
+            content: [{ type: "text", text: formatRelated(res2) + (vhint ? "\n\n" + vhint : "") }],
             details: { mode: "related", hits: res2.rows.length, dbPath: fileBase(cfg.dbPath) }
           };
         }
@@ -2967,9 +3084,14 @@ Terms: ${res2.terms.join(", ")}
 ` + formatResults(db2.search(c, { project: p.project, limit: per }))
             );
             return {
-              content: [{ type: "text", text: `Decomposed into ${clauses.length} clauses:
+              content: [
+                {
+                  type: "text",
+                  text: `Decomposed into ${clauses.length} clauses:
 
-` + parts.join("\n\n") }],
+` + parts.join("\n\n") + (vhint ? "\n\n" + vhint : "")
+                }
+              ],
               details: { mode: "decompose", hits: clauses.length, dbPath: fileBase(cfg.dbPath) }
             };
           }
@@ -2990,62 +3112,6 @@ Terms: ${res2.terms.join(", ")}
             }
           ],
           details: { mode: "error", hits: 0, dbPath: fileBase(cfg.dbPath) }
-        };
-      }
-    }
-  });
-  pi.registerTool({
-    name: "memory_get",
-    label: "Memory Get",
-    description: "Open one memory line from a memory_search or timeline result and read its stored summary by block id. Read-only and always available: it returns the already-redacted stored topic+summary, never raw session messages (use the opt-in memory_expand for originals).",
-    promptSnippet: "Open one memory line (block id) and read its stored summary",
-    promptGuidelines: [
-      "After a timeline/catalog line, call memory_get with its block id to read the stored summary; pass 'source' when the id exists in several sources."
-    ],
-    parameters: MEMORY_GET_PARAMETERS,
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      try {
-        const value = params && typeof params === "object" ? params : {};
-        const block = typeof value.block === "string" ? value.block.trim() : "";
-        const source = typeof value.source === "string" && value.source.trim() ? value.source.trim() : null;
-        if (!block) {
-          return {
-            content: [{ type: "text", text: "memory_get: 'block' is required." }],
-            details: { mode: "error", hits: 0 }
-          };
-        }
-        const res = getDb().getBlock(block, source);
-        if (!res.found) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `memory_get: no stored block '${block}'${source ? ` matching '${source}'` : ""}.`
-              }
-            ],
-            details: { mode: "missing", hits: 0 }
-          };
-        }
-        if (res.total > 1) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `memory_get: ${res.total} blocks share the id '${block}'. Pass 'source' to pick one. Newest: ${formatBlockDetail(res.row)}`
-              }
-            ],
-            details: { mode: "ambiguous", hits: res.total }
-          };
-        }
-        return {
-          content: [{ type: "text", text: formatBlockDetail(res.row) }],
-          details: { mode: "block", hits: 1, dbPath: fileBase(cfg.dbPath) }
-        };
-      } catch (e) {
-        logLine(`memory_get error: ${withoutPaths(e.stack || e.message)}`);
-        return {
-          content: [{ type: "text", text: `memory_get failed: ${withoutPaths(e.message) || "unknown error"}` }],
-          details: { mode: "error", hits: 0 }
         };
       }
     }
@@ -3192,7 +3258,7 @@ ${list}`
     });
   }
   pi.registerCommand("memory", {
-    description: "pi-billion-memory: /memory (status), rescan (force rescan), sources (show allow-list), prune <days> (delete blocks older than N days)",
+    description: "pi-billion-memory: /memory (status), rescan (force rescan), sources (show allow-list), prune <days> (delete blocks older than N days), elevation [query] (keyword-table work package)",
     handler: async (args, ctx) => {
       try {
         const want = String(args || "").trim();
@@ -3221,6 +3287,28 @@ Edit ${cfg.sourcesPath || DEFAULT_CFG.sourcesPath} and run /memory rescan.` : `N
           }
           const p = getDb().prune(keepDays);
           const msg2 = `Prune done: removed ${p.removedBlocks} block(s) / ${p.removedSources} empty source(s), ${p.remainingBlocks} remain (kept ${keepDays} day(s))`;
+          ctx.ui?.notify?.(msg2, "info");
+          return;
+        }
+        if (want === "elevation" || want.startsWith("elevation ")) {
+          const scope = want.slice("elevation".length).trim();
+          const res = getDb().timeline(scope || void 0, { limit: 0 });
+          const vocab = effectiveVocabulary();
+          const wm = vocab.table && vocab.table.watermark ? vocab.table.watermark : null;
+          let stale = null;
+          if (wm && wm.lastCreatedAt != null) {
+            stale = getDb().timeline(void 0, { from: wm.lastCreatedAt, limit: 0 }).total;
+          }
+          const msg2 = formatElevationPlan({
+            scope: scope || "all projects",
+            rows: res.total,
+            windows: Math.ceil(res.total / ELEVATION_WINDOW_ROWS),
+            brake: res.total > ELEVATION_ROWS_BRAKE,
+            capped: Boolean(res.note),
+            watermark: wm ? { lastCreatedAt: wm.lastCreatedAt ?? null, lastBlockSeq: wm.lastBlockSeq ?? null } : null,
+            stale,
+            conceptsFile: cfg.conceptsFile || null
+          });
           ctx.ui?.notify?.(msg2, "info");
           return;
         }

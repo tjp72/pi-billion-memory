@@ -81,13 +81,13 @@ affiliated with, endorsed by, or a fork of**
   ranks by relevance; `timeline` returns the **complete catalog** (one line per
   memory: time, project, block id, tier, topic — date-grouped, never truncated);
   `related` compares the **sentence containing the query words** in each block
-  (stopwords and data-driven IDF suppress generic-token noise; compression
+  (configured stopwords and a data-driven IDF suppress generic-token noise; compression
   lineage/run/neighbor are structural evidence) and shows that evidence
   sentence; `concepts` lists the concepts you configured. Timeline bounds (`from`/`to`)
   accept ISO 8601 strings (date-only = that local day) or epoch ms, and are
   displayed in local time; `limit: 0` returns the full catalog, a positive limit
   keeps the newest N and reports the real total. Follow a catalog line with
-  `memory_get` to read the stored summary.
+  `block` + `detail: true` to read the stored summary.
 - **Concept search**: pass `concept` — one name that expands to the concrete
   terms the corpus actually uses. The vocabulary is **yours**: define it under
   `"concepts": {"name": ["term", …]}` in `pi-billion-memory.json` (the
@@ -103,9 +103,9 @@ affiliated with, endorsed by, or a fork of**
 - **Requirement decomposition**: `decompose: true` splits a conjunctive query
   (`，`, `；`, `and`, …) into clauses and searches each one separately, grouping
   the hits per clause instead of ANDing every token into a single query.
-- **Read one memory**: `memory_get` opens a catalog/search line by block id and
-  returns the stored (already-redacted) topic + summary; it never reads raw
-  session messages.
+- **Read one memory**: `memory_search` with `block` + `detail: true` opens a
+  catalog/search line and returns the stored (already-redacted) topic + summary;
+  it never reads raw session messages.
 - **Exact-duplicate merge**: a memory copied across source files (fork/copy
   artifacts) is shown once and lists its alternate sources; blocks from the same
   source (multi-tier parent/child) are never collapsed.
@@ -194,6 +194,8 @@ Then in a pi session:
 - `/memory sources` — print the active allow-list.
 - `/memory rescan` — force a full allow-list rescan.
 - `/memory prune <days>` — durably delete blocks older than N days.
+- `/memory elevation [query]` — print the keyword-table work package (rows, windows, budget
+  brake, watermark) for the `docs/ELEVATION.md` workflow; numbers only.
 - Ask the model something like "what did I work on before?" so it can call
   `memory_search`.
 
@@ -278,7 +280,11 @@ bili sessions (<host>_<hash>.json)┘                                 (SQLite + 
   "expandEnabled": false,
   "expandMaxChars": 40000,
   "expandMaxMessages": 200,
-  "expandMaxReadBytes": 33554432
+  "expandMaxReadBytes": 33554432,
+  "concepts": {},
+  "deprecated": {},
+  "stopwords": [],
+  "conceptsFile": ""
 }
 ```
 
@@ -305,6 +311,13 @@ bili sessions (<host>_<hash>.json)┘                                 (SQLite + 
 - `expandMaxReadBytes`: hard cap on bytes read from a session file by one
   `memory_expand` call (default 33554432, i.e. 32 MB). The file is opened and read
   in bounded chunks, so a larger session file is never slurped whole first.
+- `concepts`: inline concept vocabulary (`{"name": ["term", …]}`); ships empty.
+- `deprecated`: retired terms (`{"old": "new", "gone": ""}`); only produces hints.
+- `stopwords`: words dropped from related-evidence tokens (function words, filler). User data:
+  the bundle ships no list, so related mode keeps every token when this is empty.
+- `conceptsFile`: optional JSON table produced by the elevation workflow
+  (`concepts`, `deprecated`, `filtered`, `scope`, `watermark`). Read-only, `~`
+  expanded, mtime+size cached, capped at 1 MB; inline `concepts` win on conflicts.
 
 ## Allow-list sources
 
@@ -367,7 +380,13 @@ Run `/memory sources` to confirm, then `/memory rescan`.
 - `mode: "timeline"` accepts `from`/`to` as ISO 8601 strings (a date-only value
   means local midnight/day end) or epoch ms; an unparsable bound is an error, not
   a silently ignored filter. `limit: 0` returns the full catalog, a positive
-  limit keeps the newest N and adds `listed`/`total` accounting.
+  limit keeps the newest N and adds `listed`/`total` accounting. `preview: true`
+  appends one bounded summary sentence per line, but only for windows of at most
+  80 entries.
+- `block` + `detail: true` reads one stored block's topic+summary; pass `source`
+  when the id exists in several sources. `mode: "concepts"` also reports the
+  vocabulary source (`config`, `file`, `config+file`), its scope/watermark, and
+  the keyword and filtered-word counts.
 - Queries of **3+ characters** use the FTS5 `trigram` index, which matches
   Chinese substrings, mixed Chinese/English text, and code identifiers.
 - Queries of **1–2 characters** use AND-ed `LIKE` matches against both

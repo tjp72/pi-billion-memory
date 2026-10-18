@@ -11,14 +11,8 @@
  * examples, or labels here; put those in the English module that consumes them.
  */
 /**
- * Function words dropped from related-evidence tokens. Only function words belong here: content
- * words (even short ones) are kept, because removing them damages the evidence sentence. Tokens
- * that are merely ubiquitous for one query are demoted by the data-driven DF gate instead.
- */
-export declare const CJK_STOPWORDS: readonly string[];
-/**
- * `密码：xxx` / `令牌是 xxx` — a Chinese credential assignment. Group 1 is the label, group 2 the
- * value, so the replacement is `$1: [REDACTED]`.
+ * Chinese credential assignment (e.g. a label followed by a colon and a value). Group 1 is the
+ * label, group 2 the value, so the replacement is `$1: [REDACTED]`.
  */
 export declare const CHINESE_SECRET_RE: RegExp;
 /** Sentence terminators: ASCII and CJK full stops and question/exclamation marks, plus newlines. */

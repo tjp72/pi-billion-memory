@@ -39,7 +39,7 @@ Concretely:
   `www.` hosts; URLs become `[REDACTED_URL]`). It must never be disabled, bypassed, or
   weakened; tests must prove both direct redaction and that an ingested secret is not
   searchable. **Model-facing output is filtered again** (search results, timeline topic, related
-  evidence, `memory_get`) as defense-in-depth, because rows ingested before the current filter
+  evidence, `block`+`detail` reads) as defense-in-depth, because rows ingested before the current filter
   (or copied in) are never rewritten and may hold a value the filter would now catch.
 
 ## 2. Language — English only, with two sanctioned exceptions
@@ -114,14 +114,15 @@ Coverage that must be preserved and extended, never removed:
   rejects below-minimum/over-window evidence, and keeps the pure-LIKE query plan unchanged;
   cross-source exact duplicates merge into one result while same-source parent/child blocks do not;
   `excludePaths` keeps matching sources out of the store.
-- **memory_get**: returns a stored summary and reports a missing/ambiguous block.
+- **memory_search(block, detail)**: returns a stored summary and reports a missing/ambiguous
+  block; `memory_get` was folded into this path (one tool surface).
 
 Fixture conventions: sessions live under encoded-dir names like `--home-dev-ProjA--` with a
 matching neutral cwd (`/home/dev/ProjA` -> project `ProjA`). Keep it that way — no real paths.
 Additional gates:
 
 - `npm run e2e` loads the built `dist/index.js`, asserts the default export is a function,
-  checks that the factory registers the three session events, `memory_search`, `memory_get`, and
+  checks that the factory registers the three session events, `memory_search`, and
   `/memory` — and that it does **not** register `memory_expand` under the default config — then
   re-imports the bundle with `expandEnabled: true` to prove the expansion tool appears only when
   opted in, and opens the SQLite store through `node:sqlite` in an isolated temporary home.
@@ -194,7 +195,7 @@ The design is deliberately minimal; preserve these properties:
   grouped, never truncated, with unplaceable rows in a trailing `unplaced` section; `limit` is an
   explicit caller cap and any hiding must be reported, never silent. Never fabricate or display an
   estimated wall-clock time (show `--:--`). `related` needs a query and compares the sentence that
-  contains the query words (bounded min/max); it removes only function-word stopwords, demotes
+  contains the query words (bounded min/max); it removes only the configured `stopwords` (user data; the bundle ships none), demotes
   generic tokens with a data-driven IDF gate (never deleting content words), keeps compression
   lineage (`direct_block_ids`)/`run_id`/neighbor as structural evidence, drops zero-evidence
   candidates, and shows the evidence sentence. All modes stay offline, bounded, and dependency-free.
@@ -207,8 +208,13 @@ The design is deliberately minimal; preserve these properties:
   string = none) is read-only runtime data: a query containing a deprecated term appends a bounded
   `Vocabulary hints` line. `decompose` splits only on explicit conjunctive
   punctuation, and each clause is an independent bounded search — never a second LLM pass.
-- **memory_get**: read-only, always registered; returns one stored block's topic+summary by id
-  (never raw session messages) with the same ambiguity handling as expansion.
+- **Block detail**: `memory_search` with `block` + `detail: true` returns one stored block's
+  topic+summary by id (never raw session messages) with the same ambiguity handling as expansion.
+- **Concept table file**: `conceptsFile` is optional read-only user data (mtime+size cached, 1 MB
+  cap, `~` expanded); `parseConceptTable` bounds every field, inline `concepts` win on conflicts,
+  and `mode: "concepts"` reports source/scope/watermark. The repo ships no vocabulary.
+- **Timeline preview**: `preview: true` appends one bounded (120-char) redacted sentence per line,
+  and only for windows of at most `TIMELINE_PREVIEW_MAX_ROWS` (80) entries.
 - **No silent data loss**: `prune()` (manual, via `/memory prune <days>`) is the only deletion
   mechanism; no automatic expiry. Prune is durable via tombstones, and the watermark ledger keeps
   pruned-but-unchanged sources skipped, so a rescan cannot resurrect them. Ingestion-parameter

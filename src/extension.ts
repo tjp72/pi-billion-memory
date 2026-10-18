@@ -51,14 +51,17 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { expandBlock, expandStoredBlock, isSyntheticRef, parseMsgIds } from "./expand.js";
-import { CJK_STOPWORDS, CHINESE_SECRET_RE, CLAUSE_SEPARATORS, SENTENCE_DELIMITERS } from "./cjk.js";
+import { CHINESE_SECRET_RE, CLAUSE_SEPARATORS, SENTENCE_DELIMITERS } from "./cjk.js";
 import {
   conceptCatalog,
   deprecatedHints,
   findConcept,
   MAX_CONCEPT_TERM_CHARS,
   MAX_DEPRECATED_TERMS,
+  MAX_TABLE_BYTES,
+  parseConceptTable,
 } from "./concepts.js";
+import type { ConceptTable } from "./concepts.js";
 
 // ---------------------------------------------------------------------------
 // Constants / config / logging
@@ -103,10 +106,21 @@ const DEFAULT_CFG = {
   /** Extra concept vocabulary for `memory_search` (`{ "name": ["term", ...] }`). */
   concepts: {},
   /**
+   * Optional concept table file produced by the elevation workflow
+   * (`{ "concepts": {...}, "deprecated": {...}, "filtered": [...], "scope": {...}, "watermark": {...} }`).
+   * Read-only user data, loaded on demand (mtime+size cached); inline `concepts` wins on conflicts.
+   */
+  conceptsFile: "",
+  /**
    * Deprecated vocabulary: `{ "old term": "replacement" }` (empty string = no replacement).
    * Runtime user data, read-only here; the extension never writes the config file.
    */
   deprecated: {},
+  /**
+   * Words dropped from related-evidence tokens (function words and pure filler). User data: the
+   * extension ships no list, so related mode simply keeps everything when this is empty.
+   */
+  stopwords: [],
 };
 
 const MAX_TOPIC_CHARS = 200;
@@ -131,6 +145,17 @@ const MAX_QUERY_CHARS = 512;
 const MAX_QUERY_TOKENS = 32;
 /** Hard safety ceiling for the full catalog. Exceeding it refuses with a hint instead of OOM. */
 const MAX_TIMELINE_ROWS = 20000;
+/** `preview: true` renders only for windows at most this large, so one response stays bounded. */
+export const TIMELINE_PREVIEW_MAX_ROWS = 80;
+/** Keyword-table workflow budget (docs/ELEVATION.md §3.1): 200 rows per window, hard stop above 2,000. */
+export const ELEVATION_WINDOW_ROWS = 200;
+export const ELEVATION_WINDOW_LIMIT = 10;
+export const ELEVATION_ROWS_BRAKE = ELEVATION_WINDOW_ROWS * ELEVATION_WINDOW_LIMIT;
+const TIMELINE_PREVIEW_CHARS = 120;
+/** Cap on the configured concepts-file path. */
+const MAX_CONCEPT_FILE_CHARS = 500;
+export const MAX_STOPWORDS = 500;
+const MAX_STOPWORD_CHARS = 64;
 /** Max manifest lines rendered by a `list` expansion. */
 const EXPAND_MANIFEST_MAX = 300;
 const DEFAULT_RESULT_LIMIT = 6;
@@ -254,6 +279,9 @@ export function sanitizeCfg(over) {
     }
     out.concepts = clean;
   }
+  if (typeof over.conceptsFile === "string") {
+    out.conceptsFile = expandHome(over.conceptsFile.trim()).slice(0, MAX_CONCEPT_FILE_CHARS);
+  }
   if (over.deprecated && typeof over.deprecated === "object" && !Array.isArray(over.deprecated)) {
     const clean: Record<string, string> = {};
     let added = 0;
@@ -269,7 +297,99 @@ export function sanitizeCfg(over) {
     }
     out.deprecated = clean;
   }
+  if (Array.isArray(over.stopwords)) {
+    const seen = new Set<string>();
+    const clean: string[] = [];
+    for (const raw of over.stopwords) {
+      if (clean.length >= MAX_STOPWORDS) break;
+      if (typeof raw !== "string") continue;
+      const word = raw.trim().slice(0, MAX_STOPWORD_CHARS);
+      const key = word.toLowerCase();
+      if (!word || seen.has(key)) continue;
+      seen.add(key);
+      clean.push(word);
+    }
+    out.stopwords = clean;
+  }
   return out;
+}
+
+/**
+ * Load the concept table named by `conceptsFile` (read-only user data, mtime+size cached).
+ * Returns null when no file is configured; a broken file degrades to an empty table plus a note.
+ */
+export function loadConceptTable() {
+  const file = cfg.conceptsFile;
+  if (!file) {
+    conceptTableCache = null;
+    return null;
+  }
+  try {
+    const st = fs.statSync(file);
+    if (
+      conceptTableCache &&
+      conceptTableCache.path === file &&
+      conceptTableCache.mtimeMs === st.mtimeMs &&
+      conceptTableCache.size === st.size
+    ) {
+      return conceptTableCache;
+    }
+    if (st.size > MAX_TABLE_BYTES) {
+      const error = `conceptsFile is larger than ${MAX_TABLE_BYTES} B; ignored`;
+      logLine(error);
+      conceptTableCache = { path: file, mtimeMs: st.mtimeMs, size: st.size, table: parseConceptTable(null), error };
+      return conceptTableCache;
+    }
+    const table = parseConceptTable(JSON.parse(fs.readFileSync(file, "utf8")));
+    conceptTableCache = { path: file, mtimeMs: st.mtimeMs, size: st.size, table, error: null };
+    return conceptTableCache;
+  } catch (e) {
+    const error = `conceptsFile unreadable (${fileBase(file)}): ${withoutPaths(e.message) || "unknown error"}`;
+    // Cache the failure too (real mtime+size when the file is still stat-able, a stable 0/0 entry
+    // otherwise) so a broken conceptsFile is re-read and re-logged at most once per change,
+    // not on every memory_search call.
+    let mtimeMs = 0;
+    let size = 0;
+    try {
+      const st = fs.statSync(file);
+      mtimeMs = st.mtimeMs;
+      size = st.size;
+    } catch {
+      // File disappeared: reuse the previous error entry when it was for this path.
+    }
+    if (
+      mtimeMs === 0 &&
+      size === 0 &&
+      conceptTableCache &&
+      conceptTableCache.path === file &&
+      conceptTableCache.error
+    ) {
+      return conceptTableCache;
+    }
+    conceptTableCache = { path: file, mtimeMs, size, table: parseConceptTable(null), error };
+    logLine(error);
+    return conceptTableCache;
+  }
+}
+
+/** Merge inline `concepts`/`deprecated` with the concepts file (inline wins on conflicts). */
+export function effectiveVocabulary() {
+  const loaded = loadConceptTable();
+  const fileConcepts = loaded ? loaded.table.concepts : {};
+  const fileDeprecated = loaded ? loaded.table.deprecated : {};
+  const inlineConcepts = cfg.concepts && typeof cfg.concepts === "object" ? cfg.concepts : {};
+  const inlineDeprecated = cfg.deprecated && typeof cfg.deprecated === "object" ? cfg.deprecated : {};
+  const concepts = { ...fileConcepts, ...inlineConcepts };
+  const deprecated = { ...fileDeprecated, ...inlineDeprecated };
+  // The source label reflects what each side actually contributes, so a configured-but-empty file
+  // does not claim a "config+file" mix (and vice versa).
+  const fileHas = Boolean(
+    loaded &&
+    Object.keys(fileConcepts).length + Object.keys(fileDeprecated).length + (loaded.table.filtered?.length ?? 0) > 0,
+  );
+  const inlineHas = Object.keys(inlineConcepts).length + Object.keys(inlineDeprecated).length > 0;
+  const source = inlineHas ? (fileHas ? "config+file" : "config") : loaded ? "file" : "config";
+  return { concepts, deprecated, table: loaded ? loaded.table : null, error: loaded ? loaded.error : null, source };
 }
 
 let cfg = { ...DEFAULT_CFG };
@@ -1592,6 +1712,7 @@ export class MemoryDb {
       listed: merged.length,
       total,
       hiddenByLimit: explicit ? Math.max(0, merged.length - listed.length) : 0,
+      preview: opts.preview === true && listed.length <= TIMELINE_PREVIEW_MAX_ROWS,
     };
   }
 
@@ -1602,7 +1723,9 @@ export class MemoryDb {
    */
   searchConcept(name, opts: any = {}) {
     this.open();
-    const found = findConcept(String(name || ""), cfg.concepts);
+    const vocabulary =
+      opts.concepts && typeof opts.concepts === "object" ? opts.concepts : effectiveVocabulary().concepts;
+    const found = findConcept(String(name || ""), vocabulary);
     if (!found) {
       return { mode: "concept", unknown: true, name: String(name || ""), rows: [], total: 0 };
     }
@@ -1821,6 +1944,14 @@ export class MemoryDb {
 
 /** DB held by the running extension instance (reused for the session, closed at shutdown) */
 let db = null;
+/** mtime+size keyed cache for the concepts file (never written back). */
+let conceptTableCache: {
+  path: string;
+  mtimeMs: number;
+  size: number;
+  table: ConceptTable;
+  error: string | null;
+} | null = null;
 /** Session generation guard: a stale background scan must not touch the DB after shutdown. */
 let sessionGeneration = 0;
 /** Set once the store is closed at session end: no continuation may reopen the file-backed DB. */
@@ -2229,117 +2360,26 @@ function significantTokens(text: string, max = RELATED_MAX_TOKENS, cjkBigrams = 
   return [...out];
 }
 
-/** Tokens used for related evidence: significant tokens (with CJK shingles) minus stopwords. */
-function contentTokens(text) {
-  return significantTokens(text, 60, true).filter((t) => !STOPWORDS.has(t.toLowerCase()));
+/** Tokens used for related evidence: significant tokens (with CJK shingles) minus stopwords. @internal */
+export function contentTokens(text) {
+  const words = stopwordSet();
+  return significantTokens(text, 60, true).filter((t) => !words.has(t.toLowerCase()));
 }
 
 /**
- * Conservative stopword set. Only function words and a few pure filler tokens are listed; real
- * content words (even short code-ish ones like `git`, `test`, `run`) are deliberately NOT removed,
- * because deleting those would harm actual content. Ubiquitous-for-this-query tokens are instead
- * demoted by the data-driven DF gate, never deleted from the evidence sentence.
+ * Lower-case set of the configured `stopwords`. The extension ships no word list: function words
+ * used by related evidence are user data, read from `pi-billion-memory.json` (empty by default).
  */
-const STOPWORDS = new Set([
-  "a",
-  "an",
-  "the",
-  "and",
-  "or",
-  "but",
-  "if",
-  "then",
-  "else",
-  "for",
-  "of",
-  "to",
-  "in",
-  "on",
-  "at",
-  "by",
-  "with",
-  "from",
-  "as",
-  "is",
-  "are",
-  "was",
-  "were",
-  "be",
-  "been",
-  "being",
-  "do",
-  "does",
-  "did",
-  "not",
-  "no",
-  "yes",
-  "it",
-  "its",
-  "this",
-  "that",
-  "these",
-  "those",
-  "you",
-  "your",
-  "we",
-  "our",
-  "they",
-  "their",
-  "he",
-  "she",
-  "his",
-  "her",
-  "him",
-  "them",
-  "us",
-  "i",
-  "me",
-  "my",
-  "so",
-  "than",
-  "too",
-  "very",
-  "can",
-  "could",
-  "should",
-  "would",
-  "will",
-  "shall",
-  "may",
-  "might",
-  "must",
-  "have",
-  "has",
-  "had",
-  "here",
-  "there",
-  "when",
-  "where",
-  "which",
-  "who",
-  "whom",
-  "what",
-  "how",
-  "why",
-  "all",
-  "any",
-  "each",
-  "some",
-  "such",
-  "into",
-  "over",
-  "under",
-  "again",
-  "more",
-  "most",
-  "other",
-  "new",
-  "via",
-  "etc",
-  "per",
-  "vs",
-  ...CJK_STOPWORDS,
-]);
+function stopwordSet(): Set<string> {
+  const list = Array.isArray(cfg.stopwords) ? cfg.stopwords : [];
+  const key = list.join("\u0000");
+  if (!stopwordCache || stopwordCache.key !== key) {
+    stopwordCache = { key, set: new Set(list.map((w) => String(w).toLowerCase())) };
+  }
+  return stopwordCache.set;
+}
+
+let stopwordCache: { key: string; set: Set<string> } | null = null;
 
 /** Split text into sentences on ASCII/CJK sentence punctuation and newlines. */
 function splitSentences(text) {
@@ -2500,10 +2540,21 @@ export function formatResults(res) {
   return head + parts.join("\n\n---\n\n");
 }
 
+/** First sentence of a summary for the timeline preview (bounded and redacted). */
+export function timelinePreview(summary) {
+  const text = redactOut(String(summary || ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+  const cut = text.search(SENTENCE_DELIMITERS);
+  const first = cut >= 0 ? text.slice(0, cut + 1) : text;
+  return first.length > TIMELINE_PREVIEW_CHARS ? first.slice(0, TIMELINE_PREVIEW_CHARS - 1) + "…" : first;
+}
+
 /**
  * Render the memory catalog: one line per memory, date-grouped, never truncated. This is the
  * timeline body itself (an index / table of contents); a block's summary is fetched separately
- * with `memory_get`.
+ * with `memory_search(block, detail: true)`.
  * @internal
  */
 export function formatTimeline(res) {
@@ -2519,9 +2570,13 @@ export function formatTimeline(res) {
     String(s || "")
       .replace(/\s+/g, " ")
       .trim();
-  const line = (r, time) =>
-    `${time} · ${r.project || "?"} · ${r.blockId || "?"}${r.kind === "opencode" ? " [opencode]" : r.kind === "bili" ? " [bili]" : ""} · tier${r.tier ?? "?"} · ${redactOut(oneLine(r.topic)) || "(no topic)"}` +
-    `${r.duplicateCount ? ` (+${r.duplicateCount})` : ""}`;
+  const line = (r, time) => {
+    const preview = res.preview ? timelinePreview(r.summary) : "";
+    return (
+      `${time} · ${r.project || "?"} · ${r.blockId || "?"}${r.kind === "opencode" ? " [opencode]" : r.kind === "bili" ? " [bili]" : ""} · tier${r.tier ?? "?"} · ${redactOut(oneLine(r.topic)) || "(no topic)"}` +
+      `${r.duplicateCount ? ` (+${r.duplicateCount})` : ""}${preview ? ` — ${preview}` : ""}`
+    );
+  };
   const lines = [];
   const listed = Number.isInteger(res.listed) ? res.listed : rows.length;
   const total = Number.isInteger(res.total) ? res.total : listed;
@@ -2559,7 +2614,7 @@ export function formatTimeline(res) {
 }
 
 /** Render the configured concepts and deprecated terms (`mode: "concepts"`). @internal */
-export function formatConcepts(list, deprecated?) {
+export function formatConcepts(list, deprecated?, meta?) {
   const entries = list || [];
   const dep =
     deprecated && typeof deprecated === "object" && !Array.isArray(deprecated) ? Object.entries(deprecated) : [];
@@ -2578,6 +2633,16 @@ export function formatConcepts(list, deprecated?) {
   if (dep.length) {
     lines.push("", `Deprecated terms (${dep.length}):`);
     for (const [k, v] of dep) lines.push(`  ${k} → ${typeof v === "string" && v ? v : "(no replacement)"}`);
+  }
+  if (meta) {
+    lines.push("");
+    lines.push(`Source: ${meta.source || "config"}`);
+    if (meta.file) lines.push(`File: ${meta.file}`);
+    if (meta.error) lines.push(`Note: ${meta.error}`);
+    if (meta.scope) lines.push(`Scope: ${JSON.stringify(meta.scope).slice(0, 200)}`);
+    if (meta.watermark) lines.push(`Watermark: ${JSON.stringify(meta.watermark).slice(0, 200)}`);
+    if (typeof meta.keywords === "number") lines.push(`Keywords: ${meta.keywords}`);
+    if (typeof meta.filtered === "number") lines.push(`Filtered words: ${meta.filtered}`);
   }
   lines.push("");
   lines.push(
@@ -2609,7 +2674,7 @@ export function formatRelated(res) {
   return `Related blocks${seed}: ${rows.length}:\n` + parts.join("\n\n---\n\n");
 }
 
-/** Render one stored block for `memory_get` (summary only; no raw session text). @internal */
+/** Render one stored block for `memory_search` (`block` + `detail: true`; summary only, no raw session text). @internal */
 export function formatBlockDetail(row) {
   const lines = [
     `Block ${row.blockId}${row.tier != null ? ` (tier ${row.tier})` : ""} · project ${row.project || "unknown"}` +
@@ -2620,6 +2685,42 @@ export function formatBlockDetail(row) {
   if (row.topic) lines.push(`Topic: ${redactOut(row.topic)}`);
   lines.push("");
   lines.push(redactOut(row.summary || "(no stored summary)"));
+  return lines.join("\n");
+}
+
+/**
+ * Render the keyword-table work package for `/memory elevation` (rows, window count, budget brake,
+ * vocabulary watermark). Numbers only — the command pulls no block text into the session.
+ * @param {{scope:string, rows:number, windows:number, brake:boolean, capped:boolean,
+ *   watermark:{{lastCreatedAt:*, lastBlockSeq:*} | null, stale:number|null,
+ *   conceptsFile:string|null}} plan
+ */
+export function formatElevationPlan(plan) {
+  const budget = plan.brake
+    ? `STOP — ${plan.rows.toLocaleString()} rows is past the hard brake (${ELEVATION_ROWS_BRAKE.toLocaleString()} rows / ${ELEVATION_WINDOW_LIMIT} windows); ask the user before a whole-library pass.`
+    : `OK — ${Math.max(0, ELEVATION_WINDOW_LIMIT - plan.windows)} window(s) left before the brake (${ELEVATION_ROWS_BRAKE.toLocaleString()} rows).`;
+  const wm = plan.watermark
+    ? plan.watermark.lastCreatedAt != null
+      ? `watermark ${typeof plan.watermark.lastCreatedAt === "number" ? fmtTs(plan.watermark.lastCreatedAt) : plan.watermark.lastCreatedAt}` +
+        (plan.watermark.lastBlockSeq != null ? ` · block ${plan.watermark.lastBlockSeq}` : "")
+      : "watermark unset"
+    : "not configured";
+  const lines = [
+    `Elevation plan — scope: ${plan.scope}`,
+    ``,
+    `Library: ${plan.rows.toLocaleString()} merged row(s) → ${plan.windows} window(s) of ${ELEVATION_WINDOW_ROWS} rows` +
+      (plan.capped ? " (count capped by the timeline ceiling)" : ""),
+    `Budget: ${budget}`,
+    `Vocabulary: ${plan.conceptsFile ? fileBase(plan.conceptsFile) : "no conceptsFile in pi-billion-memory.json"} · ${wm}` +
+      (plan.stale != null ? ` · ${plan.stale} row(s) newer than the watermark` : ""),
+    ``,
+    `Next steps`,
+    `1. Read the next window: memory_search mode 'timeline' (start from the watermark date); preview: true is honoured only for windows of ≤ ${TIMELINE_PREVIEW_MAX_ROWS} rows.`,
+    `2. Deconstruct → cluster → keywordize → filter (rules K1–K6, docs/ELEVATION.md).`,
+    `3. Verify every candidate keyword with a scoped search before recording it.`,
+    `4. Record concepts / deprecated / filtered in pi-billion-memory.json — user data, never commit it.`,
+    `5. Repeat until the brake trips, then ask the user.`,
+  ];
   return lines.join("\n");
 }
 function formatExpansion(row, sessionFile, res, mode) {
@@ -2715,7 +2816,17 @@ const MEMORY_SEARCH_PARAMETERS = {
     },
     block: {
       type: "string",
-      description: "Anchor block id for mode 'timeline' or 'related', e.g. 'b2' (from a previous result)",
+      description:
+        "Block id from a timeline or search line (with 'detail: true' it opens that block's stored summary); also the anchor for mode 'timeline' or 'related', e.g. 'b2'",
+    },
+    detail: {
+      type: "boolean",
+      description:
+        "Read one stored block: requires 'block' (from a timeline or search line) and returns its redacted topic+summary; pass 'source' when the id exists in several sources",
+    },
+    preview: {
+      type: "boolean",
+      description: `Timeline only: add a bounded first sentence of each summary; honoured only for windows of at most ${TIMELINE_PREVIEW_MAX_ROWS} entries (larger windows stay compact)`,
     },
     source: {
       type: "string",
@@ -2752,23 +2863,9 @@ interface MemorySearchParams {
   reasons: boolean;
   concept: string | null;
   decompose: boolean;
+  detail: boolean;
+  preview: boolean;
 }
-
-const MEMORY_GET_PARAMETERS = {
-  type: "object",
-  properties: {
-    block: {
-      type: "string",
-      description: "Block id from a memory_search or timeline line, e.g. 'b2'",
-    },
-    source: {
-      type: "string",
-      description:
-        "Optional disambiguator when the same block id exists in several sources (substring of the 'Source:' label or the project)",
-    },
-  },
-  required: ["block"],
-} as const;
 
 const MEMORY_EXPAND_PARAMETERS = {
   type: "object",
@@ -2904,6 +3001,8 @@ function readMemorySearchParams(raw: unknown): MemorySearchParams {
     reasons: value.reasons !== false,
     concept,
     decompose: value.decompose === true,
+    detail: value.detail === true,
+    preview: value.preview === true,
   };
 }
 
@@ -3019,10 +3118,10 @@ export default async function factory(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use memory_search when the user asks about past work, conclusions, decisions, or context from earlier sessions or from earlier in this session after compression.",
       "For Chinese queries shorter than 3 characters, memory_search falls back to substring matching automatically — still pass the query as-is.",
-      "Use mode 'timeline' for a chronological catalog of matches (one line per memory, full, never truncated); follow a line with memory_get to read that block's stored summary.",
+      "Use mode 'timeline' for a chronological catalog of matches (one line per memory, full, never truncated); open a line's stored summary with the same tool: block '<id>' + detail: true (pass 'source' when the id exists in several sources).",
       "Use mode 'related' with a query (the search words) to find blocks whose sentence containing those words is related; pass 'block' to anchor on a specific block.",
       "For a concept (one name that expands to the concrete terms the corpus uses) pass the 'concept' parameter; concepts come from the `concepts` config key - the extension ships none - and mode 'concepts' lists them.",
-      "Keep the shared vocabulary current: when the corpus names a mechanism differently from the user, record the mapping under `concepts` in pi-billion-memory.json; when a term is renamed or retired, record it under `deprecated` with its replacement (empty = none). Vocabulary is runtime user data - never commit it, and never hardcode project or personal terms in the repository.",
+      "Vocabulary is user data: record concept mappings under `concepts` and renamed/retired terms under `deprecated` in pi-billion-memory.json; never commit vocabulary, and never hardcode project or personal terms in the repository.",
       "For a multi-part requirement set decompose: true so each clause is searched separately and the hits are grouped per clause.",
       "In timeline mode pass limit: 0 for the full catalog; a positive limit keeps the newest N entries. from/to accept ISO 8601 strings (date-only = local day).",
     ],
@@ -3032,19 +3131,75 @@ export default async function factory(pi: ExtensionAPI) {
         // Light allow-list scan (mtime watermark) before every search so latest compressions are included
         await scanSources();
         const p = readMemorySearchParams(params);
-        const vhint = deprecatedHints(cfg.deprecated, p.concept || p.query);
+        const vocab = effectiveVocabulary();
+        const vhint = deprecatedHints(vocab.deprecated, [p.concept, p.query].filter(Boolean).join(" "));
         const db = getDb();
-        if (p.mode === "concepts") {
-          const catalog = conceptCatalog(cfg.concepts);
+        if (p.detail) {
+          if (!p.block) {
+            return {
+              content: [
+                { type: "text", text: "memory_search: 'detail: true' needs 'block' (from a timeline or search line)." },
+              ],
+              details: { mode: "error", hits: 0, dbPath: fileBase(cfg.dbPath) },
+            };
+          }
+          const res = db.getBlock(p.block, p.source);
+          if (!res.found) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `memory_search: no stored block '${p.block}'${p.source ? ` matching '${p.source}'` : ""}.`,
+                },
+              ],
+              details: { mode: "missing", hits: 0, dbPath: fileBase(cfg.dbPath) },
+            };
+          }
+          if (res.total > 1) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `memory_search: ${res.total} blocks share the id '${p.block}'. Pass 'source' to pick one. ` +
+                    `Newest: ${formatBlockDetail(res.row)}`,
+                },
+              ],
+              details: { mode: "ambiguous", hits: res.total, dbPath: fileBase(cfg.dbPath) },
+            };
+          }
           return {
-            content: [{ type: "text", text: formatConcepts(catalog, cfg.deprecated) }],
+            content: [{ type: "text", text: formatBlockDetail(res.row) }],
+            details: { mode: "block", hits: 1, dbPath: fileBase(cfg.dbPath) },
+          };
+        }
+        if (p.mode === "concepts") {
+          const catalog = conceptCatalog(vocab.concepts);
+          return {
+            content: [
+              {
+                type: "text",
+                text: formatConcepts(catalog, vocab.deprecated, {
+                  source: vocab.source,
+                  file: cfg.conceptsFile ? fileBase(cfg.conceptsFile) : null,
+                  error: vocab.error,
+                  scope: vocab.table?.scope || null,
+                  watermark: vocab.table?.watermark || null,
+                  keywords: Object.values(vocab.concepts).reduce(
+                    (n: number, terms: unknown) => n + (Array.isArray(terms) ? terms.length : 0),
+                    0,
+                  ),
+                  filtered: vocab.table?.filtered.length ?? 0,
+                }),
+              },
+            ],
             details: { mode: "concepts", hits: catalog.length, dbPath: fileBase(cfg.dbPath) },
           };
         }
         if (p.concept) {
-          const res = db.searchConcept(p.concept, { project: p.project, limit: p.limit });
+          const res = db.searchConcept(p.concept, { project: p.project, limit: p.limit, concepts: vocab.concepts });
           if (res.unknown) {
-            const known = conceptCatalog(cfg.concepts)
+            const known = conceptCatalog(vocab.concepts)
               .map((c) => c.label)
               .join(", ");
             return {
@@ -3077,9 +3232,10 @@ export default async function factory(pi: ExtensionAPI) {
             from: p.from,
             to: p.to,
             windowMinutes: p.windowMinutes,
+            preview: p.preview,
           });
           return {
-            content: [{ type: "text", text: formatTimeline(res) }],
+            content: [{ type: "text", text: formatTimeline(res) + (vhint ? "\n\n" + vhint : "") }],
             details: {
               mode: "timeline",
               hits: res.rows.length,
@@ -3096,7 +3252,7 @@ export default async function factory(pi: ExtensionAPI) {
             source: p.source,
           });
           return {
-            content: [{ type: "text", text: formatRelated(res) }],
+            content: [{ type: "text", text: formatRelated(res) + (vhint ? "\n\n" + vhint : "") }],
             details: { mode: "related", hits: res.rows.length, dbPath: fileBase(cfg.dbPath) },
           };
         }
@@ -3108,7 +3264,15 @@ export default async function factory(pi: ExtensionAPI) {
               (c) => `## ${c}\n` + formatResults(db.search(c, { project: p.project, limit: per })),
             );
             return {
-              content: [{ type: "text", text: `Decomposed into ${clauses.length} clauses:\n\n` + parts.join("\n\n") }],
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `Decomposed into ${clauses.length} clauses:\n\n` +
+                    parts.join("\n\n") +
+                    (vhint ? "\n\n" + vhint : ""),
+                },
+              ],
               details: { mode: "decompose", hits: clauses.length, dbPath: fileBase(cfg.dbPath) },
             };
           }
@@ -3129,68 +3293,6 @@ export default async function factory(pi: ExtensionAPI) {
             },
           ],
           details: { mode: "error", hits: 0, dbPath: fileBase(cfg.dbPath) },
-        };
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "memory_get",
-    label: "Memory Get",
-    description:
-      "Open one memory line from a memory_search or timeline result and read its stored summary by " +
-      "block id. Read-only and always available: it returns the already-redacted stored topic+summary, " +
-      "never raw session messages (use the opt-in memory_expand for originals).",
-    promptSnippet: "Open one memory line (block id) and read its stored summary",
-    promptGuidelines: [
-      "After a timeline/catalog line, call memory_get with its block id to read the stored summary; pass 'source' when the id exists in several sources.",
-    ],
-    parameters: MEMORY_GET_PARAMETERS,
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      try {
-        const value = params && typeof params === "object" ? (params as Record<string, unknown>) : {};
-        const block = typeof value.block === "string" ? value.block.trim() : "";
-        const source = typeof value.source === "string" && value.source.trim() ? value.source.trim() : null;
-        if (!block) {
-          return {
-            content: [{ type: "text", text: "memory_get: 'block' is required." }],
-            details: { mode: "error", hits: 0 },
-          };
-        }
-        const res = getDb().getBlock(block, source);
-        if (!res.found) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `memory_get: no stored block '${block}'${source ? ` matching '${source}'` : ""}.`,
-              },
-            ],
-            details: { mode: "missing", hits: 0 },
-          };
-        }
-        if (res.total > 1) {
-          return {
-            content: [
-              {
-                type: "text",
-                text:
-                  `memory_get: ${res.total} blocks share the id '${block}'. Pass 'source' to pick one. ` +
-                  `Newest: ${formatBlockDetail(res.row)}`,
-              },
-            ],
-            details: { mode: "ambiguous", hits: res.total },
-          };
-        }
-        return {
-          content: [{ type: "text", text: formatBlockDetail(res.row) }],
-          details: { mode: "block", hits: 1, dbPath: fileBase(cfg.dbPath) },
-        };
-      } catch (e) {
-        logLine(`memory_get error: ${withoutPaths(e.stack || e.message)}`);
-        return {
-          content: [{ type: "text", text: `memory_get failed: ${withoutPaths(e.message) || "unknown error"}` }],
-          details: { mode: "error", hits: 0 },
         };
       }
     },
@@ -3359,7 +3461,7 @@ export default async function factory(pi: ExtensionAPI) {
 
   pi.registerCommand("memory", {
     description:
-      "pi-billion-memory: /memory (status), rescan (force rescan), sources (show allow-list), prune <days> (delete blocks older than N days)",
+      "pi-billion-memory: /memory (status), rescan (force rescan), sources (show allow-list), prune <days> (delete blocks older than N days), elevation [query] (keyword-table work package)",
     handler: async (args, ctx) => {
       try {
         const want = String(args || "").trim();
@@ -3389,6 +3491,30 @@ export default async function factory(pi: ExtensionAPI) {
           }
           const p = getDb().prune(keepDays);
           const msg = `Prune done: removed ${p.removedBlocks} block(s) / ${p.removedSources} empty source(s), ${p.remainingBlocks} remain (kept ${keepDays} day(s))`;
+          ctx.ui?.notify?.(msg, "info");
+          return;
+        }
+        if (want === "elevation" || want.startsWith("elevation ")) {
+          // Numbers only: count the scope and the budget without pulling any block text into the
+          // session (the heavy reads happen later, one window at a time, inside memory_search).
+          const scope = want.slice("elevation".length).trim();
+          const res = getDb().timeline(scope || undefined, { limit: 0 });
+          const vocab = effectiveVocabulary();
+          const wm = vocab.table && vocab.table.watermark ? vocab.table.watermark : null;
+          let stale = null;
+          if (wm && wm.lastCreatedAt != null) {
+            stale = getDb().timeline(undefined, { from: wm.lastCreatedAt, limit: 0 }).total;
+          }
+          const msg = formatElevationPlan({
+            scope: scope || "all projects",
+            rows: res.total,
+            windows: Math.ceil(res.total / ELEVATION_WINDOW_ROWS),
+            brake: res.total > ELEVATION_ROWS_BRAKE,
+            capped: Boolean(res.note),
+            watermark: wm ? { lastCreatedAt: wm.lastCreatedAt ?? null, lastBlockSeq: wm.lastBlockSeq ?? null } : null,
+            stale,
+            conceptsFile: cfg.conceptsFile || null,
+          });
           ctx.ui?.notify?.(msg, "info");
           return;
         }

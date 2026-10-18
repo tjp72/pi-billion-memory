@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-10-18
+
+### Added
+
+- **Concept tables from a file**: `conceptsFile` loads a runtime-generated table
+  (`concepts` / `deprecated` / `filtered` / `scope` / `watermark`) as read-only user data —
+  `~`-expanded, mtime+size cached, capped at 1 MB and bounded field by field; inline
+  `concepts` win on conflicts. `mode: "concepts"` reports the source, scope, watermark,
+  keyword count and filtered-word count.
+- **`/memory elevation` command**: prints a scoped work package for the keyword-table workflow in
+  `docs/ELEVATION.md` — row count, window count, the 2,000-row budget brake, the vocabulary
+  watermark and how many rows are newer than it. Numbers only: no block text is pulled into the
+  session by the command itself.
+- **Bounded timeline preview**: `preview: true` appends one redacted sentence (≤120 chars) per
+  line and is honoured only for windows of at most 80 entries.
+- **`docs/ELEVATION.md`**: the keyword-table workflow (scope → deconstruct → cluster/keywordize →
+  screen → outline/tasks → incremental), keyword rules K1–K6, and the elevation artifact schema.
+  Filtering is a per-scope judgment recorded in the table's `filtered` list — the repository
+  hardcodes no stopword list. This document is repository-only and is not shipped in the package.
+
+### Changed
+
+- `sanitizeCfg` accepts `conceptsFile` (≤500 chars) and merges the table with inline vocabulary.
+- Related-evidence stopwords moved to the `stopwords` config key (user data; empty by default).
+  The bundle now ships no word list at all.
+- The `memory_search` prompt guidance is slimmed to calling-time rules; the keyword-table workflow
+  lives in `docs/ELEVATION.md` and the `/memory elevation` command instead of the tool prompt.
+
+### Removed
+
+- **`memory_get` tool removed** (breaking change): `block` + `detail: true` on `memory_search`
+  replaces it — registration, schema and prompt references removed.
+
+### Fixed
+
+- `Vocabulary hints` now append to `timeline` / `related` / `decompose` results too (previously
+  only the default and concept paths) and consider both `concept` and `query` at once.
+- A broken `conceptsFile` is now cached after the first failure (mtime+size, or a stable entry
+  when the file disappears) instead of being re-read and re-logged on every search.
+- `mode: "concepts"` now reports `config` / `file` / `config+file` based on what the file
+  actually contributes, not just on whether inline concepts exist.
+
 ## [0.6.2] - 2026-10-18
 
 ### Added
