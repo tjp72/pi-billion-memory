@@ -2144,18 +2144,21 @@ check(
   typeof secFrom === "string" && secFrom.includes("milliseconds"),
 );
 
-const catalog = internals.conceptCatalog(null);
 check(
-  "the built-in vocabulary covers the kernel-governance concept",
-  catalog.length >= 10 && catalog.some((c) => c.id === "compression-kernel" && c.terms.includes("压缩")),
+  "no concept vocabulary ships with the extension",
+  internals.conceptCatalog(null).length === 0 && internals.formatConcepts([]).includes("No concepts defined"),
 );
+const configured = {
+  "memory-layer": ["记忆插件", "FTS5", "检索"],
+  "compression-kernel": ["压缩", "摘要"],
+};
 check(
-  "a concept resolves by label, id and alias",
-  internals.findConcept("memory layer", null)?.entry.id === "memory-layer" &&
-    internals.findConcept("memory-layer", null)?.entry.id === "memory-layer" &&
-    internals.findConcept("retrieval", null)?.entry.id === "memory-layer" &&
-    internals.findConcept("compaction", null)?.entry.id === "compression-kernel",
+  "a configured concept resolves by label, id and alias",
+  internals.findConcept("memory-layer", configured)?.entry.id === "memory-layer" &&
+    internals.findConcept("memory layer", configured)?.entry.id === "memory-layer" &&
+    internals.findConcept("compression-kernel", configured)?.entry.id === "compression-kernel",
 );
+internals._setConfig({ concepts: configured });
 const cs = db.searchConcept("memory layer", { project: "ProjA", limit: 6 });
 check(
   "concept search merges the hits of every term in the vocabulary",
@@ -2163,17 +2166,21 @@ check(
 );
 check("concept results report which terms matched", internals.formatResults(cs).includes("Matched terms:"));
 check(
-  "an unknown concept reports the catalog instead of returning empty",
+  "an unknown concept reports the configured catalog instead of returning empty",
   db.searchConcept("no-such-concept", {}).unknown === true,
 );
-const conceptsText = internals.formatConcepts(catalog);
+const conceptsText = internals.formatConcepts(internals.conceptCatalog(configured));
 check(
-  "mode 'concepts' lists labels and their terms",
-  conceptsText.includes("compression kernel") && conceptsText.includes("terms:"),
+  "mode 'concepts' lists configured labels and their terms",
+  conceptsText.includes("Configured concepts") && conceptsText.includes("terms:"),
 );
 internals._setConfig({ concepts: { "test-concept": ["记忆插件", "FTS5"] } });
 const csCustom = db.searchConcept("test-concept", { project: "ProjA", limit: 6 });
 check("a custom configured concept is searched", csCustom.mode === "concept" && csCustom.rows.length >= 1);
+check(
+  "an unconfigured name never resolves to a bundled concept",
+  internals.conceptCatalog(null).length === 0 && db.searchConcept("no-such-thing", {}).unknown === true,
+);
 internals._setConfig({ concepts: {} });
 check(
   "decompose splits a conjunctive requirement set into clauses",

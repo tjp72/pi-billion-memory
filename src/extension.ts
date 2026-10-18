@@ -2532,11 +2532,16 @@ export function formatTimeline(res) {
   return lines.join("\n");
 }
 
-/** Render the concept vocabulary (`mode: "concepts"`). @internal */
+/** Render the configured concepts (`mode: "concepts"`). @internal */
 export function formatConcepts(list) {
   const entries = list || [];
-  if (!entries.length) return "No concepts defined.";
-  const lines = [`Concept vocabulary (${entries.length}):`];
+  if (!entries.length) {
+    return (
+      'No concepts defined. Add them under "concepts": { "name": ["term", ...] } in ' +
+      "pi-billion-memory.json; vocabulary is user data and ships with no defaults."
+    );
+  }
+  const lines = [`Configured concepts (${entries.length}):`];
   for (const c of entries) {
     lines.push("");
     lines.push(`${c.label}  (${c.id})${c.aliases && c.aliases.length ? ` · aka ${c.aliases.join(", ")}` : ""}`);
@@ -2669,7 +2674,7 @@ const MEMORY_SEARCH_PARAMETERS = {
     concept: {
       type: "string",
       description:
-        "Search a concept instead of literal keywords: the name is resolved against the built-in vocabulary (see mode 'concepts') and every term is searched, merging hits; blocks matching more distinct terms rank first. Example: 'prompt cache' or 'cache-integrity'",
+        "Search a concept instead of literal keywords: the name is resolved against the concepts configured in `pi-billion-memory.json` (see mode 'concepts') and every term is searched, merging hits; blocks matching more distinct terms rank first. The extension ships no vocabulary of its own.",
     },
     decompose: {
       type: "boolean",
@@ -2984,7 +2989,7 @@ export default async function factory(pi: ExtensionAPI) {
       "For Chinese queries shorter than 3 characters, memory_search falls back to substring matching automatically — still pass the query as-is.",
       "Use mode 'timeline' for a chronological catalog of matches (one line per memory, full, never truncated); follow a line with memory_get to read that block's stored summary.",
       "Use mode 'related' with a query (the search words) to find blocks whose sentence containing those words is related; pass 'block' to anchor on a specific block.",
-      "For a concept (one name that expands to the concrete terms the corpus uses, e.g. prompt cache) pass the 'concept' parameter; mode 'concepts' lists the built-in vocabulary and its terms.",
+      "For a concept (one name that expands to the concrete terms the corpus uses) pass the 'concept' parameter; concepts come from the `concepts` config key - the extension ships none - and mode 'concepts' lists them.",
       "For a multi-part requirement set decompose: true so each clause is searched separately and the hits are grouped per clause.",
       "In timeline mode pass limit: 0 for the full catalog; a positive limit keeps the newest N entries. from/to accept ISO 8601 strings (date-only = local day).",
     ],
@@ -3013,8 +3018,9 @@ export default async function factory(pi: ExtensionAPI) {
                 {
                   type: "text",
                   text:
-                    `Unknown concept '${p.concept}'. Known concepts: ${known}. ` +
-                    "Use mode 'concepts' for the full vocabulary and its terms.",
+                    `Unknown concept '${p.concept}'. ` +
+                    (known ? `Configured concepts: ${known}. ` : "No concepts are configured yet. ") +
+                    "Use mode 'concepts' for details; add concepts under \"concepts\" in pi-billion-memory.json.",
                 },
               ],
               details: { mode: "concept", hits: 0, unknown: true, dbPath: fileBase(cfg.dbPath) },

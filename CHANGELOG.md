@@ -9,11 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Concept vocabulary**: `memory_search` takes a `concept` name that expands to the
-  concrete terms the corpus actually uses (built-in `src/concepts.ts` plus the
-  `concepts` config key), searches every term, merges the hits, ranks by how many
-  distinct terms matched, and reports `Matched terms`; `mode: "concepts"` lists the
-  vocabulary.
+- **Concept search (user-defined)**: `memory_search` takes a `concept` name that
+  expands to the concrete terms the corpus actually uses — the vocabulary comes
+  from the `concepts` key of `pi-billion-memory.json` (the extension ships none),
+  searches every term, merges the hits, ranks by how many distinct terms matched,
+  and reports `Matched terms`; `mode: "concepts"` lists what is configured.
 - **Requirement decomposition**: `decompose: true` splits a conjunctive query
   (Chinese commas/semicolons, `and`) into clauses and searches each clause
   separately, grouping the hits per clause.
@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-pi entries with `[opencode]`/`[bili]`, and reports `listed`/`total` with merged
   duplicates; `limit: 0` returns the full catalog and a positive limit keeps the
   newest N instead of silently slicing.
+
+### Removed
+
+- The built-in concept vocabulary (`src/concepts.data.ts`). Vocabulary is user
+  runtime data, not repository content (AGENTS.md §1), so 0.6.1 retires the
+  bundled table: define concepts under `"concepts"` in `pi-billion-memory.json`.
 
 ## [0.6.0] - 2026-10-18
 

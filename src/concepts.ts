@@ -1,21 +1,13 @@
 /**
- * Built-in concept vocabulary — the search aliases this extension ships.
+ * Concept resolution — one name expands to the concrete terms a corpus actually uses, so a
+ * mechanism whose name never made it into a summary is still findable. Terms are searched one by
+ * one and the hits are merged, with blocks matching more distinct terms ranked first.
  *
- * A concept maps one name to the concrete terms a corpus actually uses, so a mechanism whose name
- * never made it into a summary is still findable. Terms are searched one by one and the hits are
- * merged, with blocks matching more distinct terms ranked first.
- *
- * The built-in list is a *default*, not a fixed taxonomy: `pi-billion-memory.json` may extend an
- * entry (`"concepts": { "cache-integrity": ["term"] }`) or add a new one. Concepts are domain
- * vocabulary supplied by the user — the built-in set covers this project's own subject matter and
- * nothing else. It deliberately contains no identifier from any private project, machine, or
- * person; see AGENTS.md §1.
- *
- * Vocabulary data lives in `concepts.data.ts` so that `scripts/check-language.mjs` can treat it as
- * a data file rather than code, and so a vocabulary change is a reviewable diff of pure data.
+ * The extension ships **no vocabulary**. A concept's terms are domain data the user supplies at
+ * runtime through the `concepts` key of `pi-billion-memory.json`; personal, project, or
+ * session-derived vocabulary is never repository content (AGENTS.md §1). This module holds only
+ * the resolution logic and the caps that keep a configured entry bounded.
  */
-
-import { CONCEPT_DATA } from "./concepts.data.js";
 
 export interface ConceptEntry {
   /** Stable machine id, e.g. "cache-integrity". */
@@ -32,8 +24,6 @@ export const MAX_CONCEPT_TERMS = 24;
 export const MAX_CONCEPT_TERM_CHARS = 64;
 export const MAX_CONCEPT_LABEL_CHARS = 120;
 export const MAX_CUSTOM_CONCEPTS = 50;
-
-const BUILTIN_CONCEPTS: ConceptEntry[] = CONCEPT_DATA;
 
 function norm(s: unknown): string {
   return typeof s === "string"
@@ -58,7 +48,7 @@ function slug(s: string): string {
   return base || "concept";
 }
 
-/** Copy one built-in/custom entry into the shape the tools consume. */
+/** Copy one configured entry into the shape the tools consume. */
 export function normalizeConceptEntry(raw: any): ConceptEntry | null {
   if (!raw || typeof raw !== "object") return null;
   const label = typeof raw.label === "string" ? raw.label.trim().slice(0, MAX_CONCEPT_LABEL_CHARS) : "";
@@ -82,15 +72,11 @@ function matchEntry(entry: ConceptEntry, key: string): boolean {
 }
 
 /**
- * The effective catalog: built-ins first, then the user's `concepts` config. A config key that
- * matches an existing id/label/alias extends that concept's terms; any other key adds a concept.
+ * The effective catalog: exactly the user's `concepts` config. A config key becomes the concept's
+ * label and id; its value is the list of terms searched for it. Nothing is bundled.
  */
 export function conceptCatalog(custom?: Record<string, unknown> | null): ConceptEntry[] {
-  const list: ConceptEntry[] = BUILTIN_CONCEPTS.map((c) => ({
-    ...c,
-    aliases: [...c.aliases],
-    terms: [...c.terms],
-  }));
+  const list: ConceptEntry[] = [];
   if (!custom || typeof custom !== "object" || Array.isArray(custom)) return list;
   let added = 0;
   for (const [key, value] of Object.entries(custom)) {

@@ -547,76 +547,11 @@ var CHINESE_SECRET_RE = new RegExp(
 var SENTENCE_DELIMITERS = /[。！？!?.;\n]+/;
 var CLAUSE_SEPARATORS = /[,，;；。、]+|\s+(?:and|且|以及|并且)\s+/i;
 
-// src/concepts.data.ts
-var CONCEPT_DATA = [
-  {
-    id: "compression-kernel",
-    label: "compression kernel",
-    aliases: ["compression", "compaction", "summarizer"],
-    terms: ["\u538B\u7F29", "compress", "compaction", "summary", "\u6458\u8981", "fold", "spill", "tier", "\u84B8\u998F", "\u5757\u8FB9\u754C", "ref-tag"]
-  },
-  {
-    id: "cache-integrity",
-    label: "prompt cache",
-    aliases: ["cache", "prefix cache", "cache hit"],
-    terms: ["\u7F13\u5B58", "cache", "\u524D\u7F00", "prefix", "\u547D\u4E2D\u7387", "schema", "system_hash", "\u5931\u914D"]
-  },
-  {
-    id: "injection-pointer",
-    label: "injection pointer",
-    aliases: ["injection", "context injection", "pointer"],
-    terms: ["\u6CE8\u5165", "inject", "\u6307\u9488", "pointer", "\u767D\u540D\u5355", "whitelist", "interjection"]
-  },
-  {
-    id: "guard-chain",
-    label: "write guard",
-    aliases: ["guard", "permission gate", "guard chain"],
-    terms: ["\u5B88\u536B", "guard", "\u6743\u9650\u77E9\u9635", "\u786E\u8BA4", "confirm", "\u62E6\u622A", "sandbox"]
-  },
-  {
-    id: "forensics",
-    label: "incident forensics",
-    aliases: ["forensics", "incident", "postmortem"],
-    terms: ["\u53D6\u8BC1", "forensic", "400", "\u5D29\u6E83", "crash", "\u6839\u56E0", "\u65E5\u5FD7", "wire"]
-  },
-  {
-    id: "ab-bench",
-    label: "A/B bench",
-    aliases: ["A/B", "bench", "ablation"],
-    terms: ["A/B", "\u53F0\u67B6", "arm", "\u81C2", "\u53F0\u8D26", "ledger", "dry run", "\u5BF9\u7167"]
-  },
-  {
-    id: "memory-layer",
-    label: "memory layer",
-    aliases: ["memory", "memory search", "retrieval"],
-    terms: ["\u8BB0\u5FC6", "memory", "sidecar", "FTS5", "SQLite", "\u5165\u5E93", "ingest", "timeline"]
-  },
-  {
-    id: "governance",
-    label: "governance",
-    aliases: ["process", "working agreement", "review process"],
-    terms: ["\u6CBB\u7406", "governance", "AGENTS.md", "DoD", "worktree", "review", "plan"]
-  },
-  {
-    id: "release-engineering",
-    label: "release engineering",
-    aliases: ["release", "shipping", "versioning"],
-    terms: ["\u53D1\u5E03", "release", "tag", "CI", "publish", "dist", "\u6821\u9A8C"]
-  },
-  {
-    id: "cross-repo",
-    label: "cross-repo migration",
-    aliases: ["cross-repo", "cross repo", "repo migration"],
-    terms: ["\u8DE8\u4ED3", "\u8DE8\u4ED3\u8FC1\u79FB", "cross-repo", "repo migration", "monorepo"]
-  }
-];
-
 // src/concepts.ts
 var MAX_CONCEPT_TERMS = 24;
 var MAX_CONCEPT_TERM_CHARS = 64;
 var MAX_CONCEPT_LABEL_CHARS = 120;
 var MAX_CUSTOM_CONCEPTS = 50;
-var BUILTIN_CONCEPTS = CONCEPT_DATA;
 function norm(s) {
   return typeof s === "string" ? s.trim().toLowerCase().replace(/[\s_-]+/g, " ") : "";
 }
@@ -635,11 +570,7 @@ function matchEntry(entry, key) {
   return [entry.id, entry.label, ...entry.aliases].some((x) => norm(x) === k);
 }
 function conceptCatalog(custom) {
-  const list = BUILTIN_CONCEPTS.map((c) => ({
-    ...c,
-    aliases: [...c.aliases],
-    terms: [...c.terms]
-  }));
+  const list = [];
   if (!custom || typeof custom !== "object" || Array.isArray(custom)) return list;
   let added = 0;
   for (const [key, value] of Object.entries(custom)) {
@@ -2580,8 +2511,10 @@ function formatTimeline(res) {
 }
 function formatConcepts(list) {
   const entries = list || [];
-  if (!entries.length) return "No concepts defined.";
-  const lines = [`Concept vocabulary (${entries.length}):`];
+  if (!entries.length) {
+    return 'No concepts defined. Add them under "concepts": { "name": ["term", ...] } in pi-billion-memory.json; vocabulary is user data and ships with no defaults.';
+  }
+  const lines = [`Configured concepts (${entries.length}):`];
   for (const c of entries) {
     lines.push("");
     lines.push(`${c.label}  (${c.id})${c.aliases && c.aliases.length ? ` \xB7 aka ${c.aliases.join(", ")}` : ""}`);
@@ -2686,7 +2619,7 @@ var MEMORY_SEARCH_PARAMETERS = {
     },
     concept: {
       type: "string",
-      description: "Search a concept instead of literal keywords: the name is resolved against the built-in vocabulary (see mode 'concepts') and every term is searched, merging hits; blocks matching more distinct terms rank first. Example: 'prompt cache' or 'cache-integrity'"
+      description: "Search a concept instead of literal keywords: the name is resolved against the concepts configured in `pi-billion-memory.json` (see mode 'concepts') and every term is searched, merging hits; blocks matching more distinct terms rank first. The extension ships no vocabulary of its own."
     },
     decompose: {
       type: "boolean",
@@ -2899,7 +2832,7 @@ async function factory(pi) {
       "For Chinese queries shorter than 3 characters, memory_search falls back to substring matching automatically \u2014 still pass the query as-is.",
       "Use mode 'timeline' for a chronological catalog of matches (one line per memory, full, never truncated); follow a line with memory_get to read that block's stored summary.",
       "Use mode 'related' with a query (the search words) to find blocks whose sentence containing those words is related; pass 'block' to anchor on a specific block.",
-      "For a concept (one name that expands to the concrete terms the corpus uses, e.g. prompt cache) pass the 'concept' parameter; mode 'concepts' lists the built-in vocabulary and its terms.",
+      "For a concept (one name that expands to the concrete terms the corpus uses) pass the 'concept' parameter; concepts come from the `concepts` config key - the extension ships none - and mode 'concepts' lists them.",
       "For a multi-part requirement set decompose: true so each clause is searched separately and the hits are grouped per clause.",
       "In timeline mode pass limit: 0 for the full catalog; a positive limit keeps the newest N entries. from/to accept ISO 8601 strings (date-only = local day)."
     ],
@@ -2924,7 +2857,7 @@ async function factory(pi) {
               content: [
                 {
                   type: "text",
-                  text: `Unknown concept '${p.concept}'. Known concepts: ${known}. Use mode 'concepts' for the full vocabulary and its terms.`
+                  text: `Unknown concept '${p.concept}'. ` + (known ? `Configured concepts: ${known}. ` : "No concepts are configured yet. ") + `Use mode 'concepts' for details; add concepts under "concepts" in pi-billion-memory.json.`
                 }
               ],
               details: { mode: "concept", hits: 0, unknown: true, dbPath: fileBase(cfg.dbPath) }
