@@ -52,7 +52,13 @@ import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { expandBlock, expandStoredBlock, isSyntheticRef, parseMsgIds } from "./expand.js";
 import { CJK_STOPWORDS, CHINESE_SECRET_RE, CLAUSE_SEPARATORS, SENTENCE_DELIMITERS } from "./cjk.js";
-import { conceptCatalog, findConcept } from "./concepts.js";
+import {
+  conceptCatalog,
+  deprecatedHints,
+  findConcept,
+  MAX_CONCEPT_TERM_CHARS,
+  MAX_DEPRECATED_TERMS,
+} from "./concepts.js";
 
 // ---------------------------------------------------------------------------
 // Constants / config / logging
@@ -96,6 +102,11 @@ const DEFAULT_CFG = {
   expandMaxReadBytes: 32 * 1024 * 1024,
   /** Extra concept vocabulary for `memory_search` (`{ "name": ["term", ...] }`). */
   concepts: {},
+  /**
+   * Deprecated vocabulary: `{ "old term": "replacement" }` (empty string = no replacement).
+   * Runtime user data, read-only here; the extension never writes the config file.
+   */
+  deprecated: {},
 };
 
 const MAX_TOPIC_CHARS = 200;
@@ -242,6 +253,21 @@ export function sanitizeCfg(over) {
       if (terms.length && key.trim()) clean[key.trim().slice(0, 120)] = terms;
     }
     out.concepts = clean;
+  }
+  if (over.deprecated && typeof over.deprecated === "object" && !Array.isArray(over.deprecated)) {
+    const clean: Record<string, string> = {};
+    let added = 0;
+    for (const [key, value] of Object.entries(over.deprecated as Record<string, unknown>)) {
+      if (added >= MAX_DEPRECATED_TERMS) break;
+      const k = String(key || "")
+        .trim()
+        .slice(0, MAX_CONCEPT_TERM_CHARS);
+      if (!k) continue;
+      if (value !== null && value !== undefined && typeof value !== "string") continue;
+      clean[k] = typeof value === "string" ? value.trim().slice(0, MAX_CONCEPT_TERM_CHARS) : "";
+      added++;
+    }
+    out.deprecated = clean;
   }
   return out;
 }
@@ -2532,25 +2558,31 @@ export function formatTimeline(res) {
   return lines.join("\n");
 }
 
-/** Render the configured concepts (`mode: "concepts"`). @internal */
-export function formatConcepts(list) {
+/** Render the configured concepts and deprecated terms (`mode: "concepts"`). @internal */
+export function formatConcepts(list, deprecated?) {
   const entries = list || [];
-  if (!entries.length) {
+  const dep =
+    deprecated && typeof deprecated === "object" && !Array.isArray(deprecated) ? Object.entries(deprecated) : [];
+  if (!entries.length && !dep.length) {
     return (
       'No concepts defined. Add them under "concepts": { "name": ["term", ...] } in ' +
       "pi-billion-memory.json; vocabulary is user data and ships with no defaults."
     );
   }
-  const lines = [`Configured concepts (${entries.length}):`];
+  const lines = [entries.length ? `Configured concepts (${entries.length}):` : "No concepts defined."];
   for (const c of entries) {
     lines.push("");
     lines.push(`${c.label}  (${c.id})${c.aliases && c.aliases.length ? ` · aka ${c.aliases.join(", ")}` : ""}`);
     lines.push(`  terms: ${c.terms.join(", ")}`);
   }
+  if (dep.length) {
+    lines.push("", `Deprecated terms (${dep.length}):`);
+    for (const [k, v] of dep) lines.push(`  ${k} → ${typeof v === "string" && v ? v : "(no replacement)"}`);
+  }
   lines.push("");
   lines.push(
     "Search a concept with memory_search + concept '<label|id|alias>'; add your own vocabulary with " +
-      '"concepts": { "name": ["term", ...] } in pi-billion-memory.json.',
+      '"concepts": { "name": ["term", ...] } in pi-billion-memory.json, and record retired terms under "deprecated".',
   );
   return lines.join("\n");
 }
@@ -2990,6 +3022,7 @@ export default async function factory(pi: ExtensionAPI) {
       "Use mode 'timeline' for a chronological catalog of matches (one line per memory, full, never truncated); follow a line with memory_get to read that block's stored summary.",
       "Use mode 'related' with a query (the search words) to find blocks whose sentence containing those words is related; pass 'block' to anchor on a specific block.",
       "For a concept (one name that expands to the concrete terms the corpus uses) pass the 'concept' parameter; concepts come from the `concepts` config key - the extension ships none - and mode 'concepts' lists them.",
+      "Keep the shared vocabulary current: when the corpus names a mechanism differently from the user, record the mapping under `concepts` in pi-billion-memory.json; when a term is renamed or retired, record it under `deprecated` with its replacement (empty = none). Vocabulary is runtime user data - never commit it, and never hardcode project or personal terms in the repository.",
       "For a multi-part requirement set decompose: true so each clause is searched separately and the hits are grouped per clause.",
       "In timeline mode pass limit: 0 for the full catalog; a positive limit keeps the newest N entries. from/to accept ISO 8601 strings (date-only = local day).",
     ],
@@ -2999,11 +3032,12 @@ export default async function factory(pi: ExtensionAPI) {
         // Light allow-list scan (mtime watermark) before every search so latest compressions are included
         await scanSources();
         const p = readMemorySearchParams(params);
+        const vhint = deprecatedHints(cfg.deprecated, p.concept || p.query);
         const db = getDb();
         if (p.mode === "concepts") {
           const catalog = conceptCatalog(cfg.concepts);
           return {
-            content: [{ type: "text", text: formatConcepts(catalog) }],
+            content: [{ type: "text", text: formatConcepts(catalog, cfg.deprecated) }],
             details: { mode: "concepts", hits: catalog.length, dbPath: fileBase(cfg.dbPath) },
           };
         }
@@ -3030,7 +3064,7 @@ export default async function factory(pi: ExtensionAPI) {
             `Concept: ${res.concept.label} (${res.concept.id}) · ${res.terms.length} terms · ` +
             `${res.total} matching memories\nTerms: ${res.terms.join(", ")}\n\n`;
           return {
-            content: [{ type: "text", text: head + formatResults(res) }],
+            content: [{ type: "text", text: head + formatResults(res) + (vhint ? "\n\n" + vhint : "") }],
             details: { mode: "concept", hits: res.rows.length, dbPath: fileBase(cfg.dbPath) },
           };
         }
@@ -3080,7 +3114,7 @@ export default async function factory(pi: ExtensionAPI) {
           }
         }
         const res = db.search(p.query, { project: p.project, limit: p.limit });
-        const text = formatResults(res);
+        const text = formatResults(res) + (vhint ? "\n\n" + vhint : "");
         return {
           content: [{ type: "text", text }],
           details: { mode: res.mode, hits: res.rows.length, dbPath: fileBase(cfg.dbPath) },

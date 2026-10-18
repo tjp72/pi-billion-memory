@@ -2182,6 +2182,29 @@ check(
   internals.conceptCatalog(null).length === 0 && db.searchConcept("no-such-thing", {}).unknown === true,
 );
 internals._setConfig({ concepts: {} });
+const depTable = { oldmarker: "newmarker", retiredmarker: "" };
+const depHint = internals.deprecatedHints(depTable, "please find the oldmarker and retiredmarker");
+check(
+  "a deprecated term with a replacement produces a vocabulary hint",
+  depHint.includes("oldmarker") && depHint.includes("newmarker"),
+);
+check(
+  "a deprecated term without a replacement is still reported",
+  depHint.includes("retiredmarker") && depHint.includes("no replacement"),
+);
+check("an unrelated query produces no vocabulary hint", internals.deprecatedHints(depTable, "nothing to see") === "");
+check(
+  "mode 'concepts' lists the deprecated table",
+  internals.formatConcepts([], depTable).includes("Deprecated terms") &&
+    internals.formatConcepts([], depTable).includes("newmarker"),
+);
+const depClamped = internals.sanitizeCfg({ deprecated: { ["k".repeat(300)]: "v", bad: 42 } });
+check(
+  "sanitizeCfg bounds the deprecated table and drops non-string replacements",
+  Object.keys(depClamped.deprecated).length === 1 &&
+    Object.keys(depClamped.deprecated)[0].length <= 64 &&
+    depClamped.deprecated.bad === undefined,
+);
 check(
   "decompose splits a conjunctive requirement set into clauses",
   internals.splitClauses("压缩摘要可检索，原文可展开；索引版本化").length === 3 &&

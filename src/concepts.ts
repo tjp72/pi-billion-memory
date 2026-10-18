@@ -122,3 +122,52 @@ export function findConcept(
   if (partial.length !== 1) return null;
   return { entry: partial[0], terms: [...partial[0].terms] };
 }
+
+/** Max deprecated terms kept from the runtime config (guards a hostile or careless config). */
+export const MAX_DEPRECATED_TERMS = 200;
+/** Max deprecated-term hints rendered for one query. */
+const MAX_HINT_TERMS = 5;
+
+/** Normalize a vocabulary term for matching: lowercase, collapsed whitespace/hyphens/underscores. */
+export function normTerm(s: unknown): string {
+  return typeof s === "string"
+    ? s
+        .trim()
+        .toLowerCase()
+        .replace(/[\s_-]+/g, " ")
+    : "";
+}
+
+function termPresent(key: string, hay: string): boolean {
+  if (!key) return false;
+  if (/[\u4e00-\u9fff]/.test(key)) return hay.includes(key);
+  const esc = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^a-z0-9])${esc}(?=$|[^a-z0-9])`).test(hay);
+}
+
+/**
+ * Hints for deprecated vocabulary terms occurring in `text`. The table is runtime user data
+ * (`deprecated` in pi-billion-memory.json: `{ "old term": "replacement", "retired term": "" }`),
+ * never repository content; the extension only reads it.
+ * @internal
+ */
+export function deprecatedHints(deprecated?: Record<string, unknown> | null, text?: string | null): string {
+  if (!deprecated || typeof deprecated !== "object" || Array.isArray(deprecated)) return "";
+  const hay = normTerm(text);
+  if (!hay) return "";
+  const hits: string[] = [];
+  for (const [rawKey, rawVal] of Object.entries(deprecated)) {
+    if (hits.length >= MAX_HINT_TERMS) break;
+    const key = normTerm(rawKey);
+    if (!key || key.length < 2 || !termPresent(key, hay)) continue;
+    const replacement = normTerm(rawVal);
+    const label = String(rawKey).trim().slice(0, MAX_CONCEPT_TERM_CHARS);
+    hits.push(
+      replacement
+        ? `Deprecated term '${label}': use '${String(rawVal).trim()}' instead.`
+        : `Deprecated term '${label}': no replacement recorded.`,
+    );
+  }
+  if (!hits.length) return "";
+  return ["Vocabulary hints (runtime config, not repository content):", ...hits.map((h) => `- ${h}`)].join("\n");
+}

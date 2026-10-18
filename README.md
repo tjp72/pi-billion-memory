@@ -95,6 +95,11 @@ affiliated with, endorsed by, or a fork of**
   committed). All terms are searched, hits are merged, ranked by how many
   distinct terms matched, and list `Matched terms`. `mode: "concepts"` shows
   what you defined.
+- **Retired vocabulary**: `"deprecated": {"old term": "replacement", "gone": ""}` in
+  `pi-billion-memory.json` records terms that were renamed or dropped (empty string = no
+  replacement). A search whose query contains one ends with a `Vocabulary hints` line
+  pointing at the current name, and `mode: "concepts"` lists the table. The extension only
+  reads it: the vocabulary is yours to maintain, and it never belongs in this repository.
 - **Requirement decomposition**: `decompose: true` splits a conjunctive query
   (`，`, `；`, `and`, …) into clauses and searches each one separately, grouping
   the hits per clause instead of ANDing every token into a single query.

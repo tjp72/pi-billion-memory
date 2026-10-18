@@ -203,7 +203,9 @@ The design is deliberately minimal; preserve these properties:
   `limit: 0` means the full catalog while a positive limit keeps the newest N. `concept` resolves
   label → id → alias via `findConcept` and searches every term of the user's `concepts` config
   (capped by `MAX_CUSTOM_CONCEPTS`); the extension ships no vocabulary (AGENTS §1). Hits are
-  merged and reported with the terms that matched. `decompose` splits only on explicit conjunctive
+  merged and reported with the terms that matched. `deprecated` (`{"old": "replacement"}`, empty
+  string = none) is read-only runtime data: a query containing a deprecated term appends a bounded
+  `Vocabulary hints` line. `decompose` splits only on explicit conjunctive
   punctuation, and each clause is an independent bounded search — never a second LLM pass.
 - **memory_get**: read-only, always registered; returns one stored block's topic+summary by id
   (never raw session messages) with the same ambiguity handling as expansion.

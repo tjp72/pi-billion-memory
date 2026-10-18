@@ -605,6 +605,35 @@ function findConcept(name, custom) {
   if (partial.length !== 1) return null;
   return { entry: partial[0], terms: [...partial[0].terms] };
 }
+var MAX_DEPRECATED_TERMS = 200;
+var MAX_HINT_TERMS = 5;
+function normTerm(s) {
+  return typeof s === "string" ? s.trim().toLowerCase().replace(/[\s_-]+/g, " ") : "";
+}
+function termPresent(key, hay) {
+  if (!key) return false;
+  if (/[\u4e00-\u9fff]/.test(key)) return hay.includes(key);
+  const esc = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^a-z0-9])${esc}(?=$|[^a-z0-9])`).test(hay);
+}
+function deprecatedHints(deprecated, text) {
+  if (!deprecated || typeof deprecated !== "object" || Array.isArray(deprecated)) return "";
+  const hay = normTerm(text);
+  if (!hay) return "";
+  const hits = [];
+  for (const [rawKey, rawVal] of Object.entries(deprecated)) {
+    if (hits.length >= MAX_HINT_TERMS) break;
+    const key = normTerm(rawKey);
+    if (!key || key.length < 2 || !termPresent(key, hay)) continue;
+    const replacement = normTerm(rawVal);
+    const label = String(rawKey).trim().slice(0, MAX_CONCEPT_TERM_CHARS);
+    hits.push(
+      replacement ? `Deprecated term '${label}': use '${String(rawVal).trim()}' instead.` : `Deprecated term '${label}': no replacement recorded.`
+    );
+  }
+  if (!hits.length) return "";
+  return ["Vocabulary hints (runtime config, not repository content):", ...hits.map((h) => `- ${h}`)].join("\n");
+}
 
 // src/extension.ts
 var HOME = os.homedir();
@@ -643,7 +672,12 @@ var DEFAULT_CFG = {
   /** Hard cap on bytes read from a session file by one `memory_expand` call. */
   expandMaxReadBytes: 32 * 1024 * 1024,
   /** Extra concept vocabulary for `memory_search` (`{ "name": ["term", ...] }`). */
-  concepts: {}
+  concepts: {},
+  /**
+   * Deprecated vocabulary: `{ "old term": "replacement" }` (empty string = no replacement).
+   * Runtime user data, read-only here; the extension never writes the config file.
+   */
+  deprecated: {}
 };
 var MAX_TOPIC_CHARS = 200;
 var PREVIEW_CHARS = 600;
@@ -729,6 +763,19 @@ function sanitizeCfg(over) {
       if (terms.length && key.trim()) clean[key.trim().slice(0, 120)] = terms;
     }
     out.concepts = clean;
+  }
+  if (over.deprecated && typeof over.deprecated === "object" && !Array.isArray(over.deprecated)) {
+    const clean = {};
+    let added = 0;
+    for (const [key, value] of Object.entries(over.deprecated)) {
+      if (added >= MAX_DEPRECATED_TERMS) break;
+      const k = String(key || "").trim().slice(0, MAX_CONCEPT_TERM_CHARS);
+      if (!k) continue;
+      if (value !== null && value !== void 0 && typeof value !== "string") continue;
+      clean[k] = typeof value === "string" ? value.trim().slice(0, MAX_CONCEPT_TERM_CHARS) : "";
+      added++;
+    }
+    out.deprecated = clean;
   }
   return out;
 }
@@ -2509,20 +2556,25 @@ function formatTimeline(res) {
   }
   return lines.join("\n");
 }
-function formatConcepts(list) {
+function formatConcepts(list, deprecated) {
   const entries = list || [];
-  if (!entries.length) {
+  const dep = deprecated && typeof deprecated === "object" && !Array.isArray(deprecated) ? Object.entries(deprecated) : [];
+  if (!entries.length && !dep.length) {
     return 'No concepts defined. Add them under "concepts": { "name": ["term", ...] } in pi-billion-memory.json; vocabulary is user data and ships with no defaults.';
   }
-  const lines = [`Configured concepts (${entries.length}):`];
+  const lines = [entries.length ? `Configured concepts (${entries.length}):` : "No concepts defined."];
   for (const c of entries) {
     lines.push("");
     lines.push(`${c.label}  (${c.id})${c.aliases && c.aliases.length ? ` \xB7 aka ${c.aliases.join(", ")}` : ""}`);
     lines.push(`  terms: ${c.terms.join(", ")}`);
   }
+  if (dep.length) {
+    lines.push("", `Deprecated terms (${dep.length}):`);
+    for (const [k, v] of dep) lines.push(`  ${k} \u2192 ${typeof v === "string" && v ? v : "(no replacement)"}`);
+  }
   lines.push("");
   lines.push(
-    `Search a concept with memory_search + concept '<label|id|alias>'; add your own vocabulary with "concepts": { "name": ["term", ...] } in pi-billion-memory.json.`
+    `Search a concept with memory_search + concept '<label|id|alias>'; add your own vocabulary with "concepts": { "name": ["term", ...] } in pi-billion-memory.json, and record retired terms under "deprecated".`
   );
   return lines.join("\n");
 }
@@ -2833,6 +2885,7 @@ async function factory(pi) {
       "Use mode 'timeline' for a chronological catalog of matches (one line per memory, full, never truncated); follow a line with memory_get to read that block's stored summary.",
       "Use mode 'related' with a query (the search words) to find blocks whose sentence containing those words is related; pass 'block' to anchor on a specific block.",
       "For a concept (one name that expands to the concrete terms the corpus uses) pass the 'concept' parameter; concepts come from the `concepts` config key - the extension ships none - and mode 'concepts' lists them.",
+      "Keep the shared vocabulary current: when the corpus names a mechanism differently from the user, record the mapping under `concepts` in pi-billion-memory.json; when a term is renamed or retired, record it under `deprecated` with its replacement (empty = none). Vocabulary is runtime user data - never commit it, and never hardcode project or personal terms in the repository.",
       "For a multi-part requirement set decompose: true so each clause is searched separately and the hits are grouped per clause.",
       "In timeline mode pass limit: 0 for the full catalog; a positive limit keeps the newest N entries. from/to accept ISO 8601 strings (date-only = local day)."
     ],
@@ -2841,11 +2894,12 @@ async function factory(pi) {
       try {
         await scanSources();
         const p = readMemorySearchParams(params);
+        const vhint = deprecatedHints(cfg.deprecated, p.concept || p.query);
         const db2 = getDb();
         if (p.mode === "concepts") {
           const catalog = conceptCatalog(cfg.concepts);
           return {
-            content: [{ type: "text", text: formatConcepts(catalog) }],
+            content: [{ type: "text", text: formatConcepts(catalog, cfg.deprecated) }],
             details: { mode: "concepts", hits: catalog.length, dbPath: fileBase(cfg.dbPath) }
           };
         }
@@ -2868,7 +2922,7 @@ Terms: ${res2.terms.join(", ")}
 
 `;
           return {
-            content: [{ type: "text", text: head + formatResults(res2) }],
+            content: [{ type: "text", text: head + formatResults(res2) + (vhint ? "\n\n" + vhint : "") }],
             details: { mode: "concept", hits: res2.rows.length, dbPath: fileBase(cfg.dbPath) }
           };
         }
@@ -2921,7 +2975,7 @@ Terms: ${res2.terms.join(", ")}
           }
         }
         const res = db2.search(p.query, { project: p.project, limit: p.limit });
-        const text = formatResults(res);
+        const text = formatResults(res) + (vhint ? "\n\n" + vhint : "");
         return {
           content: [{ type: "text", text }],
           details: { mode: res.mode, hits: res.rows.length, dbPath: fileBase(cfg.dbPath) }

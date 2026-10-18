@@ -1,6 +1,6 @@
 // Test-only entry point. The published extension entry is src/index.ts.
 export { default } from "./extension.js";
-import { conceptCatalog, findConcept } from "./concepts.js";
+import { conceptCatalog, deprecatedHints, findConcept, MAX_DEPRECATED_TERMS } from "./concepts.js";
 import {
   expandBlock,
   expandStoredBlock,
@@ -73,6 +73,8 @@ export const internals = {
   parseTimeParam,
   conceptCatalog,
   findConcept,
+  deprecatedHints,
+  MAX_DEPRECATED_TERMS,
   mergeDuplicateRows,
   redactSecrets,
   withoutPaths,

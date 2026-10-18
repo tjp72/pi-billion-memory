@@ -38,3 +38,7 @@ export declare function findConcept(name: string, custom?: Record<string, unknow
     entry: ConceptEntry;
     terms: string[];
 } | null;
+/** Max deprecated terms kept from the runtime config (guards a hostile or careless config). */
+export declare const MAX_DEPRECATED_TERMS = 200;
+/** Normalize a vocabulary term for matching: lowercase, collapsed whitespace/hyphens/underscores. */
+export declare function normTerm(s: unknown): string;
