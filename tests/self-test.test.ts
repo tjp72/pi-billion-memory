@@ -1060,14 +1060,14 @@ check(
 
 // --- platform-neutral basename in model output --------------------------------------
 const winRow = {
-  sourceFile: "C:\\Users\\x\\sessions\\--F--git--\\s.jsonl.acp.json",
+  sourceFile: "C:\\Users\\x\\sessions\\--D--code--\\s.jsonl.acp.json",
   kind: "pi",
   blockId: "b1",
   tier: 1,
   tokens: 1,
   createdAt: T2,
   summary: "winbaseMarker",
-  project: "git",
+  project: "code",
   refStart: null,
   refEnd: null,
 };
